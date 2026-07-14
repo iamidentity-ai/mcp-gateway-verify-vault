@@ -18,7 +18,7 @@
  *      AUTH_METHOD=verify (the SPIFFE-actor fallback).
  *   3. UI app              — OIDC PKCE user sign-in; issues the subject_token,
  *      constrains delegation via a may_act claim.
- *   4. CELX custom attributes — DENY / VIP-read / sensitive-write /
+ *   4. CELX custom attributes — DENY / elevated-read / sensitive-write /
  *      standard-write, POSTed with explicit id == name.
  *   5. Access policy       — DENY -> MFA_ALWAYS -> MFA_ALWAYS -> MFA_PER_SESSION
  *      -> ALLOW, enforcementType under meta, IN opCode — bound to the TE app

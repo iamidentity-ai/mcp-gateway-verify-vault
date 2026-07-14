@@ -109,17 +109,17 @@ describe('mintCred', () => {
     expect(body.claims.jti).toMatch(/^[0-9a-f-]{36}$/i);
   });
 
-  it('uses the credsPath the caller passed in (VIP / write role routing lives in build-rar, not here)', async () => {
-    const obo = await realJwtObo('jti-vip');
+  it('uses the credsPath the caller passed in (elevated / write role routing lives in build-rar, not here)', async () => {
+    const obo = await realJwtObo('jti-elevated');
     const fetchMock = vi.fn<typeof fetch>(async () => vaultMintResponse());
 
     await mintCred(
-      { obo, authorizationDetails: AUTHZ_DETAILS, credsPath: 'verify-rar/creds/records-vip' },
+      { obo, authorizationDetails: AUTHZ_DETAILS, credsPath: 'verify-rar/creds/records-elevated' },
       { fetchImpl: fetchMock, vaultAddr: 'https://vault.test' },
     );
 
     const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe('https://vault.test/v1/verify-rar/creds/records-vip');
+    expect(url).toBe('https://vault.test/v1/verify-rar/creds/records-elevated');
   });
 
   it('throws when Vault returns non-ok, including status + body excerpt', async () => {
@@ -223,7 +223,7 @@ describe('revokeLease', () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error('network down');
     });
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
 
     await expect(
       revokeLease('lease-abc', 'tok', { fetchImpl, vaultAddr: 'https://v' }),
@@ -241,7 +241,7 @@ describe('revokeLease', () => {
           headers: { 'Content-Type': 'application/json' },
         }),
     );
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
 
     await expect(
       revokeLease('lease-bad', 'tok', { fetchImpl, vaultAddr: 'https://v' }),
@@ -255,7 +255,7 @@ describe('revokeLease', () => {
     const fetchImpl = vi.fn(
       async () => new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }),
     );
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
 
     await revokeLease('lease-ok', 'tok', { fetchImpl, vaultAddr: 'https://v' });
 

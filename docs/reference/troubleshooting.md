@@ -60,28 +60,29 @@ bug: it stops a bearer holder who learned a victim's `txId` from forcing a sessi
 [the consumer contract](../concepts/human-in-the-loop.md#the-consumer-contract-202-pending-is-resok)
 and [any-agent](../guides/any-agent.md).
 
-## VIP discovery
+## Classification discovery
 
-### Every record looks non-VIP; the step-up never fires
+### Every record looks public; the step-up never fires
 
-**Cause:** `readVipFlag` isn't finding the flag. In production `callUpstreamTool` returns the MCP
-`CallToolResult` envelope verbatim - `{ content: [{ type: 'text', text: '<json string>' }] }` - so the
-record (and its `vip_flag`) lives **inside** that JSON string, not at the top level. Reading the flag
-off the envelope directly makes every record look non-VIP, so the gateway never elevates and the
-`RecordsVipRead` policy rule never fires - the "policy isn't being applied" bug that is actually a
-parsing bug. **Fix (built in):** `readVipFlag` unwraps `content[0].text` before checking
-`config/rar.json → vipElevation.vipField`. If you changed the upstream response shape, update the
-unwrap.
+**Cause:** `shouldStepUp` isn't finding the classification. In production `callUpstreamTool` returns
+the MCP `CallToolResult` envelope verbatim - `{ content: [{ type: 'text', text: '<json string>' }] }`
+- so the record (and its `classification`) lives **inside** that JSON string, not at the top level.
+Reading the field off the envelope directly makes every record look public, so the gateway never
+elevates and the `RecordsElevatedRead` policy rule never fires - the "policy isn't being applied" bug
+that is actually a parsing bug. **Fix (built in):** `shouldStepUp` unwraps `content[0].text` before
+evaluating `config/rar.json → stepUp.elevateWhen`. If you changed the upstream response shape, update
+the unwrap.
 
 ### Every record now forces a step-up (the opposite)
 
-**Cause:** `readVipFlag` **fails closed** - only an explicit `vip_flag: false` is treated as non-VIP;
-anything it can't parse into a record carrying that field is treated as VIP. If you pointed the
-gateway at a **different upstream** whose read result doesn't carry `vipElevation.vipField` at the
-top level of the unwrapped record, every read over-protects into a step-up. **Fix:** make the
-`probeTool` read (`get_record` by default) return the flag at the top level of its record, or set
-`vipElevation.vipField` to where your upstream actually puts it. Over-protection is the *intended*
-failure mode - it never leaks VIP data.
+**Cause:** `shouldStepUp` **fails closed** - with the shipped `notIn` safe-list, only a value
+explicitly listed (`public` / `internal`) bypasses; anything else, and any result it can't parse into
+a record carrying that field, forces the step-up. If you pointed the gateway at a **different
+upstream** whose read result doesn't carry the `elevateWhen.field` at the top level of the unwrapped
+record, every read over-protects into a step-up. **Fix:** make the `probeTool` read (`get_record` by
+default) return the classification at the top level of its record, or set `elevateWhen.field` to where
+your upstream actually puts it. Over-protection is the *intended* failure mode - it never leaks
+sensitive data. (See [the elevateWhen match rule](../guides/step-up-policies.md#the-elevatewhen-match-rule).)
 
 ### `Error: config/tools.json: tool "…" uses rarAction "…" which is not a defined action` at startup
 

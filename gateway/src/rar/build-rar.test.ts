@@ -5,8 +5,8 @@
  *   - buildRAR shape (3 elements: business + 2× vault:path_access)
  *   - business RAR type + operationDetails.action + subaction nesting
  *   - record_id present only when passed
- *   - VIP read collapses to record_read_vip + records-vip path
- *   - record_write routes to records-write path (vip ignored on writes)
+ *   - elevated read collapses to record_read_elevated + records-elevated path
+ *   - record_write routes to records-write path (elevated ignored on writes)
  *   - vaultRarAction / vaultCredsPath collapse rules directly
  *   - resolveRar: single source of truth for authorizationDetails + credsPath
  *     — the two must always AGREE on the collapsed action
@@ -52,24 +52,24 @@ describe('buildRAR', () => {
     expect((leasesPath as any).action).toBe('update');
   });
 
-  it('a VIP read collapses to record_read_vip and the -vip creds path', () => {
-    const rar = buildRAR({ rarAction: 'record_read', vip: true });
-    expect((rar[0] as any).operationDetails.action).toBe('record_read_vip');
+  it('an elevated read collapses to record_read_elevated and the -elevated creds path', () => {
+    const rar = buildRAR({ rarAction: 'record_read', elevated: true });
+    expect((rar[0] as any).operationDetails.action).toBe('record_read_elevated');
     // subaction preserves the ORIGINAL rarAction, not the collapsed value
     expect((rar[0] as any).operationDetails.subaction).toBe('record_read');
-    expect((rar[1] as any).path_constraint).toBe('verify-rar/creds/records-vip');
+    expect((rar[1] as any).path_constraint).toBe('verify-rar/creds/records-elevated');
   });
 
-  it('record_write routes to records-write regardless of vip', () => {
-    const rar = buildRAR({ rarAction: 'record_write', vip: true });
+  it('record_write routes to records-write regardless of elevated', () => {
+    const rar = buildRAR({ rarAction: 'record_write', elevated: true });
     expect((rar[0] as any).operationDetails.action).toBe('record_write');
     expect((rar[1] as any).path_constraint).toBe('verify-rar/creds/records-write');
   });
 });
 
 describe('vaultRarAction (Vault role-mapping collapse)', () => {
-  it('preserves record_read_vip', () => {
-    expect(vaultRarAction('record_read_vip')).toBe('record_read_vip');
+  it('preserves record_read_elevated', () => {
+    expect(vaultRarAction('record_read_elevated')).toBe('record_read_elevated');
   });
 
   it('preserves record_write', () => {
@@ -85,29 +85,29 @@ describe('vaultRarAction (Vault role-mapping collapse)', () => {
 
 describe('vaultCredsPath', () => {
   it('maps collapsed actions to their Vault creds paths', () => {
-    expect(vaultCredsPath('record_read_vip')).toBe('verify-rar/creds/records-vip');
+    expect(vaultCredsPath('record_read_elevated')).toBe('verify-rar/creds/records-elevated');
     expect(vaultCredsPath('record_write')).toBe('verify-rar/creds/records-write');
     expect(vaultCredsPath('record_read')).toBe('verify-rar/creds/records');
   });
 });
 
 describe('resolveRar (single source of truth for authorizationDetails + credsPath)', () => {
-  it('VIP read: credsPath is the -vip path AND authorizationDetails agree on record_read_vip', () => {
+  it('elevated read: credsPath is the -elevated path AND authorizationDetails agree on record_read_elevated', () => {
     const { authorizationDetails, credsPath, collapsedAction } = resolveRar({
       rarAction: 'record_read',
-      vip: true,
+      elevated: true,
     });
 
-    expect(credsPath).toBe('verify-rar/creds/records-vip');
-    expect(collapsedAction).toBe('record_read_vip');
-    expect((authorizationDetails[0] as any).operationDetails.action).toBe('record_read_vip');
+    expect(credsPath).toBe('verify-rar/creds/records-elevated');
+    expect(collapsedAction).toBe('record_read_elevated');
+    expect((authorizationDetails[0] as any).operationDetails.action).toBe('record_read_elevated');
     // subaction preserves the ORIGINAL rarAction, not the collapsed value
     expect((authorizationDetails[0] as any).operationDetails.subaction).toBe('record_read');
     // the vault:path_access element's path_constraint must match credsPath too
     expect((authorizationDetails[1] as any).path_constraint).toBe(credsPath);
   });
 
-  it('non-VIP read: credsPath is the standard path AND authorizationDetails agree on record_read', () => {
+  it('non-elevated read: credsPath is the standard path AND authorizationDetails agree on record_read', () => {
     const { authorizationDetails, credsPath, collapsedAction } = resolveRar({
       rarAction: 'record_read',
     });
@@ -117,10 +117,10 @@ describe('resolveRar (single source of truth for authorizationDetails + credsPat
     expect((authorizationDetails[0] as any).operationDetails.action).toBe('record_read');
   });
 
-  it('record_write: credsPath is the write path AND authorizationDetails agree on record_write (vip ignored)', () => {
+  it('record_write: credsPath is the write path AND authorizationDetails agree on record_write (elevated ignored)', () => {
     const { authorizationDetails, credsPath, collapsedAction } = resolveRar({
       rarAction: 'record_write',
-      vip: true,
+      elevated: true,
     });
 
     expect(credsPath).toBe('verify-rar/creds/records-write');
@@ -131,11 +131,11 @@ describe('resolveRar (single source of truth for authorizationDetails + credsPat
   it('a per-tool action other than record_read (e.g. get_record_history) still collapses correctly', () => {
     const { authorizationDetails, credsPath, collapsedAction } = resolveRar({
       rarAction: 'get_record_history',
-      vip: true,
+      elevated: true,
     });
 
-    expect(collapsedAction).toBe('record_read_vip');
-    expect(credsPath).toBe('verify-rar/creds/records-vip');
+    expect(collapsedAction).toBe('record_read_elevated');
+    expect(credsPath).toBe('verify-rar/creds/records-elevated');
     expect((authorizationDetails[0] as any).operationDetails.subaction).toBe('get_record_history');
   });
 });
@@ -157,7 +157,7 @@ describe('config-driven vocabulary (custom "tickets" domain, zero code change)',
       ticket_write: { credsPath: 'verify-rar/creds/tickets-write' },
       ticket_purge: { blocked: true },
     },
-    vipElevation: { discoveryTools: ['get_ticket'], vipField: 'priority_flag' },
+    stepUp: { discoveryTools: ['get_ticket'], elevateWhen: { field: 'priority', in: ['high', 'urgent'] } },
   });
 
   it('business element uses the custom rarType + idField', () => {
@@ -168,9 +168,9 @@ describe('config-driven vocabulary (custom "tickets" domain, zero code change)',
     expect((rar[0] as any).operationDetails.record_id).toBeUndefined();
   });
 
-  it('vip read elevates to the config-declared step-up action + its creds path', () => {
+  it('elevated read elevates to the config-declared step-up action + its creds path', () => {
     const { authorizationDetails, credsPath, collapsedAction } = resolveRar(
-      { rarAction: 'ticket_read', vip: true },
+      { rarAction: 'ticket_read', elevated: true },
       ticketsConfig,
     );
     expect(collapsedAction).toBe('ticket_read_priority');
@@ -180,8 +180,8 @@ describe('config-driven vocabulary (custom "tickets" domain, zero code change)',
     expect((authorizationDetails[1] as any).path_constraint).toBe(credsPath);
   });
 
-  it('write ignores vip (no elevation target) and unknown/blocked actions collapse to the default', () => {
-    expect(resolveRar({ rarAction: 'ticket_write', vip: true }, ticketsConfig).credsPath).toBe(
+  it('write ignores elevated (no elevation target) and unknown/blocked actions collapse to the default', () => {
+    expect(resolveRar({ rarAction: 'ticket_write', elevated: true }, ticketsConfig).credsPath).toBe(
       'verify-rar/creds/tickets-write',
     );
     // per-tool subaction with no own entry -> default

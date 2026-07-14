@@ -105,20 +105,20 @@ function makeRunDeps(overrides: Record<string, unknown> = {}) {
     gateTool: (_name: string) => makeGateResult(),
     // Self-contained fake mirroring build-rar.ts's real collapse rules (NOT
     // the real module — pipeline tests stay isolated from rar/ internals).
-    // Deliberately reimplements the same vip-elevation-then-collapse
+    // Deliberately reimplements the same elevation-then-collapse
     // sequence in ONE function so overriding it in a single test can't
     // reintroduce the "two separate derivations" bug class this task fixes.
-    resolveRar: (args: { rarAction: string; recordId?: string; vip?: boolean }) => {
+    resolveRar: (args: { rarAction: string; recordId?: string; elevated?: boolean }) => {
       const isRead = args.rarAction !== 'record_write';
       const collapsedAction =
-        args.vip === true && isRead
-          ? 'record_read_vip'
+        args.elevated === true && isRead
+          ? 'record_read_elevated'
           : args.rarAction === 'record_write'
             ? 'record_write'
             : 'record_read';
       const credsPath =
-        collapsedAction === 'record_read_vip'
-          ? 'verify-rar/creds/records-vip'
+        collapsedAction === 'record_read_elevated'
+          ? 'verify-rar/creds/records-elevated'
           : collapsedAction === 'record_write'
             ? 'verify-rar/creds/records-write'
             : 'verify-rar/creds/records';
@@ -149,9 +149,10 @@ function makeRunDeps(overrides: Record<string, unknown> = {}) {
       message: 'Approve: view a record.',
     }),
     mintCred: async () => ({ username: 'v-records-1', password: 'p4ss', leaseId: 'lease-1' }),
-    // Non-VIP by default (explicit vip_flag:false — readVipFlag now FAILS CLOSED,
-    // so a discovery probe with no vip_flag is treated as VIP).
-    callUpstreamTool: async () => ({ ok: true, vip_flag: false, record: { recordId: 'REC-1' } }),
+    // Public by default (explicit classification:'public' — shouldStepUp now
+    // FAILS CLOSED, so a discovery probe with no classification is treated as
+    // restricted).
+    callUpstreamTool: async () => ({ ok: true, classification: 'public', record: { recordId: 'REC-1' } }),
     revokeLease: async () => undefined,
     appendAudit: (_rec: unknown) => undefined,
     clearDeny: (_id: string) => undefined,
@@ -176,21 +177,21 @@ function expectOrder(calls: string[], order: string[]): void {
 }
 
 describe('runPipeline', () => {
-  // ── Gateway-derived VIP step-up (discovery read → elevate) ──────────────
-  it('VIP record: gateway discovery read detects vip_flag and forces a step-up (2 exchanges, mfa_challenge → pending)', async () => {
+  // ── Gateway-derived step-up (discovery read → elevate) ──────────────────
+  it('restricted record: gateway discovery read detects classification and forces a step-up (2 exchanges, mfa_challenge → pending)', async () => {
     const { deps, calls } = makeRunDeps({
       // Upstream returns the PRODUCTION MCP CallToolResult envelope (record +
-      // its vip_flag live inside content[0].text) — this is what would have
-      // caught the "isVip always false" unwrap bug.
+      // its classification live inside content[0].text) — this is what would
+      // have caught the "always public" unwrap bug.
       callUpstreamTool: async () => ({
-        content: [{ type: 'text', text: JSON.stringify({ record_id: 'REC-9001', display_name: 'Jordan Reyes', vip_flag: true }) }],
+        content: [{ type: 'text', text: JSON.stringify({ record_id: 'REC-9001', display_name: 'Jordan Reyes', classification: 'restricted' }) }],
       }),
-      // Standard RAR (discovery) exchanges OK; the elevated record_read_vip
+      // Standard RAR (discovery) exchanges OK; the elevated record_read_elevated
       // RAR is what Verify challenges — keyed off the collapsed action so the
-      // test mirrors the real the VIP-read policy rule.
+      // test mirrors the real elevated-read policy rule.
       exchangeToken: async (args: any) => {
         const action = args?.authorizationDetails?.[0]?.operationDetails?.action;
-        if (action === 'record_read_vip') {
+        if (action === 'record_read_elevated') {
           return { status: 'mfa_challenge', challengeToken: 'challenge-1' };
         }
         return { status: 'ok', accessToken: 'obo-token-1', expiresIn: 3600, scope: 'records:read' };
@@ -203,21 +204,21 @@ describe('runPipeline', () => {
     );
 
     expect(result.status).toBe('pending');
-    // Two exchanges: the standard discovery read, then the elevated VIP read.
+    // Two exchanges: the standard discovery read, then the elevated read.
     expect(calls.filter((c) => c === 'exchangeToken').length).toBe(2);
     expect(calls).toContain('triggerOAuthMfaPush');
     expect(calls).toContain('putPending');
-    // The parked pending must mint from the VIP creds path, not the base one.
+    // The parked pending must mint from the elevated creds path, not the base one.
     const putPending = deps.putPending as unknown as { mock: { calls: unknown[][] } };
     const pendingCtx = putPending.mock.calls[0][1] as { credsPath: string };
-    expect(pendingCtx.credsPath).toBe('verify-rar/creds/records-vip');
+    expect(pendingCtx.credsPath).toBe('verify-rar/creds/records-elevated');
   });
 
-  it('non-VIP record: discovery read is the delivered read — no step-up (1 exchange, ok)', async () => {
+  it('public record: discovery read is the delivered read — no step-up (1 exchange, ok)', async () => {
     const { deps, calls } = makeRunDeps({
-      // Production MCP envelope, non-VIP record.
+      // Production MCP envelope, public record.
       callUpstreamTool: async () => ({
-        content: [{ type: 'text', text: JSON.stringify({ record_id: 'REC-1006', display_name: 'Marisol Okafor', vip_flag: false }) }],
+        content: [{ type: 'text', text: JSON.stringify({ record_id: 'REC-1006', display_name: 'Marisol Okafor', classification: 'public' }) }],
       }),
     });
 
@@ -233,17 +234,17 @@ describe('runPipeline', () => {
     expect(calls).not.toContain('triggerOAuthMfaPush');
   });
 
-  // ── SECURITY (review #1): VIP step-up covers detail/history via probeTool ──
-  it('VIP record via get_record_detail: probe(get_record) detects VIP -> step-up on the DETAIL read (2 exchanges, pending, VIP creds)', async () => {
+  // ── SECURITY (review #1): step-up covers detail/history via probeTool ─────
+  it('restricted record via get_record_detail: probe(get_record) detects restricted -> step-up on the DETAIL read (2 exchanges, pending, elevated creds)', async () => {
     const { deps, calls } = makeRunDeps({
-      // The probe (get_record) returns a VIP record; the elevated detail read
-      // short-circuits at mfa_challenge before calling upstream.
+      // The probe (get_record) returns a restricted record; the elevated detail
+      // read short-circuits at mfa_challenge before calling upstream.
       callUpstreamTool: async () => ({
-        content: [{ type: 'text', text: JSON.stringify({ record_id: 'REC-9002', vip_flag: true }) }],
+        content: [{ type: 'text', text: JSON.stringify({ record_id: 'REC-9002', classification: 'restricted' }) }],
       }),
       exchangeToken: async (args: any) => {
         const action = args?.authorizationDetails?.[0]?.operationDetails?.action;
-        if (action === 'record_read_vip') return { status: 'mfa_challenge', challengeToken: 'challenge-1' };
+        if (action === 'record_read_elevated') return { status: 'mfa_challenge', challengeToken: 'challenge-1' };
         return { status: 'ok', accessToken: 'obo-token-1', expiresIn: 3600, scope: 'records:read' };
       },
     });
@@ -256,17 +257,17 @@ describe('runPipeline', () => {
     expect(result.status).toBe('pending');
     expect(calls.filter((c) => c === 'exchangeToken').length).toBe(2); // probe + elevated
     expect(calls).toContain('putPending');
-    // The parked step-up is for the DETAIL tool, minting from the VIP creds path.
+    // The parked step-up is for the DETAIL tool, minting from the elevated creds path.
     const putPending = deps.putPending as unknown as { mock: { calls: unknown[][] } };
     const pendingCtx = putPending.mock.calls[0][1] as { credsPath: string; toolName: string };
     expect(pendingCtx.toolName).toBe('get_record_detail');
-    expect(pendingCtx.credsPath).toBe('verify-rar/creds/records-vip');
+    expect(pendingCtx.credsPath).toBe('verify-rar/creds/records-elevated');
   });
 
-  it('non-VIP record via get_record_detail: probe(get_record) non-VIP -> delivers the detail read (2 exchanges, ok, no push)', async () => {
+  it('public record via get_record_detail: probe(get_record) public -> delivers the detail read (2 exchanges, ok, no push)', async () => {
     const { deps, calls } = makeRunDeps({
       callUpstreamTool: async () => ({
-        content: [{ type: 'text', text: JSON.stringify({ record_id: 'REC-1006', vip_flag: false }) }],
+        content: [{ type: 'text', text: JSON.stringify({ record_id: 'REC-1006', classification: 'public' }) }],
       }),
     });
 
@@ -281,12 +282,12 @@ describe('runPipeline', () => {
     expect(calls).not.toContain('triggerOAuthMfaPush');
   });
 
-  it('fail-closed: an unparseable probe result forces a step-up (readVipFlag defaults to VIP, never leaks)', async () => {
+  it('fail-closed: an unparseable probe result forces a step-up (shouldStepUp defaults to elevate, never leaks)', async () => {
     const { deps, calls } = makeRunDeps({
       callUpstreamTool: async () => ({ content: [{ type: 'text', text: '{ not valid json' }] }),
       exchangeToken: async (args: any) => {
         const action = args?.authorizationDetails?.[0]?.operationDetails?.action;
-        if (action === 'record_read_vip') return { status: 'mfa_challenge', challengeToken: 'challenge-1' };
+        if (action === 'record_read_elevated') return { status: 'mfa_challenge', challengeToken: 'challenge-1' };
         return { status: 'ok', accessToken: 'obo-token-1', expiresIn: 3600, scope: 'records:read' };
       },
     });
@@ -297,6 +298,29 @@ describe('runPipeline', () => {
     );
 
     expect(result.status).toBe('pending'); // could-not-parse → step-up, not silent deliver
+    expect(calls.filter((c) => c === 'exchangeToken').length).toBe(2);
+  });
+
+  // ── fail-closed on the notIn safe-list: an UNKNOWN classification elevates ──
+  it('fail-closed safe-list: an unknown classification (not in notIn) forces a step-up', async () => {
+    const { deps, calls } = makeRunDeps({
+      // "confidential" is not in the shipped notIn safe-list ["public","internal"].
+      callUpstreamTool: async () => ({
+        content: [{ type: 'text', text: JSON.stringify({ record_id: 'REC-42', classification: 'confidential' }) }],
+      }),
+      exchangeToken: async (args: any) => {
+        const action = args?.authorizationDetails?.[0]?.operationDetails?.action;
+        if (action === 'record_read_elevated') return { status: 'mfa_challenge', challengeToken: 'challenge-1' };
+        return { status: 'ok', accessToken: 'obo-token-1', expiresIn: 3600, scope: 'records:read' };
+      },
+    });
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-42' } },
+      deps as any,
+    );
+
+    expect(result.status).toBe('pending');
     expect(calls.filter((c) => c === 'exchangeToken').length).toBe(2);
   });
 
@@ -382,7 +406,7 @@ describe('runPipeline', () => {
       oboTtl: 3600,
       oboScope: 'records:read',
       cred: { username: 'v-records-1', leaseId: 'lease-1', path: 'verify-rar/creds/records' },
-      vipElevated: false,
+      elevated: false,
     });
     // Security control: the raw OBO bearer token must NEVER leak into the
     // client-visible diagnostics — it is a replayable credential.
@@ -424,33 +448,42 @@ describe('runPipeline', () => {
     expect(deps.clearDeny).not.toHaveBeenCalled();
   });
 
-  it('VIP read (args.vip=true) mints from the VIP creds path — regression guard for the ' +
-    'RAR-action/creds-path mismatch fixed by resolveRar', async () => {
-    const { deps } = makeRunDeps();
+  it('elevated read (gateway-derived) mints from the elevated creds path AND the RAR agrees on the ' +
+    'collapsed action — regression guard for the RAR-action/creds-path mismatch fixed by resolveRar', async () => {
+      const { deps } = makeRunDeps({
+        // Restricted record → the gateway derives the elevation (the caller can
+        // no longer request it). The default exchange mock returns OK for BOTH
+        // the discovery and the elevated read (no challenge), so the elevated
+        // read is delivered ok.
+        callUpstreamTool: async () => ({
+          content: [{ type: 'text', text: JSON.stringify({ record_id: 'REC-1', classification: 'restricted' }) }],
+        }),
+      });
 
-    const result = await runPipeline(
-      { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1', vip: true } },
-      deps as any,
-    );
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
 
-    expect(result.status).toBe('ok');
+      expect(result.status).toBe('ok');
 
-    // The Vault creds path the mint dep receives MUST be the -vip path — the
-    // pre-fix bug derived credsPath from the raw (non-vip-elevated) rarAction
-    // separately from authorizationDetails, so it stayed on the non-VIP path
-    // even when the RAR sent to Verify claimed record_read_vip.
-    expect(deps.mintCred).toHaveBeenCalledWith({
-      obo: 'obo-token-1',
-      authorizationDetails: expect.any(Array),
-      credsPath: 'verify-rar/creds/records-vip',
+      // The Vault creds path the mint dep receives for the elevated read MUST be
+      // the -elevated path — the pre-fix bug derived credsPath from the raw
+      // (non-elevated) rarAction separately from authorizationDetails, so it
+      // stayed on the base path even when the RAR claimed record_read_elevated.
+      expect(deps.mintCred).toHaveBeenCalledWith({
+        obo: 'obo-token-1',
+        authorizationDetails: expect.any(Array),
+        credsPath: 'verify-rar/creds/records-elevated',
+      });
+
+      // The RAR sent to Verify and the minted creds path must AGREE on the
+      // collapsed action — the elevated exchange (the last one) claims
+      // record_read_elevated.
+      const exchangeCalls = (deps.exchangeToken as any).mock.calls;
+      const elevatedArgs = exchangeCalls[exchangeCalls.length - 1][0];
+      expect(elevatedArgs.authorizationDetails[0].operationDetails.action).toBe('record_read_elevated');
     });
-
-    // The RAR sent to Verify and the minted creds path must AGREE on the
-    // collapsed action — assert the business element that resolveRar handed
-    // to exchangeToken also elevated to record_read_vip.
-    const exchangeArgs = (deps.exchangeToken as any).mock.calls[0][0];
-    expect(exchangeArgs.authorizationDetails[0].operationDetails.action).toBe('record_read_vip');
-  });
 
   it('tier 2/3 direct ok (no challenge fired) DOES clearDeny — it is an MFA-gated tool by tier', async () => {
     const { deps } = makeRunDeps({

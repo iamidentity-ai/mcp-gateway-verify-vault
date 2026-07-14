@@ -31,7 +31,7 @@ function ticketsRar(): RarConfig {
       ticket_write: { credsPath: 'verify-rar/creds/tickets-write' },
       ticket_purge: { blocked: true },
     },
-    vipElevation: { discoveryTools: ['get_ticket'], vipField: 'priority_flag' },
+    stepUp: { discoveryTools: ['get_ticket'], elevateWhen: { field: 'priority', in: ['high', 'urgent'] } },
   };
 }
 function ticketsTools(): ToolsConfig {
@@ -73,7 +73,7 @@ describe('classifyActions', () => {
     const roles = classifyActions(loadTools(), loadRarConfig());
     expect(roles.defaultAction).toBe('record_read');
     expect(roles.denyActions).toEqual(['record_delete']);
-    expect(roles.vipAction).toBe('record_read_vip');
+    expect(roles.elevatedAction).toBe('record_read_elevated');
     expect(roles.writeAction).toBe('record_write');
     expect(roles.standardTool).toBe('update_record'); // tier 2
     expect(roles.sensitiveTool).toBe('update_contact'); // tier 3
@@ -82,7 +82,7 @@ describe('classifyActions', () => {
   it('maps the custom tickets config the same way', () => {
     const roles = classifyActions(ticketsTools(), ticketsRar());
     expect(roles.denyActions).toEqual(['ticket_purge']);
-    expect(roles.vipAction).toBe('ticket_read_priority');
+    expect(roles.elevatedAction).toBe('ticket_read_priority');
     expect(roles.writeAction).toBe('ticket_write');
     expect(roles.standardTool).toBe('update_ticket');
     expect(roles.sensitiveTool).toBe('escalate_ticket');
@@ -103,9 +103,9 @@ describe('generateCelxAttributes (records)', () => {
     }
     expect(Object.keys(byName).sort()).toEqual([
       'RecordsDeleteDeny',
+      'RecordsElevatedRead',
       'RecordsSensitiveWrite',
       'RecordsStandardWrite',
-      'RecordsVipRead',
     ]);
   });
 
@@ -114,8 +114,8 @@ describe('generateCelxAttributes (records)', () => {
     expect(byName['RecordsDeleteDeny']!.function.custom).toContain('ad.type == "urn:example:agent:records"');
   });
 
-  it('keys the VIP CELX on the elevated read action', () => {
-    expect(byName['RecordsVipRead']!.function.custom).toContain('ad.operationDetails.action == "record_read_vip"');
+  it('keys the elevated CELX on the elevated read action', () => {
+    expect(byName['RecordsElevatedRead']!.function.custom).toContain('ad.operationDetails.action == "record_read_elevated"');
   });
 
   it('keys both write CELX on record_write and disambiguates by tool', () => {
@@ -130,10 +130,10 @@ describe('generateCelxAttributes (tickets — genericity)', () => {
     const attrs = generateCelxAttributes(ticketsTools(), ticketsRar());
     const names = attrs.map((a) => a.name).sort();
     expect(names).toEqual([
+      'TicketsElevatedRead',
       'TicketsPurgeDeny',
       'TicketsSensitiveWrite',
       'TicketsStandardWrite',
-      'TicketsVipRead',
     ]);
     const deny = attrs.find((a) => a.name === 'TicketsPurgeDeny')!;
     expect(deny.function.custom).toContain('ad.operationDetails.action == "ticket_purge"');
@@ -144,7 +144,7 @@ describe('generateCelxAttributes (tickets — genericity)', () => {
 describe('generateAccessPolicy (records)', () => {
   const policy = generateAccessPolicy(loadTools(), loadRarConfig());
 
-  it('orders rules DENY -> MFA_ALWAYS(vip) -> MFA_ALWAYS(sensitive) -> MFA_PER_SESSION -> ALLOW', () => {
+  it('orders rules DENY -> MFA_ALWAYS(elevated) -> MFA_ALWAYS(sensitive) -> MFA_PER_SESSION -> ALLOW', () => {
     expect(policy.rules.map((r) => r.result.action)).toEqual([
       'ACTION_DENY',
       'ACTION_MFA_ALWAYS',
@@ -168,7 +168,7 @@ describe('generateAccessPolicy (records)', () => {
     for (const c of conds) expect(c.opCode).toBe('IN');
     const referenced = conds.map((c) => c.name);
     expect(referenced).toContain(names.deny);
-    expect(referenced).toContain(names.vip);
+    expect(referenced).toContain(names.elevated);
     expect(referenced).toContain(names.sensitive);
     expect(referenced).toContain(names.standard);
   });
@@ -192,7 +192,7 @@ describe('generateVaultRoles (records)', () => {
   const roles = generateVaultRoles(loadRarConfig(), 'records', loadTools());
 
   it('creates one role per non-blocked creds path, skipping the blocked action', () => {
-    expect(roles.map((r) => r.roleName).sort()).toEqual(['records', 'records-vip', 'records-write']);
+    expect(roles.map((r) => r.roleName).sort()).toEqual(['records', 'records-elevated', 'records-write']);
   });
 
   it('keys rar_mappings on <rarType>|<action> with an object value (not a string)', () => {
@@ -204,11 +204,11 @@ describe('generateVaultRoles (records)', () => {
     expect(typeof mapping).toBe('object');
   });
 
-  it('grants a DISTINCT read_vip PG role to the VIP role (base records_read is RLS-restricted to non-VIP rows)', () => {
-    const vip = roles.find((r) => r.roleName === 'records-vip')!;
-    expect(vip.pgRole).toBe('records_read_vip');
-    expect(vip.body.rar_mappings['urn:example:agent:records|record_read_vip']!.grants).toEqual([
-      'GRANT records_read_vip TO "{{name}}"',
+  it('grants a DISTINCT read_elevated PG role to the elevated role (base records_read is RLS-restricted to public rows)', () => {
+    const elevated = roles.find((r) => r.roleName === 'records-elevated')!;
+    expect(elevated.pgRole).toBe('records_read_elevated');
+    expect(elevated.body.rar_mappings['urn:example:agent:records|record_read_elevated']!.grants).toEqual([
+      'GRANT records_read_elevated TO "{{name}}"',
     ]);
   });
 
@@ -228,8 +228,8 @@ describe('generateVaultRoles (tickets — genericity)', () => {
     expect(write.pgRole).toBe('tickets_write');
     expect(write.body.db_name).toBe('tickets_db');
     expect(write.body.rar_mappings['urn:example:agent:tickets|ticket_write']).toBeDefined();
-    // The priority (elevated) action gets the distinct read_vip role.
-    expect(roles.find((r) => r.roleName === 'tickets-priority')!.pgRole).toBe('tickets_read_vip');
+    // The priority (elevated) action gets the distinct read_elevated role.
+    expect(roles.find((r) => r.roleName === 'tickets-priority')!.pgRole).toBe('tickets_read_elevated');
   });
 
   // ── #7 regression: grant derived from TIER, not rar.json position ─────────
@@ -246,7 +246,6 @@ describe('generateVaultRoles (tickets — genericity)', () => {
         ticket_read_pii: { credsPath: 'verify-rar/creds/tickets-pii' },
         ticket_write: { credsPath: 'verify-rar/creds/tickets-write' },
       },
-      vipElevation: { discoveryTools: [], vipField: '' },
     } as RarConfig;
     const tools: ToolsConfig = {
       get_ticket: { tier: 1, rarAction: 'ticket_read', scope: 'tickets:read' },
@@ -264,7 +263,7 @@ describe('generateRuntimePolicyHcl', () => {
   it('grants read+update on every creds path plus sys/leases/revoke', () => {
     const hcl = generateRuntimePolicyHcl(loadRarConfig());
     expect(hcl).toContain('path "verify-rar/creds/records" {');
-    expect(hcl).toContain('path "verify-rar/creds/records-vip" {');
+    expect(hcl).toContain('path "verify-rar/creds/records-elevated" {');
     expect(hcl).toContain('path "verify-rar/creds/records-write" {');
     expect(hcl).toContain('path "sys/leases/revoke" {');
     expect(hcl).toContain('capabilities = ["read", "update"]');

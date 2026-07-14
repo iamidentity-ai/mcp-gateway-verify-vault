@@ -37,9 +37,17 @@ export interface RarActionConfig {
   blocked?: boolean;
 }
 
-export interface RarVipElevationConfig {
+export interface ElevateWhenRule {
+  field: string;
+  equals?: unknown;
+  in?: unknown[];
+  notIn?: unknown[];
+}
+
+export interface RarStepUpConfig {
   discoveryTools: string[];
-  vipField: string;
+  elevateWhen: ElevateWhenRule;
+  probeTool?: string;
 }
 
 export interface RarConfig {
@@ -47,7 +55,7 @@ export interface RarConfig {
   idField: string;
   argIdKey: string;
   actions: Record<string, RarActionConfig>;
-  vipElevation?: RarVipElevationConfig;
+  stepUp?: RarStepUpConfig;
 }
 
 // The gateway's config directory, relative to THIS file (bootstrap/lib/).

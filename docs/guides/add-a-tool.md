@@ -16,8 +16,8 @@ Every tool gets a tier. The tier is the whole authorization posture:
 | 4 | Blocked | Denied at the gate - Verify is never contacted. |
 
 Pick the tier by blast radius, not by convenience. A read that exposes a sensitive row belongs in
-tier 1 only if you rely on the [VIP discovery probe](../concepts/human-in-the-loop.md) to force
-step-up on the sensitive rows; otherwise consider the elevated path.
+tier 1 only if you rely on the [classification discovery probe](../concepts/human-in-the-loop.md) to
+force step-up on the sensitive rows; otherwise consider the elevated path.
 
 ## ☐ 1. Add the tier-map entry - `config/tools.json`
 

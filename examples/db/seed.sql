@@ -1,20 +1,20 @@
 -- examples/db/seed.sql — a small, self-consistent "records" dataset.
--- 7 records (4 standard, 3 VIP) assigned to one owner. Idempotent.
+-- 7 records (4 public, 3 restricted) assigned to one owner. Idempotent.
 
-INSERT INTO records_demo.owners (upn, display_name, is_vip_authorized) VALUES
+INSERT INTO records_demo.owners (upn, display_name, can_read_restricted) VALUES
   ('agent@example.com', 'Example Operator', TRUE),
   ('desk@example.com',  'Front Desk',       FALSE)
 ON CONFLICT (upn) DO NOTHING;
 
-INSERT INTO records_demo.records (record_id, display_name, dob, email, vip_flag) VALUES
-  ('REC-1001', 'Dana Reyes',      '1980-03-14', 'dana.reyes@example.com',    FALSE),
-  ('REC-1002', 'Marion Alvarez',  '1975-07-22', 'marion.alvarez@example.com',FALSE),
-  ('REC-1003', 'Priya Nair',      '1990-11-05', 'priya.nair@example.com',    FALSE),
-  ('REC-1004', 'Sam Whitfield',   '1968-01-30', 'sam.whitfield@example.com', FALSE),
-  -- VIP records — the gateway forces a step-up MFA push before any read.
-  ('REC-9001', 'Jordan Vance',    '1994-08-02', 'jordan.vance@example.com',  TRUE),
-  ('REC-9002', 'Alex Okonkwo',    '1958-05-19', 'alex.okonkwo@example.com',  TRUE),
-  ('REC-9003', 'Robin Castellano','1972-01-27', 'robin.castellano@example.com', TRUE)
+INSERT INTO records_demo.records (record_id, display_name, dob, email, classification) VALUES
+  ('REC-1001', 'Dana Reyes',      '1980-03-14', 'dana.reyes@example.com',    'public'),
+  ('REC-1002', 'Marion Alvarez',  '1975-07-22', 'marion.alvarez@example.com','public'),
+  ('REC-1003', 'Priya Nair',      '1990-11-05', 'priya.nair@example.com',    'public'),
+  ('REC-1004', 'Sam Whitfield',   '1968-01-30', 'sam.whitfield@example.com', 'public'),
+  -- Restricted records — the gateway forces a step-up MFA push before any read.
+  ('REC-9001', 'Jordan Vance',    '1994-08-02', 'jordan.vance@example.com',  'restricted'),
+  ('REC-9002', 'Alex Okonkwo',    '1958-05-19', 'alex.okonkwo@example.com',  'restricted'),
+  ('REC-9003', 'Robin Castellano','1972-01-27', 'robin.castellano@example.com', 'restricted')
 ON CONFLICT (record_id) DO NOTHING;
 
 -- Detail lines (category/value/status) — get_record_detail reads, update_record writes.

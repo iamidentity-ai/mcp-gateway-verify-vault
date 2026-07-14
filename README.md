@@ -129,7 +129,7 @@ docker compose up --build
 Now two calls prove the whole chain - a routine read, and a step-up read:
 
 ```bash
-# A. Non-VIP record → 200 with the row AND the ephemeral cred that fetched it
+# A. Public record → 200 with the row AND the ephemeral cred that fetched it
 curl -sS -X POST localhost:3014/tool \
   -H "Authorization: Bearer <user-access-token>" \
   -H 'Content-Type: application/json' \
@@ -137,7 +137,7 @@ curl -sS -X POST localhost:3014/tool \
 # → 200 { "ok": true, "data": { ...record... },
 #         "_diagnostic": { "oboJti": "...", "cred": { "username": "v-token-records-...", "leaseId": "...", "path": "verify-rar/creds/records" } } }
 
-# B. VIP record → 202 pending + a push to your phone (the gateway forces step-up)
+# B. Restricted record → 202 pending + a push to your phone (the gateway forces step-up)
 curl -sS -X POST localhost:3014/tool \
   -H "Authorization: Bearer <user-access-token>" \
   -H 'Content-Type: application/json' \
@@ -147,11 +147,11 @@ curl -sS -X POST localhost:3014/tool \
 curl -sS -X POST localhost:3014/hitl/complete \
   -H "Authorization: Bearer <user-access-token>" \
   -H 'Content-Type: application/json' -d '{"txId":"<from above>"}'
-# → 200 { "ok": true, "data": { ...VIP record... }, "_diagnostic": { ... "cred": { "path": "verify-rar/creds/records-vip" } } }
+# → 200 { "ok": true, "data": { ...restricted record... }, "_diagnostic": { ... "cred": { "path": "verify-rar/creds/records-elevated" } } }
 ```
 
-Notice: **the caller never sent `vip`.** `REC-9001` is flagged VIP in the seed data, and the
-gateway *derived* the step-up server-side - the agent cannot skip it. And the response *shows* the
+Notice: **the caller never requested elevation.** `REC-9001` is classified `restricted` in the seed
+data, and the gateway *derived* the step-up server-side - the agent cannot skip it. And the response *shows* the
 one-time Vault credential that ran the query (`_diagnostic.cred`), which is deliberate:
 [invisible security reads as broken](docs/concepts/observability.md).
 

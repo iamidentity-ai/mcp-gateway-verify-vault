@@ -9,20 +9,21 @@ export interface ListRecordsArgs {
 
 /**
  * A LIST row deliberately carries NO PII (no dob/email) — bulk reads return
- * identifiers + vip_flag only. Personal data is available solely through the
- * single-record reads (get_record / get_record_detail / get_record_history),
- * which the gateway VIP-gates per record. This closes the bulk-PII path: a
- * caller cannot pull a VIP record's dob/email by LISTING instead of reading it.
+ * identifiers + classification only. Personal data is available solely through
+ * the single-record reads (get_record / get_record_detail / get_record_history),
+ * which the gateway step-up-gates per record. This closes the bulk-PII path: a
+ * caller cannot pull a restricted record's dob/email by LISTING instead of
+ * reading it.
  */
 export interface ListRecordRow {
   record_id: string;
   display_name: string;
-  vip_flag: boolean;
+  classification: string;
 }
 
 export async function listRecords(pool: pg.Pool, args: ListRecordsArgs): Promise<ListRecordRow[]> {
   const { rows } = await pool.query(
-    `SELECT r.record_id, r.display_name, r.vip_flag
+    `SELECT r.record_id, r.display_name, r.classification
        FROM records_demo.records r
        JOIN records_demo.assignments a ON a.record_id = r.record_id
        JOIN records_demo.owners o ON o.id = a.owner_id

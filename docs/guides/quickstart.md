@@ -105,10 +105,10 @@ RFC 8693 subject token). Two ways to grab one, from the [smoke script header](..
     -d scope="openid records:read records:write" | jq -r .access_token
   ```
 
-The token must belong to a user with a registered **push factor**, or the VIP step-up cannot park a
-real challenge.
+The token must belong to a user with a registered **push factor**, or the elevated step-up cannot
+park a real challenge.
 
-**A - a routine read.** Non-VIP `REC-1001` returns the row *and* the ephemeral cred that fetched it:
+**A - a routine read.** Public `REC-1001` returns the row *and* the ephemeral cred that fetched it:
 
 ```bash
 curl -sS -X POST localhost:3014/tool \
@@ -119,12 +119,12 @@ curl -sS -X POST localhost:3014/tool \
 ```jsonc
 // 200
 { "ok": true,
-  "data": { "record_id": "REC-1001", "display_name": "Dana Reyes", "vip_flag": false, "...": "..." },
+  "data": { "record_id": "REC-1001", "display_name": "Dana Reyes", "classification": "public", "...": "..." },
   "_diagnostic": { "oboJti": "…", "cred": { "username": "v-token-records-…", "path": "verify-rar/creds/records" } } }
 ```
 
-**B - a step-up read.** VIP `REC-9001` returns `202 pending` with a push to your phone. **The caller
-never sent `vip`** - the gateway [derived it](../concepts/human-in-the-loop.md):
+**B - a step-up read.** Restricted `REC-9001` returns `202 pending` with a push to your phone. **The
+caller never requested elevation** - the gateway [derived it](../concepts/human-in-the-loop.md):
 
 ```bash
 curl -sS -X POST localhost:3014/tool \
@@ -140,7 +140,7 @@ Approve the push, then resume with the **same bearer**:
 curl -sS -X POST localhost:3014/hitl/complete \
   -H "Authorization: Bearer <user-access-token>" \
   -H 'Content-Type: application/json' -d '{"txId":"<from above>"}'
-# → 200 { "ok": true, "data": { …VIP record… }, "_diagnostic": { "cred": { "path": "verify-rar/creds/records-vip" } } }
+# → 200 { "ok": true, "data": { …restricted record… }, "_diagnostic": { "cred": { "path": "verify-rar/creds/records-elevated" } } }
 ```
 
 ## Step 6 - the automated proof
@@ -151,8 +151,8 @@ SMOKE_SUBJECT_TOKEN=<user-access-token> \
 npm run smoke
 ```
 
-`smoke` asserts, positive **and** negative: tier-1 read → `200` + real OBO/cred; VIP read → `202
-pending` + `txId`; tier-4 delete → `403` *before Verify is contacted*; unknown tool → `403`. It
+`smoke` asserts, positive **and** negative: tier-1 read → `200` + real OBO/cred; restricted read →
+`202 pending` + `txId`; tier-4 delete → `403` *before Verify is contacted*; unknown tool → `403`. It
 exits non-zero on any failure.
 
 ## Troubleshooting
@@ -162,7 +162,7 @@ exits non-zero on any failure.
 | `401 { "error": "missing_bearer" }` | No `Authorization` header. | Every user route is bearer-gated; add `-H "Authorization: Bearer …"`. |
 | `401 { "ok": false, "error": "inactive_session" }` | Introspection failed - expired token, or the gateway can't reach Verify (fail-closed). | Refresh the token; confirm `VERIFY_TENANT_URL` and network reachability. |
 | `200` but `_diagnostic: {}` | The call did not go through exchange+mint. | You're likely looking at a denied/killed result - check `ok`/`denied`. See [observability](../concepts/observability.md). |
-| VIP record returns `200` immediately (no push) | `readVipFlag` isn't finding `vip_flag` - usually the upstream envelope shape. | Confirm the naive MCP returns the record inside `content[0].text`; check `config/rar.json → vipElevation.vipField`. |
+| Restricted record returns `200` immediately (no push) | `shouldStepUp` isn't finding `classification` - usually the upstream envelope shape. | Confirm the naive MCP returns the record inside `content[0].text`; check `config/rar.json → stepUp.elevateWhen`. |
 | `403 denied` on a tool you expected to work | It's tier 4 (blocked) or an unknown tool name. | Check `config/tools.json`; see [add a tool](add-a-tool.md). |
 | Step-up push never arrives | The user has no registered push factor, or policy didn't fire `mfa_challenge`. | Register a push factor; verify the access policy is ACTIVE/fedSSO and bound to the TE app ([step-up policies](step-up-policies.md)). |
 | `CSIAQ0155E` / `invalid_client` in logs, one retry, then fine | Verify Vault plugin rotated the client secret on read; the cache was briefly stale. | Expected - the single narrow-invalidation retry handles it. A "waiting Ns for propagation" log line would be the bug. |

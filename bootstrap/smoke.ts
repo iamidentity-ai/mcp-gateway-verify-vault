@@ -21,16 +21,16 @@
  *           -d client_id=<ui_client_id> -d client_secret=<ui_secret> \
  *           -d scope="openid records:read records:write" | jq -r .access_token
  * The token must belong to a user with a registered MFA (push) factor, or the
- * VIP step-up assertion below cannot park a real challenge.
+ * elevated step-up assertion below cannot park a real challenge.
  *
  * ── What it proves (positive AND negative) ──────────────────────────────────
- *   1. Tier-1 read on a NON-VIP id -> 200 ok + a real OBO + ephemeral cred.
- *   2. Read on a VIP id           -> 202 pending (step-up parked). The gateway
- *      DERIVES the VIP elevation (the caller never sends vip) and forces a push
+ *   1. Tier-1 read on a PUBLIC id  -> 200 ok + a real OBO + ephemeral cred.
+ *   2. Read on a RESTRICTED id     -> 202 pending (step-up parked). The gateway
+ *      DERIVES the elevation (the caller never requests it) and forces a push
  *      — a script can't tap a phone, so this asserts pending + a txId and tells
  *      you to approve manually to finish the flow.
- *   3. Tier-4 (delete)            -> 403 denied BEFORE Verify is contacted.
- *   4. Unknown tool               -> 403 denied (unknown_tool).
+ *   3. Tier-4 (delete)             -> 403 denied BEFORE Verify is contacted.
+ *   4. Unknown tool                -> 403 denied (unknown_tool).
  */
 
 const GATEWAY_URL = (process.env['GATEWAY_URL'] || 'http://127.0.0.1:3014').replace(/\/+$/, '');
@@ -40,9 +40,9 @@ if (!SUBJECT_TOKEN) {
   process.exit(1);
 }
 
-// Seed ids (examples/db/seed.sql): REC-1001..1004 standard, REC-9001..9003 VIP.
-const NONVIP_ID = process.env['SMOKE_NONVIP_ID'] || 'REC-1001';
-const VIP_ID = process.env['SMOKE_VIP_ID'] || 'REC-9001';
+// Seed ids (examples/db/seed.sql): REC-1001..1004 public, REC-9001..9003 restricted.
+const PUBLIC_ID = process.env['SMOKE_PUBLIC_ID'] || 'REC-1001';
+const ELEVATED_ID = process.env['SMOKE_ELEVATED_ID'] || 'REC-9001';
 const DELETE_ID = process.env['SMOKE_DELETE_ID'] || 'REC-1001';
 
 interface ToolResponse {
@@ -79,7 +79,7 @@ function record(name: string, pass: boolean, detail: string): void {
 }
 
 async function assertTier1Read(): Promise<void> {
-  const { status, body } = await callTool('get_record', { recordId: NONVIP_ID });
+  const { status, body } = await callTool('get_record', { recordId: PUBLIC_ID });
   const diag = (body['_diagnostic'] ?? {}) as Record<string, unknown>;
   // Proof the exchange + mint ran = the ephemeral Vault cred (you cannot mint
   // one without a valid OBO). The OBO's jti is shown for cross-system correlation.
@@ -88,7 +88,7 @@ async function assertTier1Read(): Promise<void> {
   const oboLeaked = 'obo' in diag;
   const pass = status === 200 && body['ok'] === true && hasCred && !oboLeaked;
   record(
-    'tier-1 read (non-VIP) -> 200 ok + ephemeral cred, no raw OBO leak',
+    'tier-1 read (public) -> 200 ok + ephemeral cred, no raw OBO leak',
     pass,
     pass
       ? `200 ok; OBO jti=${String(diag['oboJti'] ?? 'n/a')}, cred path=${String((diag['cred'] as Record<string, unknown>)?.['path'] ?? 'n/a')}`
@@ -96,11 +96,11 @@ async function assertTier1Read(): Promise<void> {
   );
 }
 
-async function assertVipStepUp(): Promise<void> {
-  const { status, body } = await callTool('get_record', { recordId: VIP_ID });
+async function assertElevatedStepUp(): Promise<void> {
+  const { status, body } = await callTool('get_record', { recordId: ELEVATED_ID });
   const pass = status === 202 && body['pending'] === true && typeof body['txId'] === 'string';
   record(
-    'VIP read -> 202 pending (gateway-forced step-up)',
+    'restricted read -> 202 pending (gateway-forced step-up)',
     pass,
     pass
       ? `202 pending, txId=${String(body['txId'])} — APPROVE THE PUSH ON YOUR PHONE, then POST /hitl/complete {txId} to finish manually`
@@ -108,18 +108,18 @@ async function assertVipStepUp(): Promise<void> {
   );
 }
 
-// A SIBLING read (detail) of the SAME VIP record must ALSO be gated — the
-// gateway probes the parent record's VIP status via probeTool, so an agent
+// A SIBLING read (detail) of the SAME restricted record must ALSO be gated — the
+// gateway probes the parent record's classification via probeTool, so an agent
 // cannot dodge the step-up by calling get_record_detail instead of get_record.
-async function assertVipStepUpOnSiblingRead(): Promise<void> {
-  const { status, body } = await callTool('get_record_detail', { recordId: VIP_ID });
+async function assertElevatedStepUpOnSiblingRead(): Promise<void> {
+  const { status, body } = await callTool('get_record_detail', { recordId: ELEVATED_ID });
   const pass = status === 202 && body['pending'] === true;
   record(
-    'VIP DETAIL read (sibling tool) -> 202 pending (no VIP-bypass via a non-get_record tool)',
+    'restricted DETAIL read (sibling tool) -> 202 pending (no bypass via a non-get_record tool)',
     pass,
     pass
-      ? `202 pending — sibling reads are VIP-gated, not just get_record`
-      : `LEAK? get_record_detail on a VIP id returned status=${status} pending=${String(body['pending'])} body=${JSON.stringify(body).slice(0, 200)}`,
+      ? `202 pending — sibling reads are gated too, not just get_record`
+      : `LEAK? get_record_detail on a restricted id returned status=${status} pending=${String(body['pending'])} body=${JSON.stringify(body).slice(0, 200)}`,
   );
 }
 
@@ -159,8 +159,8 @@ async function main(): Promise<void> {
   }
 
   await assertTier1Read();
-  await assertVipStepUp();
-  await assertVipStepUpOnSiblingRead();
+  await assertElevatedStepUp();
+  await assertElevatedStepUpOnSiblingRead();
   await assertTier4Denied();
   await assertUnknownTool();
 
@@ -172,7 +172,7 @@ async function main(): Promise<void> {
     console.error(`FAILED: ${failed.map((f) => f.name).join('; ')}`);
     process.exit(1);
   }
-  console.log('All assertions passed. (The VIP step-up is parked pending — approve it on your phone to see the full flow complete.)');
+  console.log('All assertions passed. (The elevated step-up is parked pending — approve it on your phone to see the full flow complete.)');
 }
 
 main().catch((err) => {

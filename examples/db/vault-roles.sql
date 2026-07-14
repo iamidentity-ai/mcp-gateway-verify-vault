@@ -9,37 +9,39 @@
 -- Mapping to the gateway's config/rar.json creds paths (bootstrap/vault.ts
 -- generates the matching Vault roles; the pgRole is derived tier-driven by
 -- classifyActions, NOT by a positional scan):
---   verify-rar/creds/records        -> records_read       (record_read)     — NON-VIP rows only (RLS)
---   verify-rar/creds/records-vip    -> records_read_vip   (record_read_vip) — ALL rows (RLS permits)
---   verify-rar/creds/records-write  -> records_write      (record_write)
+--   verify-rar/creds/records          -> records_read          (record_read)          — PUBLIC rows only (RLS)
+--   verify-rar/creds/records-elevated -> records_read_elevated (record_read_elevated) — ALL rows (RLS permits)
+--   verify-rar/creds/records-write    -> records_write         (record_write)
 --
 -- DEFENSE IN DEPTH (Row-Level Security, below): the base records_read role
--- CANNOT read VIP rows even if a caller reaches a read tool the gateway's VIP
--- discovery does not cover — VIP data is readable ONLY through records_read_vip,
--- which the gateway mints ONLY after a completed Verify step-up. The gateway's
--- discovery probe reads through records_read; for a VIP record RLS returns no
--- row, readVipFlag FAILS CLOSED, and the gateway forces the step-up. Enforcement
--- thus holds at BOTH the gateway (primary) and the data layer (backstop).
+-- CANNOT read restricted rows even if a caller reaches a read tool the gateway's
+-- step-up discovery does not cover — restricted data is readable ONLY through
+-- records_read_elevated, which the gateway mints ONLY after a completed Verify
+-- step-up. The gateway's discovery probe reads through records_read; for a
+-- restricted record RLS returns no row, shouldStepUp FAILS CLOSED, and the
+-- gateway forces the step-up. Enforcement thus holds at BOTH the gateway
+-- (primary) and the data layer (backstop).
 --
 -- NOTE: this RLS is validated against a live Postgres (bootstrap smoke / Task 7),
 -- not by the offline unit suite.
 
 DO $$
 BEGIN
-  -- Base read role: RLS (below) restricts it to NON-VIP rows.
+  -- Base read role: RLS (below) restricts it to PUBLIC rows.
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'records_read') THEN
     CREATE ROLE records_read NOLOGIN;
   END IF;
   GRANT USAGE ON SCHEMA records_demo TO records_read;
   GRANT SELECT ON ALL TABLES IN SCHEMA records_demo TO records_read;
 
-  -- VIP read role: same grants, but its RLS policy sees ALL rows. The gateway
-  -- mints from this role ONLY after a Verify step-up (record_read_vip action).
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'records_read_vip') THEN
-    CREATE ROLE records_read_vip NOLOGIN;
+  -- Elevated read role: same grants, but its RLS policy sees ALL rows. The
+  -- gateway mints from this role ONLY after a Verify step-up
+  -- (record_read_elevated action).
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'records_read_elevated') THEN
+    CREATE ROLE records_read_elevated NOLOGIN;
   END IF;
-  GRANT USAGE ON SCHEMA records_demo TO records_read_vip;
-  GRANT SELECT ON ALL TABLES IN SCHEMA records_demo TO records_read_vip;
+  GRANT USAGE ON SCHEMA records_demo TO records_read_elevated;
+  GRANT SELECT ON ALL TABLES IN SCHEMA records_demo TO records_read_elevated;
 
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'records_write') THEN
     CREATE ROLE records_write NOLOGIN;
@@ -52,13 +54,13 @@ BEGIN
   -- The verify-rar plugin connection user needs ADMIN OPTION to re-grant these.
   -- bootstrap/vault.ts sets VERIFY_RAR_DB_USER; grant to it if it already exists.
   IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'vault_rar_admin') THEN
-    GRANT records_read     TO vault_rar_admin WITH ADMIN OPTION;
-    GRANT records_read_vip TO vault_rar_admin WITH ADMIN OPTION;
-    GRANT records_write    TO vault_rar_admin WITH ADMIN OPTION;
+    GRANT records_read          TO vault_rar_admin WITH ADMIN OPTION;
+    GRANT records_read_elevated TO vault_rar_admin WITH ADMIN OPTION;
+    GRANT records_write         TO vault_rar_admin WITH ADMIN OPTION;
   END IF;
 END $$;
 
--- ── Row-Level Security: the DATA-LAYER VIP boundary ─────────────────────────
+-- ── Row-Level Security: the DATA-LAYER classification boundary ──────────────
 -- Idempotent (DROP POLICY IF EXISTS then CREATE). RLS applies to the ephemeral
 -- users because they are granted membership in these roles and are neither the
 -- table owner (the migration superuser) nor BYPASSRLS. The naive_admin fallback
@@ -68,27 +70,27 @@ ALTER TABLE records_demo.records        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE records_demo.record_details ENABLE ROW LEVEL SECURITY;
 ALTER TABLE records_demo.record_history ENABLE ROW LEVEL SECURITY;
 
--- records: non-VIP role sees only vip_flag=false; VIP + write roles see all.
-DROP POLICY IF EXISTS records_nonvip    ON records_demo.records;
-DROP POLICY IF EXISTS records_vip_all   ON records_demo.records;
+-- records: base role sees only classification='public'; elevated + write roles see all.
+DROP POLICY IF EXISTS records_public    ON records_demo.records;
+DROP POLICY IF EXISTS records_elevated  ON records_demo.records;
 DROP POLICY IF EXISTS records_write_all ON records_demo.records;
-CREATE POLICY records_nonvip    ON records_demo.records FOR SELECT TO records_read     USING (vip_flag = false);
-CREATE POLICY records_vip_all   ON records_demo.records FOR ALL    TO records_read_vip USING (true);
-CREATE POLICY records_write_all ON records_demo.records FOR ALL    TO records_write    USING (true) WITH CHECK (true);
+CREATE POLICY records_public    ON records_demo.records FOR SELECT TO records_read          USING (classification = 'public');
+CREATE POLICY records_elevated  ON records_demo.records FOR ALL    TO records_read_elevated USING (true);
+CREATE POLICY records_write_all ON records_demo.records FOR ALL    TO records_write         USING (true) WITH CHECK (true);
 
--- record_details / record_history: gate on the PARENT record's vip_flag. The
+-- record_details / record_history: gate on the PARENT record's classification. The
 -- inner SELECT runs under the same role, so records' own RLS already limits it
--- to non-VIP rows for records_read — the explicit vip_flag=false is belt-and-braces.
-DROP POLICY IF EXISTS record_details_nonvip    ON records_demo.record_details;
-DROP POLICY IF EXISTS record_details_vip_all   ON records_demo.record_details;
+-- to public rows for records_read — the explicit classification='public' is belt-and-braces.
+DROP POLICY IF EXISTS record_details_public   ON records_demo.record_details;
+DROP POLICY IF EXISTS record_details_elevated ON records_demo.record_details;
 DROP POLICY IF EXISTS record_details_write_all ON records_demo.record_details;
-CREATE POLICY record_details_nonvip ON records_demo.record_details FOR SELECT TO records_read
-  USING (EXISTS (SELECT 1 FROM records_demo.records r WHERE r.record_id = record_details.record_id AND r.vip_flag = false));
-CREATE POLICY record_details_vip_all   ON records_demo.record_details FOR ALL TO records_read_vip USING (true);
-CREATE POLICY record_details_write_all ON records_demo.record_details FOR ALL TO records_write    USING (true) WITH CHECK (true);
+CREATE POLICY record_details_public ON records_demo.record_details FOR SELECT TO records_read
+  USING (EXISTS (SELECT 1 FROM records_demo.records r WHERE r.record_id = record_details.record_id AND r.classification = 'public'));
+CREATE POLICY record_details_elevated  ON records_demo.record_details FOR ALL TO records_read_elevated USING (true);
+CREATE POLICY record_details_write_all ON records_demo.record_details FOR ALL TO records_write         USING (true) WITH CHECK (true);
 
-DROP POLICY IF EXISTS record_history_nonvip  ON records_demo.record_history;
-DROP POLICY IF EXISTS record_history_vip_all ON records_demo.record_history;
-CREATE POLICY record_history_nonvip ON records_demo.record_history FOR SELECT TO records_read
-  USING (EXISTS (SELECT 1 FROM records_demo.records r WHERE r.record_id = record_history.record_id AND r.vip_flag = false));
-CREATE POLICY record_history_vip_all ON records_demo.record_history FOR ALL TO records_read_vip USING (true);
+DROP POLICY IF EXISTS record_history_public   ON records_demo.record_history;
+DROP POLICY IF EXISTS record_history_elevated ON records_demo.record_history;
+CREATE POLICY record_history_public ON records_demo.record_history FOR SELECT TO records_read
+  USING (EXISTS (SELECT 1 FROM records_demo.records r WHERE r.record_id = record_history.record_id AND r.classification = 'public'));
+CREATE POLICY record_history_elevated ON records_demo.record_history FOR ALL TO records_read_elevated USING (true);

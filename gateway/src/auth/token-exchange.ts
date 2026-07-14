@@ -181,7 +181,7 @@ const DENY_SUFFIX = "If you didn't request this, deny.";
  */
 const ACTION_PHRASES: Record<string, string> = {
   record_read: 'view a record',
-  record_read_vip: 'view a VIP record',
+  record_read_elevated: 'view a restricted record',
   record_write: 'update a record',
   record_delete: 'delete a record',
 };

@@ -12,9 +12,10 @@ importantly - what the gateway does *not* claim.
   and **revoked in a `finally`** on completion. Compromising the gateway mid-call yields at most one
   short-lived credential for one operation - not a durable foothold. (Contrast the naive server's
   fallback: a single static admin credential for everyone.)
-- **Read a VIP record without a live human approval.** VIP is detected **server-side**; the agent
-  can't set it, and the gateway re-runs a VIP record through the elevated RAR that makes IdP policy
-  require a push. A compromised agent with a valid bearer still lights up the real user's phone.
+- **Read a restricted record without a live human approval.** Classification is detected
+  **server-side**; the agent can't request elevation, and the gateway re-runs a restricted record
+  through the elevated RAR that makes IdP policy require a push. A compromised agent with a valid
+  bearer still lights up the real user's phone.
 - **Write without approval.** Tier 2 requires a policy-driven push; tier 3 requires a push on **every**
   call - enforced by IdP policy on the RAR, not by gateway code that could be edited around.
 - **Invoke a blocked operation.** Tier 4 (`delete_record`) is denied at the gate, before the IdP is
@@ -43,7 +44,7 @@ token. (`VAULT_KEY` is a dev-only override; never set it in a real deployment.) 
 
 ## Honest boundaries - what the gateway does *not* claim
 
-- With a valid live bearer, an attacker **can** perform tier-1 reads of non-VIP records the user is
+- With a valid live bearer, an attacker **can** perform tier-1 reads of public records the user is
   entitled to (Token-Exchange only, no human check). The gateway enforces IdP policy; it is not an
   anomaly detector on reads.
 - In-memory state (deny counter, kill-gate, pending store, audit ring buffer) is **per-process and

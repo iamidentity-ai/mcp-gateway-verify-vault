@@ -20,16 +20,23 @@
  *       default      — exactly ONE action must set true; any action without
  *                      its own (non-blocked) entry collapses onto it
  *       elevatedFrom — marks this action as the step-up of the named base
- *                      action: `vip: true` on the base elevates to this one
+ *                      action: an `elevated: true` read on the base elevates
+ *                      to this one
  *       blocked      — never reaches token exchange. Tier 4 is already gated
  *                      in policy/tiers.ts before RAR is built; the entry here
  *                      is documentation + validation. For collapse purposes a
  *                      blocked action behaves like an unmapped one (falls to
  *                      the default action) — it can never be minted from.
- *   vipElevation — the gateway-derived VIP step-up (pipeline.ts step 2.5):
+ *   stepUp — the gateway-derived step-up (pipeline.ts step 2.5):
  *       discoveryTools — tool names whose reads run the cheap discovery probe
- *       vipField       — field on the discovery-read result that marks the
- *                        row as VIP (elevation-worthy)
+ *       elevateWhen    — declarative match rule evaluated against the
+ *                        discovery-read result; a match forces the step-up.
+ *                        Exactly ONE matcher is set:
+ *                          equals — value === equals
+ *                          in     — in.includes(value)      (allow-list)
+ *                          notIn  — !notIn.includes(value)  (fail-closed
+ *                                   safe-list: elevate for anything NOT
+ *                                   explicitly safe, incl. unknown levels)
  *
  * The file is read via fs at module load (same readFileSync-at-import
  * pattern as policy/tiers.ts — no ESM import-attribute requirement under
@@ -53,14 +60,27 @@ export interface RarActionConfig {
   blocked?: boolean;
 }
 
-export interface RarVipElevationConfig {
+/**
+ * Declarative match rule for stepUp.elevateWhen. Exactly ONE of
+ * equals/in/notIn is set (validated at parse). Evaluated against the value at
+ * `field` on the unwrapped discovery-read record.
+ */
+export interface ElevateWhenRule {
+  field: string;
+  equals?: unknown;
+  in?: unknown[];
+  notIn?: unknown[];
+}
+
+export interface RarStepUpConfig {
   discoveryTools: string[];
-  vipField: string;
+  elevateWhen: ElevateWhenRule;
   /**
-   * Tool the discovery probe CALLS to learn vipField. Defaults to the requested
-   * tool. Set it so record-scoped reads whose OWN result does not carry vipField
-   * (detail/history rows) can probe the PARENT record's VIP status via a single
-   * flag-carrying read (e.g. get_record). Must be one of discoveryTools.
+   * Tool the discovery probe CALLS to learn the classification. Defaults to the
+   * requested tool. Set it so record-scoped reads whose OWN result does not
+   * carry the classification field (detail/history rows) can probe the PARENT
+   * record's classification via a single flag-carrying read (e.g. get_record).
+   * Must be one of discoveryTools.
    */
   probeTool?: string;
 }
@@ -70,7 +90,7 @@ export interface RarConfig {
   idField: string;
   argIdKey: string;
   actions: Record<string, RarActionConfig>;
-  vipElevation: RarVipElevationConfig;
+  stepUp: RarStepUpConfig;
   /** Derived at parse: the single actions entry with `default: true`. */
   defaultAction: string;
   /** Derived at parse: base action → the action that `elevatedFrom`s it. */
@@ -95,8 +115,9 @@ function requireNonEmptyString(value: unknown, field: string): string {
  *   - every non-blocked action has a credsPath
  *   - every `elevatedFrom` references an existing action, and no two actions
  *     elevate from the same base (elevation must be unambiguous)
- *   - vipElevation, when present, has a string[] discoveryTools and a
- *     non-empty vipField; when absent, VIP discovery is simply disabled
+ *   - stepUp, when present, has a string[] discoveryTools and an elevateWhen
+ *     rule with a non-empty field and EXACTLY ONE of equals/in/notIn; when
+ *     absent, step-up discovery is simply disabled
  */
 export function parseRarConfig(raw: unknown): RarConfig {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
@@ -154,41 +175,76 @@ export function parseRarConfig(raw: unknown): RarConfig {
     }
   }
 
-  let vipElevation: RarVipElevationConfig = { discoveryTools: [], vipField: '' };
-  if (cfg['vipElevation'] !== undefined) {
-    const ve = cfg['vipElevation'];
-    if (typeof ve !== 'object' || ve === null || Array.isArray(ve)) {
-      throw new RarConfigError('config/rar.json: "vipElevation" must be an object');
+  let stepUp: RarStepUpConfig = { discoveryTools: [], elevateWhen: { field: '' } };
+  if (cfg['stepUp'] !== undefined) {
+    const su = cfg['stepUp'];
+    if (typeof su !== 'object' || su === null || Array.isArray(su)) {
+      throw new RarConfigError('config/rar.json: "stepUp" must be an object');
     }
-    const veObj = ve as Record<string, unknown>;
-    const discoveryTools = veObj['discoveryTools'] ?? [];
+    const suObj = su as Record<string, unknown>;
+    const discoveryTools = suObj['discoveryTools'] ?? [];
     if (!Array.isArray(discoveryTools) || discoveryTools.some((t) => typeof t !== 'string' || t === '')) {
       throw new RarConfigError(
-        'config/rar.json: vipElevation.discoveryTools must be an array of tool-name strings',
+        'config/rar.json: stepUp.discoveryTools must be an array of tool-name strings',
       );
     }
     let probeTool: string | undefined;
-    if (veObj['probeTool'] !== undefined) {
-      probeTool = requireNonEmptyString(veObj['probeTool'], 'vipElevation.probeTool');
+    if (suObj['probeTool'] !== undefined) {
+      probeTool = requireNonEmptyString(suObj['probeTool'], 'stepUp.probeTool');
       if (!(discoveryTools as string[]).includes(probeTool)) {
         throw new RarConfigError(
-          `config/rar.json: vipElevation.probeTool "${probeTool}" must be listed in discoveryTools`,
+          `config/rar.json: stepUp.probeTool "${probeTool}" must be listed in discoveryTools`,
         );
       }
     }
-    vipElevation = {
+    stepUp = {
       discoveryTools: discoveryTools as string[],
-      vipField: requireNonEmptyString(veObj['vipField'], 'vipElevation.vipField'),
+      elevateWhen: parseElevateWhen(suObj['elevateWhen']),
       probeTool,
     };
   }
 
-  return { rarType, idField, argIdKey, actions, vipElevation, defaultAction, elevationByBase };
+  return { rarType, idField, argIdKey, actions, stepUp, defaultAction, elevationByBase };
+}
+
+/**
+ * Validate + return the declarative elevateWhen match rule. `field` must be a
+ * non-empty string, and EXACTLY ONE of equals/in/notIn must be set (a
+ * RarConfigError naming the rule otherwise). `in`/`notIn`, when set, must be
+ * arrays. `notIn` is the fail-closed safe-list: the gateway elevates for any
+ * value NOT explicitly listed (including unknown/new levels).
+ */
+export function parseElevateWhen(raw: unknown): ElevateWhenRule {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new RarConfigError('config/rar.json: stepUp.elevateWhen must be an object');
+  }
+  const r = raw as Record<string, unknown>;
+  const field = requireNonEmptyString(r['field'], 'stepUp.elevateWhen.field');
+
+  const setMatchers = (['equals', 'in', 'notIn'] as const).filter((k) => r[k] !== undefined);
+  if (setMatchers.length !== 1) {
+    throw new RarConfigError(
+      `config/rar.json: stepUp.elevateWhen (field "${field}") must set EXACTLY ONE of equals/in/notIn (found ${setMatchers.length})`,
+    );
+  }
+  for (const key of ['in', 'notIn'] as const) {
+    if (r[key] !== undefined && !Array.isArray(r[key])) {
+      throw new RarConfigError(
+        `config/rar.json: stepUp.elevateWhen.${key} (field "${field}") must be an array`,
+      );
+    }
+  }
+  return {
+    field,
+    ...(r['equals'] !== undefined ? { equals: r['equals'] } : {}),
+    ...(r['in'] !== undefined ? { in: r['in'] as unknown[] } : {}),
+    ...(r['notIn'] !== undefined ? { notIn: r['notIn'] as unknown[] } : {}),
+  };
 }
 
 /**
  * True when `credsPath` belongs to an ELEVATED action (one declaring
- * `elevatedFrom`). Replaces the old hardcoded `credsPath.includes('-vip')`
+ * `elevatedFrom`). Replaces the old hardcoded `credsPath.includes('-elevated')`
  * display heuristic in pipeline.ts — the config, not a path-suffix naming
  * convention, is what defines "elevated".
  */

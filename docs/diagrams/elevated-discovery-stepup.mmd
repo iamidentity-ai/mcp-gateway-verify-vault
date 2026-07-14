@@ -1,5 +1,5 @@
-%% Gateway-derived VIP discovery -> policy-enforced step-up.
-%% The agent CANNOT set vip - the gateway decides server-side.
+%% Gateway-derived classification discovery -> policy-enforced step-up.
+%% The agent CANNOT request elevation - the gateway decides server-side.
 %% Ported (genericized to the records domain) from the reference deployment.
 sequenceDiagram
     autonumber
@@ -10,7 +10,7 @@ sequenceDiagram
     participant N as Naive MCP
     participant U as User phone (Verify app)
 
-    Note over C,G: get_record - the agent CANNOT set vip
+    Note over C,G: get_record - the agent CANNOT request elevation
     C->>G: /tool get_record {recordId}
 
     rect rgb(224, 236, 255)
@@ -19,25 +19,25 @@ sequenceDiagram
     V-->>G: OBO - standard read, policy allows, no push
     G->>K: mint records cred
     G->>N: read record
-    N-->>G: record incl. vip_flag
+    N-->>G: record incl. classification
     end
 
-    alt vip_flag == false
+    alt classification == public
         G-->>C: 200 record - the discovery read IS the delivered read
-    else vip_flag == true
-        Note over G: discard probe data · audit vip_discovery · force step-up
-        G->>V: re-exchange · rarAction = record_read_vip
-        Note over V: CELX RecordsVipRead matches<br/>operationDetails.action == record_read_vip<br/>policy Records-RAR-HITL -> ACTION_MFA_ALWAYS
+    else classification == restricted
+        Note over G: discard probe data · audit stepup_discovery · force step-up
+        G->>V: re-exchange · rarAction = record_read_elevated
+        Note over V: CELX RecordsElevatedRead matches<br/>operationDetails.action == record_read_elevated<br/>policy Records-RAR-HITL -> ACTION_MFA_ALWAYS
         V-->>G: 200 scope=mfa_challenge + challenge token
         G->>V: trigger push (newest userPresence factor)
-        V->>U: Approve VIP read of record N?
+        V->>U: Approve restricted read of record N?
         U-->>V: approve
         G->>V: poll transactionUri (returnJwt=true)
         V-->>G: VERIFY_SUCCESS + assertion JWT
         G->>V: jwt_bearer leg 2 - RE-SEND authorization_details
-        V-->>G: OBO (VIP-scoped)
-        G->>K: mint records-vip cred (5-min TTL)
-        G->>N: read record (VIP path)
-        N-->>G: VIP record
+        V-->>G: OBO (elevated-scoped)
+        G->>K: mint records-elevated cred (5-min TTL)
+        G->>N: read record (elevated path)
+        N-->>G: restricted record
         G-->>C: 200 record - step-up enforced
     end

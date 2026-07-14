@@ -26,30 +26,30 @@ from your RAR type's last segment (`records` → prefix `Records`):
 | CELX attribute | Fires `true` when the RAR carries… | Policy rule | Verdict |
 |---|---|---|---|
 | `RecordsDeleteDeny` | a blocked (tier 4) action (`record_delete`) | `Records blocked-action hard deny` | `ACTION_DENY` |
-| `RecordsVipRead` | `operationDetails.action == record_read_vip` | `Records VIP read step-up` | `ACTION_MFA_ALWAYS` |
+| `RecordsElevatedRead` | `operationDetails.action == record_read_elevated` | `Records Elevated read step-up` | `ACTION_MFA_ALWAYS` |
 | `RecordsSensitiveWrite` | a write action (tier 3) | `Records sensitive write` | `ACTION_MFA_ALWAYS` |
 | `RecordsStandardWrite` | a write action (tier 2) | `Records standard write` | `ACTION_MFA_PER_SESSION` |
 | *(none - default rule)* | anything unmatched (tier-1 reads) | `Default rule` | `ACTION_ALLOW` |
 
-The policy is `Records-RAR-HITL`, **rule order is first-match-wins**: DENY → VIP read → sensitive
-write → standard write → default allow. It is bound to the Token-Exchange app via the app-level
-`authPolicy` field.
+The policy is `Records-RAR-HITL`, **rule order is first-match-wins**: DENY → elevated read →
+sensitive write → standard write → default allow. It is bound to the Token-Exchange app via the
+app-level `authPolicy` field.
 
 ### How each tier lands on a verdict
 
 - **Tier 1 (read)** → `record_read` action → no CELX attribute matches → **default `ACTION_ALLOW`**.
   Token Exchange succeeds with no push.
-- **Tier 1 VIP read** → the gateway [derives](../concepts/human-in-the-loop.md) the elevated
-  `record_read_vip` action → `RecordsVipRead` fires → **`ACTION_MFA_ALWAYS`** (push every VIP read).
-  This covers **every** record-scoped read tool, not just `get_record`: the gateway probes the
-  parent record's VIP status with `vipElevation.probeTool` (a flag-carrying read), so
-  `get_record_detail` / `get_record_history` on a VIP record are gated too - an agent cannot dodge
-  the step-up by calling a sibling read. `list_records` returns **no PII** (identifiers + `vip_flag`
-  only), so bulk listing can't leak a VIP record's personal data either. And the check **fails
-  closed**: a probe result the gateway can't parse forces the step-up rather than delivering. A
-  **data-layer backstop** reinforces all of this - the base `records_read` Postgres role is
-  Row-Level-Security-restricted to non-VIP rows, so VIP data is physically unreadable except through
-  the `records_read_vip` role the gateway mints *only* after a completed step-up
+- **Tier 1 elevated read** → the gateway [derives](../concepts/human-in-the-loop.md) the elevated
+  `record_read_elevated` action → `RecordsElevatedRead` fires → **`ACTION_MFA_ALWAYS`** (push every
+  restricted read). This covers **every** record-scoped read tool, not just `get_record`: the gateway
+  probes the parent record's classification with `stepUp.probeTool` (a classification-carrying read),
+  so `get_record_detail` / `get_record_history` on a restricted record are gated too - an agent
+  cannot dodge the step-up by calling a sibling read. `list_records` returns **no PII** (identifiers +
+  `classification` only), so bulk listing can't leak a restricted record's personal data either. And
+  the check **fails closed**: a probe result the gateway can't parse forces the step-up rather than
+  delivering. A **data-layer backstop** reinforces all of this - the base `records_read` Postgres role
+  is Row-Level-Security-restricted to public rows, so restricted data is physically unreadable except
+  through the `records_read_elevated` role the gateway mints *only* after a completed step-up
   (see `examples/db/vault-roles.sql`).
 - **Tier 2 / Tier 3 (write)** → `record_write` action → a write attribute fires → **MFA**. See the
   known-limitation note below on why both currently land on `ACTION_MFA_ALWAYS`.
@@ -95,9 +95,41 @@ config on the next `bootstrap:verify`, or by hand in the Admin console:
   `config/rar.json`, re-run bootstrap).
 - **Relax tier 2 to once-per-session** → this is what `RecordsStandardWrite` +
   `ACTION_MFA_PER_SESSION` is for; it activates once the RAR carries a tool disambiguator.
-- **Protect a different "sensitive row" flag** → point `config/rar.json → vipElevation.vipField` at
-  your flag; the `VipRead` rule then fires on your rows.
+- **Protect a different "sensitive row" field** → point `config/rar.json → stepUp.elevateWhen` at
+  your field (see below); the `ElevatedRead` rule then fires on your rows.
 
 The runtime never changes for any of these. The gateway builds the RAR, sends the exchange, and
 enforces whatever the policy returns. Wiring the **denial-escalation** side (three denials → session
 kill) is a separate concern: [session kill](session-kill.md).
+
+## The `elevateWhen` match rule
+
+Which discovery-read results elevate is a **declarative match rule**, not a hardcoded boolean.
+`config/rar.json → stepUp.elevateWhen` names a `field` on the (unwrapped) discovery-read record and
+sets **exactly one** matcher:
+
+| Matcher | Elevates when | Use it for |
+|---|---|---|
+| `equals` | `value === equals` | a single sensitive value (e.g. `{ "field": "tier", "equals": "platinum" }`). |
+| `in` | `in.includes(value)` | an **allow-list of sensitive values** (e.g. `{ "field": "priority", "in": ["high", "urgent"] }`). |
+| `notIn` | `!notIn.includes(value)` | a **fail-closed safe-list**: elevate for anything NOT explicitly safe. |
+
+The shipped config uses the safe-list:
+
+```jsonc
+"stepUp": {
+  "discoveryTools": ["get_record", "get_record_detail", "get_record_history"],
+  "probeTool": "get_record",
+  "elevateWhen": { "field": "classification", "notIn": ["public", "internal"] }
+}
+```
+
+`notIn` is the **fail-closed** choice, and the recommended default: a record whose `classification`
+is `public` or `internal` is delivered without a push, and **everything else** - `restricted`,
+`confidential`, a brand-new level nobody has taught the gateway about, or a missing/unparseable field
+- forces the step-up. A new sensitive classification is protected the moment it appears, with no
+config change. (`equals`/`in` are allow-lists: they elevate only for the values you name, so an
+unknown level would slip through - prefer `notIn` unless you can enumerate every sensitive value.)
+The whole evaluation also fails closed: a probe result the gateway can't parse into a record, or a
+record missing the `field`, elevates rather than delivers. Config is validated at startup - a rule
+that sets zero or more than one matcher throws a named `RarConfigError`.

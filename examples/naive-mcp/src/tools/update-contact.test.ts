@@ -3,7 +3,7 @@ import { updateContact } from './update-contact.js';
 
 describe('updateContact', () => {
   it('updates the email and returns the row', async () => {
-    const row = { record_id: 'REC-1001', display_name: 'Dana Reyes', email: 'new@example.com', vip_flag: false };
+    const row = { record_id: 'REC-1001', display_name: 'Dana Reyes', email: 'new@example.com', classification: 'public' };
     const pool = { query: vi.fn().mockResolvedValue({ rows: [row] }) } as any;
     const result = await updateContact(pool, { recordId: 'REC-1001', email: 'new@example.com' });
     expect(pool.query).toHaveBeenCalledWith(expect.stringContaining('UPDATE records_demo.records'), ['REC-1001', 'new@example.com']);

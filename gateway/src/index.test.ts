@@ -74,7 +74,7 @@ describe('pipelineResultToEnvelope', () => {
     // production — client.callTool() handed back verbatim, and a naive
     // upstream's handlers all do `return { content: [{ type: 'text', text:
     // JSON.stringify(result) }] }` (no structuredContent).
-    const record = { record_id: 'REC-1006', display_name: 'Marisol Okafor', vip_flag: false };
+    const record = { record_id: 'REC-1006', display_name: 'Marisol Okafor', classification: 'public' };
     const envelope = pipelineResultToEnvelope({
       status: 'ok',
       data: { content: [{ type: 'text', text: JSON.stringify(record) }] },

@@ -41,7 +41,7 @@ into the MCP `CallToolResult` text block (`content[0].text`). The two transports
       "leaseId": "verify-rar/creds/records/…",
       "path": "verify-rar/creds/records"
     },
-    "vipElevated": false               // true iff this went through the VIP step-up path
+    "elevated": false                  // true iff this went through the elevated step-up path
   }
 }
 ```
@@ -60,7 +60,7 @@ string so consumers see the record, not `{ content: [{ text }] }`.
   "ok": false,
   "pending": true,
   "txId": "3f8c…",                     // resume via POST /hitl/complete { txId }
-  "pushInfo": { "title": "Approve: view a VIP record", "message": "…", "transactionUri": "…" }
+  "pushInfo": { "title": "Approve: view a restricted record", "message": "…", "transactionUri": "…" }
 }
 ```
 
@@ -168,7 +168,7 @@ Returns the caller's own audit records (`audit/chain.ts`), most-recent-first, ca
 ] }
 ```
 
-`decision` values: `ok`, `tier4_deny`, `unknown_tool_deny`, `vip_discovery`, `mfa_deny`,
+`decision` values: `ok`, `tier4_deny`, `unknown_tool_deny`, `stepup_discovery`, `mfa_deny`,
 `suspicious_deny_killed`. The audit chain is an in-memory ring buffer (500 records, oldest-evicted,
 non-persistent - see [observability](../concepts/observability.md#the-audit-chain--the-affirmative-deliverable)).
 

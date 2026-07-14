@@ -18,8 +18,9 @@ BEGIN
   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA records_demo TO naive_admin;
   GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA records_demo TO naive_admin;
   -- BYPASSRLS on purpose: the naive fallback is the INSECURE CONTROL — it must
-  -- keep seeing every row (VIP included) despite the Row-Level Security added in
-  -- vault-roles.sql for the gateway's ephemeral roles. That "one identity sees
-  -- everything" behaviour is exactly the anti-pattern the gateway replaces.
+  -- keep seeing every row (restricted included) despite the Row-Level Security
+  -- added in vault-roles.sql for the gateway's ephemeral roles. That "one
+  -- identity sees everything" behaviour is exactly the anti-pattern the gateway
+  -- replaces.
   ALTER ROLE naive_admin BYPASSRLS;
 END $$;

@@ -3,14 +3,31 @@
   "idField": "record_id",
   "argIdKey": "recordId",
   "actions": {
-    "record_read":     { "credsPath": "verify-rar/creds/records", "default": true },
-    "record_read_vip": { "credsPath": "verify-rar/creds/records-vip", "elevatedFrom": "record_read" },
-    "record_write":    { "credsPath": "verify-rar/creds/records-write" },
-    "record_delete":   { "blocked": true }
+    "record_read": {
+      "credsPath": "verify-rar/creds/records",
+      "default": true
+    },
+    "record_read_elevated": {
+      "credsPath": "verify-rar/creds/records-elevated",
+      "elevatedFrom": "record_read"
+    },
+    "record_write": {
+      "credsPath": "verify-rar/creds/records-write"
+    },
+    "record_delete": {
+      "blocked": true
+    }
   },
-  "vipElevation": {
-    "discoveryTools": ["get_record", "get_record_detail", "get_record_history"],
+  "stepUp": {
+    "discoveryTools": [
+      "get_record",
+      "get_record_detail",
+      "get_record_history"
+    ],
     "probeTool": "get_record",
-    "vipField": "vip_flag"
+    "elevateWhen": {
+      "field": "classification",
+      "notIn": ["public", "internal"]
+    }
   }
 }

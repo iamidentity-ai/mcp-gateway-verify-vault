@@ -35,7 +35,7 @@ flowchart LR
 |---|---|---|---|
 | 1 | **Upstream MCP URL** | `UPSTREAM_MCP_URL` env | Point the south face at your naive MCP's `/mcp`. |
 | 2 | **Tier map** | `gateway/config/tools.json` | `tool → { tier, rarAction, scope }` for each of your tools. |
-| 3 | **RAR vocabulary** | `gateway/config/rar.json` | Your business RAR `type`, id field, actions, creds paths, VIP elevation. |
+| 3 | **RAR vocabulary** | `gateway/config/rar.json` | Your business RAR `type`, id field, actions, creds paths, step-up rule. |
 | 4 | **IdP trust** | `bootstrap/verify.ts` (generated from 1–3) | Run it - the TE app, CELX attributes, and access policy are derived. |
 | 5 | **Secrets-engine roles** | `bootstrap/vault.ts` (generated from 3) | Run it - one `verify-rar` role per creds path, plus the OAuth-RS entities. |
 
@@ -112,12 +112,12 @@ This is the file that says what your domain *is*:
   "idField": "order_id",                        // key the domain id is nested under in operationDetails
   "argIdKey": "orderId",                        // the tool-call argument the id is read FROM
   "actions": {
-    "order_read":     { "credsPath": "verify-rar/creds/orders",       "default": true },
-    "order_read_vip": { "credsPath": "verify-rar/creds/orders-vip",   "elevatedFrom": "order_read" },
-    "order_write":    { "credsPath": "verify-rar/creds/orders-write" },
-    "order_delete":   { "blocked": true }
+    "order_read":          { "credsPath": "verify-rar/creds/orders",          "default": true },
+    "order_read_elevated": { "credsPath": "verify-rar/creds/orders-elevated", "elevatedFrom": "order_read" },
+    "order_write":         { "credsPath": "verify-rar/creds/orders-write" },
+    "order_delete":        { "blocked": true }
   },
-  "vipElevation": { "discoveryTools": ["get_order"], "vipField": "priority_flag" }
+  "stepUp": { "discoveryTools": ["get_order"], "elevateWhen": { "field": "priority", "in": ["high", "urgent"] } }
 }
 ```
 
@@ -128,13 +128,15 @@ mystery first-request failure):
   onto it;
 - every non-blocked action has a `credsPath`;
 - every `elevatedFrom` references an existing action, and no two actions elevate from the same base;
-- `vipElevation.discoveryTools` are the tools that run the [server-derived VIP
-  probe](../concepts/human-in-the-loop.md), and `vipField` is the field on a read result that marks
-  a row "sensitive" (here, `priority_flag` instead of `vip_flag`).
+- `stepUp.discoveryTools` are the tools that run the [server-derived classification
+  probe](../concepts/human-in-the-loop.md), and `elevateWhen` is the declarative match rule on a read
+  result that marks a row "sensitive" (here, `priority` **in** `["high", "urgent"]` instead of a
+  `classification` safe-list).
 
-That last block is how you protect *your* sensitive rows: point `vipField` at whatever flag your
-system of record uses, list the read tool(s) that should probe for it, and the gateway forces
-step-up on a match - with the agent unable to skip it.
+That last block is how you protect *your* sensitive rows: point `elevateWhen.field` at whatever field
+your system of record uses (with `equals` / `in` / `notIn` - `notIn` is the fail-closed safe-list),
+list the read tool(s) that should probe for it, and the gateway forces step-up on a match - with the
+agent unable to skip it. See [the elevateWhen match rule](step-up-policies.md#the-elevatewhen-match-rule).
 
 ### ☐ 4. Provision IdP trust - `bootstrap/verify.ts`
 
@@ -144,9 +146,9 @@ GATEWAY_APP_PREFIX="Orders Gateway" npm run bootstrap:verify
 
 It generates and creates, from surfaces 2–3: the Token-Exchange app (with your scopes and the RAR
 plumbing), the Agent Identity app, a UI app, the CELX attributes keyed on your `rarType` +
-actions, and the access policy (deny → VIP MFA → write MFA → allow) bound to the TE app. It prints
-every id and the `.env` lines to set. The [step-up policy guide](step-up-policies.md) explains the
-generated rules.
+actions, and the access policy (deny → elevated MFA → write MFA → allow) bound to the TE app. It
+prints every id and the `.env` lines to set. The [step-up policy guide](step-up-policies.md) explains
+the generated rules.
 
 ### ☐ 5. Provision secrets-engine roles - `bootstrap/vault.ts`
 
@@ -154,7 +156,7 @@ generated rules.
 npm run bootstrap:vault
 ```
 
-It creates one `verify-rar` role per non-blocked creds path (`orders`, `orders-vip`,
+It creates one `verify-rar` role per non-blocked creds path (`orders`, `orders-elevated`,
 `orders-write`), each with a `rar_mappings` entry keyed `<rarType>|<action>` that GRANTs the
 matching Postgres role, plus the two OAuth-RS entities the OBO resolves against (SUBJECT keyed by
 the `agent_id` claim - one entity covers all users - and ACTOR keyed by the OBO's `act.sub`). Your
@@ -178,5 +180,5 @@ changed *what the domain is*, not *how it's secured*. That separation is the pro
 core is the small, stable part; the trust configuration is where your afternoon goes.
 
 > The generated object names carry your `rarType`'s last segment as a prefix (e.g.
-> `Orders-RAR-HITL`, `OrdersVipRead`). That's derived, not hand-authored - rename the `rarType` and
-> the whole naming follows.
+> `Orders-RAR-HITL`, `OrdersElevatedRead`). That's derived, not hand-authored - rename the `rarType`
+> and the whole naming follows.

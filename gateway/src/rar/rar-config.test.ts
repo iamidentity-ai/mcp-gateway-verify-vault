@@ -8,15 +8,16 @@
  *   - validation failures each throw a NAMED RarConfigError (startup, not
  *     first-request): missing/duplicate default, dangling elevatedFrom,
  *     ambiguous elevation, blocked default, empty rarType/idField/argIdKey,
- *     missing credsPath on a non-blocked action, malformed vipElevation
- *   - vipElevation is optional — absence just disables VIP discovery
+ *     missing credsPath on a non-blocked action, malformed stepUp
+ *   - stepUp is optional — absence just disables step-up discovery
  *   - isElevatedCredsPath keys off elevatedFrom entries, not a path-suffix
  *     naming convention
  */
 import { describe, it, expect } from 'vitest';
 import { parseRarConfig, isElevatedCredsPath, rarConfig, RarConfigError } from './rar-config.js';
 
-/** A valid custom-domain fixture (nothing "records" about it). */
+/** A valid custom-domain fixture (nothing "records" about it). Note the
+ *  DIFFERENT matcher (`in`) — proving elevateWhen is generic, not a boolean. */
 function ticketsConfig(): Record<string, unknown> {
   return {
     rarType: 'urn:example:agent:tickets',
@@ -31,7 +32,7 @@ function ticketsConfig(): Record<string, unknown> {
       ticket_write: { credsPath: 'verify-rar/creds/tickets-write' },
       ticket_purge: { blocked: true },
     },
-    vipElevation: { discoveryTools: ['get_ticket'], vipField: 'priority_flag' },
+    stepUp: { discoveryTools: ['get_ticket'], elevateWhen: { field: 'priority', in: ['high', 'urgent'] } },
   };
 }
 
@@ -43,14 +44,14 @@ describe('parseRarConfig — good config', () => {
     expect(cfg.argIdKey).toBe('ticketId');
     expect(cfg.defaultAction).toBe('ticket_read');
     expect(cfg.elevationByBase).toEqual({ ticket_read: 'ticket_read_priority' });
-    expect(cfg.vipElevation).toEqual({ discoveryTools: ['get_ticket'], vipField: 'priority_flag' });
+    expect(cfg.stepUp).toEqual({ discoveryTools: ['get_ticket'], elevateWhen: { field: 'priority', in: ['high', 'urgent'] } });
   });
 
-  it('treats vipElevation as optional — absence disables VIP discovery, no error', () => {
+  it('treats stepUp as optional — absence disables step-up discovery, no error', () => {
     const raw = ticketsConfig();
-    delete raw['vipElevation'];
+    delete raw['stepUp'];
     const cfg = parseRarConfig(raw);
-    expect(cfg.vipElevation.discoveryTools).toEqual([]);
+    expect(cfg.stepUp.discoveryTools).toEqual([]);
   });
 });
 
@@ -60,11 +61,11 @@ describe('the shipped config/rar.json singleton', () => {
     expect(rarConfig.idField).toBe('record_id');
     expect(rarConfig.argIdKey).toBe('recordId');
     expect(rarConfig.defaultAction).toBe('record_read');
-    expect(rarConfig.elevationByBase).toEqual({ record_read: 'record_read_vip' });
-    expect(rarConfig.vipElevation).toEqual({
+    expect(rarConfig.elevationByBase).toEqual({ record_read: 'record_read_elevated' });
+    expect(rarConfig.stepUp).toEqual({
       discoveryTools: ['get_record', 'get_record_detail', 'get_record_history'],
       probeTool: 'get_record',
-      vipField: 'vip_flag',
+      elevateWhen: { field: 'classification', notIn: ['public', 'internal'] },
     });
     // The blocked entry is kept for documentation/validation (tier 4 gates
     // in tiers.ts) — it never carries a credsPath.
@@ -136,27 +137,51 @@ describe('parseRarConfig — validation failures (named error at startup)', () =
     expectRarConfigError(raw, /"actions" must be a non-empty object/);
   });
 
-  it('rejects a vipElevation with an empty vipField', () => {
+  it('rejects a stepUp with an empty elevateWhen.field', () => {
     const raw = ticketsConfig();
-    raw['vipElevation'] = { discoveryTools: ['get_ticket'], vipField: '' };
-    expectRarConfigError(raw, /vipElevation\.vipField/);
+    raw['stepUp'] = { discoveryTools: ['get_ticket'], elevateWhen: { field: '', in: ['high'] } };
+    expectRarConfigError(raw, /stepUp\.elevateWhen\.field/);
   });
 
-  it('rejects a vipElevation whose discoveryTools is not a string array', () => {
+  it('rejects a stepUp whose elevateWhen sets NO matcher', () => {
     const raw = ticketsConfig();
-    raw['vipElevation'] = { discoveryTools: [42], vipField: 'priority_flag' };
-    expectRarConfigError(raw, /vipElevation\.discoveryTools must be an array of tool-name strings/);
+    raw['stepUp'] = { discoveryTools: ['get_ticket'], elevateWhen: { field: 'priority' } };
+    expectRarConfigError(raw, /must set EXACTLY ONE of equals\/in\/notIn \(found 0\)/);
+  });
+
+  it('rejects a stepUp whose elevateWhen sets MORE THAN ONE matcher', () => {
+    const raw = ticketsConfig();
+    raw['stepUp'] = { discoveryTools: ['get_ticket'], elevateWhen: { field: 'priority', in: ['high'], notIn: ['low'] } };
+    expectRarConfigError(raw, /must set EXACTLY ONE of equals\/in\/notIn \(found 2\)/);
+  });
+
+  it('rejects a stepUp whose elevateWhen.in is not an array', () => {
+    const raw = ticketsConfig();
+    raw['stepUp'] = { discoveryTools: ['get_ticket'], elevateWhen: { field: 'priority', in: 'high' } };
+    expectRarConfigError(raw, /stepUp\.elevateWhen\.in .* must be an array/);
+  });
+
+  it('accepts the notIn fail-closed safe-list matcher', () => {
+    const raw = ticketsConfig();
+    raw['stepUp'] = { discoveryTools: ['get_ticket'], elevateWhen: { field: 'classification', notIn: ['public', 'internal'] } };
+    expect(parseRarConfig(raw).stepUp.elevateWhen).toEqual({ field: 'classification', notIn: ['public', 'internal'] });
+  });
+
+  it('rejects a stepUp whose discoveryTools is not a string array', () => {
+    const raw = ticketsConfig();
+    raw['stepUp'] = { discoveryTools: [42], elevateWhen: { field: 'priority', in: ['high'] } };
+    expectRarConfigError(raw, /stepUp\.discoveryTools must be an array of tool-name strings/);
   });
 
   it('accepts a probeTool that is listed in discoveryTools', () => {
     const raw = ticketsConfig();
-    raw['vipElevation'] = { discoveryTools: ['get_ticket', 'get_ticket_line'], probeTool: 'get_ticket', vipField: 'priority_flag' };
-    expect(parseRarConfig(raw).vipElevation.probeTool).toBe('get_ticket');
+    raw['stepUp'] = { discoveryTools: ['get_ticket', 'get_ticket_line'], probeTool: 'get_ticket', elevateWhen: { field: 'priority', in: ['high'] } };
+    expect(parseRarConfig(raw).stepUp.probeTool).toBe('get_ticket');
   });
 
   it('rejects a probeTool that is NOT listed in discoveryTools', () => {
     const raw = ticketsConfig();
-    raw['vipElevation'] = { discoveryTools: ['get_ticket'], probeTool: 'not_a_discovery_tool', vipField: 'priority_flag' };
+    raw['stepUp'] = { discoveryTools: ['get_ticket'], probeTool: 'not_a_discovery_tool', elevateWhen: { field: 'priority', in: ['high'] } };
     expectRarConfigError(raw, /probeTool.*must be listed in discoveryTools/);
   });
 });
@@ -169,8 +194,8 @@ describe('isElevatedCredsPath', () => {
     expect(isElevatedCredsPath('verify-rar/creds/tickets-write', cfg)).toBe(false);
   });
 
-  it('matches the default config the same way the old "-vip" suffix heuristic did', () => {
-    expect(isElevatedCredsPath('verify-rar/creds/records-vip')).toBe(true);
+  it('matches the default config the same way the old "-elevated" suffix heuristic did', () => {
+    expect(isElevatedCredsPath('verify-rar/creds/records-elevated')).toBe(true);
     expect(isElevatedCredsPath('verify-rar/creds/records')).toBe(false);
     expect(isElevatedCredsPath('verify-rar/creds/records-write')).toBe(false);
   });

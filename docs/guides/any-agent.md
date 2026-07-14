@@ -126,7 +126,7 @@ import { z } from "zod";
 function makeGetRecordTool(bearer: string) {
   return new DynamicStructuredTool({
     name: "get_record",
-    description: "Fetch a customer record by id. VIP records require a human approval.",
+    description: "Fetch a customer record by id. Restricted records require a human approval.",
     schema: z.object({ recordId: z.string() }),
     func: async ({ recordId }) => {
       const env = await callGatewayTool("get_record", { recordId }, bearer); // Adapter 1
@@ -164,7 +164,7 @@ async function runAgent(userPrompt: string, bearer: string) {
   const tools: Anthropic.Tool[] = [
     {
       name: "get_record",
-      description: "Fetch a customer record by id. VIP records trigger a human approval push.",
+      description: "Fetch a customer record by id. Restricted records trigger a human approval push.",
       input_schema: {
         type: "object",
         properties: { recordId: { type: "string" } },

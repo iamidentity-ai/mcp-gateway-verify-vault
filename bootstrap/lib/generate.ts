@@ -18,7 +18,7 @@
  * Rule order (first match wins), mirroring the reference access policy:
  *   blocked action  -> ACTION_DENY            (defense-in-depth; tier 4 is
  *                                              already gated pre-exchange)
- *   VIP read        -> ACTION_MFA_ALWAYS      (step-up every call)
+ *   elevated read   -> ACTION_MFA_ALWAYS      (step-up every call)
  *   sensitive write -> ACTION_MFA_ALWAYS      (tier 3, push every call)
  *   standard write  -> ACTION_MFA_PER_SESSION (tier 2, push once per session)
  *   default         -> ACTION_ALLOW
@@ -64,7 +64,7 @@ export interface AccessPolicy {
 // ── Vault object shapes ──────────────────────────────────────────
 
 export interface VaultRarRole {
-  /** Vault role name = last path segment of credsPath (e.g. "records-vip"). */
+  /** Vault role name = last path segment of credsPath (e.g. "records-elevated"). */
   roleName: string;
   /** verify-rar/creds/<role> — the path the gateway POSTs the OBO to. */
   credsPath: string;
@@ -121,8 +121,8 @@ export interface ActionRoles {
   defaultAction: string;
   /** blocked: true actions -> the DENY rule. */
   denyActions: string[];
-  /** the action some other action `elevatedFrom`s -> the VIP-read rule. */
-  vipAction?: string;
+  /** the action some other action `elevatedFrom`s -> the elevated-read rule. */
+  elevatedAction?: string;
   /** the rarAction shared by tier 2/3 write tools -> the write rules. */
   writeAction?: string;
   /** tier 2 tool name -> the standard-write disambiguator. */
@@ -135,7 +135,7 @@ export interface ActionRoles {
  * Derive, from tools.json + rar.json, which action fills each policy role.
  * This is the ONE place the mapping is computed; the CELX + policy + Vault
  * generators all consume it, so they can never disagree about which action is
- * "the write action" or "the VIP action".
+ * "the write action" or "the elevated action".
  */
 export function classifyActions(tools: ToolsConfig, rar: RarConfig): ActionRoles {
   const defaultAction =
@@ -146,7 +146,7 @@ export function classifyActions(tools: ToolsConfig, rar: RarConfig): ActionRoles
     .map(([name]) => name);
 
   // The elevated action is the one another action points at via elevatedFrom.
-  const vipAction = Object.entries(rar.actions).find(([, a]) => a.elevatedFrom !== undefined)?.[0];
+  const elevatedAction = Object.entries(rar.actions).find(([, a]) => a.elevatedFrom !== undefined)?.[0];
 
   // Write tools = tier 2 (standard) and tier 3 (sensitive). They share one
   // rarAction under the reference vocabularies (record_write / policy:update).
@@ -161,7 +161,7 @@ export function classifyActions(tools: ToolsConfig, rar: RarConfig): ActionRoles
   const standardTool = tier2Tools[0]?.[0] ?? tier3Tools[0]?.[0];
   const sensitiveTool = tier3Tools[0]?.[0] ?? tier2Tools[0]?.[0];
 
-  return { defaultAction, denyActions, vipAction, writeAction, standardTool, sensitiveTool };
+  return { defaultAction, denyActions, elevatedAction, writeAction, standardTool, sensitiveTool };
 }
 
 /**
@@ -190,8 +190,8 @@ export function validateToolRarActions(tools: ToolsConfig, rar: RarConfig): void
 // ── CELX builders (byte-faithful to the reference attributes) ────
 
 /**
- * "authz preamble + exists(action)" CELX — used for the DENY and VIP-read
- * attributes. Matches the battle-tested reference cancel-deny / VIP-read
+ * "authz preamble + exists(action)" CELX — used for the DENY and elevated-read
+ * attributes. Matches the battle-tested reference cancel-deny / elevated-read
  * attribute shape exactly (indentation is load-bearing: CELX is
  * whitespace-sensitive YAML).
  */
@@ -281,7 +281,7 @@ function standardWriteCelx(rarType: string, writeAction: string, standardTool: s
 
 export interface AttributeNames {
   deny?: string;
-  vip?: string;
+  elevated?: string;
   sensitive?: string;
   standard?: string;
 }
@@ -294,7 +294,7 @@ export function attributeNames(tools: ToolsConfig, rar: RarConfig): AttributeNam
     const verb = roles.denyActions.length === 1 ? pascalCase(lastToken(roles.denyActions[0]!)) : 'Blocked';
     names.deny = `${prefix}${verb}Deny`;
   }
-  if (roles.vipAction) names.vip = `${prefix}VipRead`;
+  if (roles.elevatedAction) names.elevated = `${prefix}ElevatedRead`;
   if (roles.writeAction) {
     names.sensitive = `${prefix}SensitiveWrite`;
     names.standard = `${prefix}StandardWrite`;
@@ -320,7 +320,7 @@ function attr(name: string, description: string, custom: string): AttributeDef {
 }
 
 /**
- * The (up to) 4 CELX custom attributes: DENY / VIP-read / sensitive-write /
+ * The (up to) 4 CELX custom attributes: DENY / elevated-read / sensitive-write /
  * standard-write. All POSTed with explicit id == name.
  */
 export function generateCelxAttributes(tools: ToolsConfig, rar: RarConfig): AttributeDef[] {
@@ -338,12 +338,12 @@ export function generateCelxAttributes(tools: ToolsConfig, rar: RarConfig): Attr
     );
   }
 
-  if (names.vip && roles.vipAction) {
+  if (names.elevated && roles.elevatedAction) {
     out.push(
       attr(
-        names.vip,
-        `Returns "true" when authorization_details carries a ${rar.rarType} entry with operationDetails.action == "${roles.vipAction}" — the gateway-derived VIP step-up action. Bound to ACTION_MFA_ALWAYS (step-up every call). The caller never sets this; the gateway elevates a VIP record's read to this action.`,
-        actionMatchCelx('isVipRead', rar.rarType, [roles.vipAction]),
+        names.elevated,
+        `Returns "true" when authorization_details carries a ${rar.rarType} entry with operationDetails.action == "${roles.elevatedAction}" — the gateway-derived elevated step-up action. Bound to ACTION_MFA_ALWAYS (step-up every call). The caller never sets this; the gateway elevates a restricted record's read to this action.`,
+        actionMatchCelx('isElevatedRead', rar.rarType, [roles.elevatedAction]),
       ),
     );
   }
@@ -401,9 +401,9 @@ function rule(
 
 /**
  * The RAR-keyed HITL access policy, bound (by verify.ts) to the Token Exchange
- * app. Rule order (first match wins) is DENY -> VIP -> sensitive -> standard ->
- * default ALLOW. enforcementType lives under `meta` (top-level is silently
- * stripped -> policy ACTIVE but never evaluates).
+ * app. Rule order (first match wins) is DENY -> elevated -> sensitive ->
+ * standard -> default ALLOW. enforcementType lives under `meta` (top-level is
+ * silently stripped -> policy ACTIVE but never evaluates).
  */
 export function generateAccessPolicy(tools: ToolsConfig, rar: RarConfig): AccessPolicy {
   const prefix = domainPrefix(rar);
@@ -421,13 +421,13 @@ export function generateAccessPolicy(tools: ToolsConfig, rar: RarConfig): Access
       ),
     );
   }
-  if (names.vip) {
+  if (names.elevated) {
     rules.push(
       rule(
         '1',
-        `${prefix} VIP read step-up`,
-        'Step-up MFA (every call) when the RAR carries the gateway-derived VIP-read action — protects VIP records from session-hijack reads.',
-        names.vip,
+        `${prefix} Elevated read step-up`,
+        'Step-up MFA (every call) when the RAR carries the gateway-derived elevated-read action — protects restricted records from session-hijack reads.',
+        names.elevated,
         'ACTION_MFA_ALWAYS',
       ),
     );
@@ -458,7 +458,7 @@ export function generateAccessPolicy(tools: ToolsConfig, rar: RarConfig): Access
   rules.push({
     id: '100',
     name: 'Default rule',
-    description: 'Standard (non-VIP) reads and anything unmatched above — token exchange succeeds immediately, no push.',
+    description: 'Public reads and anything unmatched above — token exchange succeeds immediately, no push.',
     alwaysRun: false,
     firstFactor: false,
     conditions: [],
@@ -467,7 +467,7 @@ export function generateAccessPolicy(tools: ToolsConfig, rar: RarConfig): Access
 
   return {
     name: `${prefix}-RAR-HITL`,
-    description: `${prefix} — RAR-keyed HITL. Bound to the Token Exchange app. Rule order (first match wins): blocked-action DENY -> VIP read (MFA every call) -> sensitive write (MFA every call) -> standard write (MFA once) -> default allow.`,
+    description: `${prefix} — RAR-keyed HITL. Bound to the Token Exchange app. Rule order (first match wins): blocked-action DENY -> elevated read (MFA every call) -> sensitive write (MFA every call) -> standard write (MFA once) -> default allow.`,
     containsFirstFactor: false,
     rules,
     meta: {
@@ -499,8 +499,9 @@ function lastPathSegment(p: string): string {
  * granted is derived from the SAME tier-driven classification the CELX/policy
  * generation uses (classifyActions), NOT a positional scan over rar.json:
  *   - the write action (from tier-2/3 tools)      -> <slug>_write
- *   - the elevated/VIP action (elevatedFrom)       -> <slug>_read_vip (a role
- *     that CAN read VIP rows; the base <slug>_read is restricted to non-VIP)
+ *   - the elevated action (elevatedFrom)          -> <slug>_read_elevated (a
+ *     role that CAN read restricted rows; the base <slug>_read is restricted to
+ *     public rows)
  *   - every other read action                      -> <slug>_read
  * so a DB grant can never disagree with the policy, and an extra read action
  * that happens to carry its own creds path is never mistaken for "the write
@@ -508,7 +509,7 @@ function lastPathSegment(p: string): string {
  */
 export function generateVaultRoles(rar: RarConfig, dbName: string, tools: ToolsConfig): VaultRarRole[] {
   const slug = domainSlug(rar);
-  const { writeAction, vipAction } = classifyActions(tools, rar);
+  const { writeAction, elevatedAction } = classifyActions(tools, rar);
   const out: VaultRarRole[] = [];
 
   for (const [action, cfg] of Object.entries(rar.actions)) {
@@ -516,8 +517,8 @@ export function generateVaultRoles(rar: RarConfig, dbName: string, tools: ToolsC
     const pgRole =
       action === writeAction
         ? `${slug}_write`
-        : action === vipAction
-          ? `${slug}_read_vip`
+        : action === elevatedAction
+          ? `${slug}_read_elevated`
           : `${slug}_read`;
     const roleName = lastPathSegment(cfg.credsPath);
     out.push({

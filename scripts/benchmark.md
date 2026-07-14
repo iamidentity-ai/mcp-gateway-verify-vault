@@ -20,7 +20,7 @@ quickstart uses). Export it:
 ```bash
 export TOK="<user-access-token>"
 export URL="http://127.0.0.1:3014/tool"
-export BODY='{"name":"get_record","arguments":{"recordId":"REC-1001"}}'   # non-VIP: no push
+export BODY='{"name":"get_record","arguments":{"recordId":"REC-1001"}}'   # public: no push
 ```
 
 ## A/B: does the introspection cache help?
@@ -50,7 +50,7 @@ the introspection-cache win; everything else (exchange, mint, upstream, revoke)
 is identical.
 
 Notes:
-- Use a **non-VIP** record id. A VIP id returns `202 pending` (a real push), which
+- Use a **public** record id. A restricted id returns `202 pending` (a real push), which
   you cannot drive from a load test and which roughly doubles the round-trips.
 - `autocannon` reports non-2xx separately - a spike there usually means the token
   expired mid-run; refresh `$TOK`.

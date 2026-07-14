@@ -12,7 +12,7 @@ export interface UpdatedContact {
   record_id: string;
   display_name: string;
   email: string | null;
-  vip_flag: boolean;
+  classification: string;
 }
 
 export async function updateContact(pool: pg.Pool, args: UpdateContactArgs): Promise<UpdatedContact | null> {
@@ -20,7 +20,7 @@ export async function updateContact(pool: pg.Pool, args: UpdateContactArgs): Pro
     `UPDATE records_demo.records
         SET email = $2
       WHERE record_id = $1
-      RETURNING record_id, display_name, email, vip_flag`,
+      RETURNING record_id, display_name, email, classification`,
     [args.recordId, args.email],
   );
   return rows[0] ?? null;

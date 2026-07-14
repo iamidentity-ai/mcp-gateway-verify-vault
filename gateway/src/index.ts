@@ -113,7 +113,7 @@ function looksLikeMcpTextResult(value: unknown): value is { content: McpTextCont
  * status/ok naming: `PipelineResult['data']` for an `'ok'` result is, in
  * production, `{ content: [{ type: 'text', text: '<JSON string>' }] }` —
  * NOT the record object a UI route would destructure fields off of
- * directly (`record.display_name`, `.vip_flag`, …). Left unwrapped, every
+ * directly (`record.display_name`, `.classification`, …). Left unwrapped, every
  * one of those reads would be `undefined`. `pipeline.test.ts`'s own mocks
  * for `callUpstreamTool`
  * return plain objects (e.g. `{ ok: true, record: {...} }`), so this stays
@@ -145,14 +145,14 @@ function unwrapToolData(data: unknown): unknown {
  *
  * When the pipeline supplies no `diag`, `_diagnostic` is `{}` — this mapper
  * never fabricates values it doesn't have. The populated case carries the
- * pipeline's OboDiag so a UI's audit-trace ribbon and VIP lease/cred display
- * can light up.
+ * pipeline's OboDiag so a UI's audit-trace ribbon and elevated lease/cred
+ * display can light up.
  */
 export function pipelineResultToEnvelope(result: PipelineResult): Record<string, unknown> {
   switch (result.status) {
     case 'ok':
       // `diag` is the pipeline's OboDiag (oboJti/oboTtl/oboScope/cred/
-      // vipElevated) — the `_diagnostic` contract a UI's agent log and
+      // elevated) — the `_diagnostic` contract a UI's agent log and
       // audit-trace ribbon read. All non-secret: the raw OBO bearer token
       // is never exposed to clients (it is a replayable credential).
       return { ok: true, data: unwrapToolData(result.data), _diagnostic: result.diag ?? {} };
@@ -247,20 +247,20 @@ app.post('/hitl/complete', async (req: Request, res: Response) => {
   try {
     const result = verdict
       ? await completePending(txId, callerVerifyUserId, {
-          pollOAuthMfaStatus: async () => {
-            if (verdict === 'approved') {
-              return { state: 'approved', assertion: (body['assertion'] as string) ?? 'test-assertion' };
-            }
-            if (verdict === 'timeout') return { state: 'timeout' };
-            return { state: verdict, reason: (body['reason'] as string) ?? verdict };
-          },
-        })
+        pollOAuthMfaStatus: async () => {
+          if (verdict === 'approved') {
+            return { state: 'approved', assertion: (body['assertion'] as string) ?? 'test-assertion' };
+          }
+          if (verdict === 'timeout') return { state: 'timeout' };
+          return { state: verdict, reason: (body['reason'] as string) ?? verdict };
+        },
+      })
       : await completePending(txId, callerVerifyUserId);
     // Return the SAME `{ ok, data, _diagnostic }` envelope as /tool and /mcp —
     // a consumer resuming a step-up must not get a different shape than the
     // one that parked it (statusCodeFor still drives the HTTP status off the
     // raw result). completePending's `ok` result carries `diag`, so the
-    // approved VIP read surfaces its OBO + VIP-scoped cred here too.
+    // approved elevated read surfaces its OBO + elevated-scoped cred here too.
     res.status(statusCodeFor(result)).json(pipelineResultToEnvelope(result));
   } catch (err) {
     const e = err as Error;
@@ -330,8 +330,8 @@ const MCP_TOOL_SPECS: McpToolSpec[] = [
     name: 'get_record',
     config: {
       title: 'Get a record',
-      description: 'Returns a single record by record id. VIP step-up: pass vip=true for the elevated-trust read path.',
-      inputSchema: { recordId: z.string(), vip: z.boolean().optional() },
+      description: 'Returns a single record by record id. Step-up on restricted records is gateway-derived; the caller never requests elevation.',
+      inputSchema: { recordId: z.string() },
     },
   },
   {
@@ -339,7 +339,7 @@ const MCP_TOOL_SPECS: McpToolSpec[] = [
     config: {
       title: "List an owner's records",
       description: 'Returns every record assigned to the given owner, by owner UPN.',
-      inputSchema: { ownerUpn: z.string(), vip: z.boolean().optional() },
+      inputSchema: { ownerUpn: z.string() },
     },
   },
   {
@@ -347,7 +347,7 @@ const MCP_TOOL_SPECS: McpToolSpec[] = [
     config: {
       title: 'Get history for a record',
       description: 'Returns every history entry filed against a record id, most recent first.',
-      inputSchema: { recordId: z.string(), vip: z.boolean().optional() },
+      inputSchema: { recordId: z.string() },
     },
   },
   {

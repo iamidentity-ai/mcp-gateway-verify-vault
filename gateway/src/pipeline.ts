@@ -95,7 +95,7 @@ export interface OboDiag {
   oboTtl?: number;
   oboScope?: string;
   cred?: { username: string; leaseId: string; path: string };
-  vipElevated?: boolean;
+  elevated?: boolean;
 }
 
 export type PipelineResult =
@@ -172,23 +172,27 @@ function isMfaGatedTier(tier: number): boolean {
 }
 
 /**
- * Read the configured VIP field (config/rar.json → vipElevation.vipField,
- * `vip_flag` under the default config) off a discovery-read result. In
- * PRODUCTION callUpstreamTool (proxy/upstream.ts) returns the MCP
- * CallToolResult envelope verbatim —
+ * Evaluate the configured step-up match rule (config/rar.json →
+ * stepUp.elevateWhen) against a discovery-read result to decide whether the
+ * gateway must force a step-up. In PRODUCTION callUpstreamTool
+ * (proxy/upstream.ts) returns the MCP CallToolResult envelope verbatim —
  * `{ content: [{ type: 'text', text: '<json string>' }] }` — so the record,
- * and its VIP field, lives inside that JSON string, NOT at the top level.
- * (pipeline.test.ts mocks may return the plain record; index.ts's
+ * and its classification field, lives inside that JSON string, NOT at the top
+ * level. (pipeline.test.ts mocks may return the plain record; index.ts's
  * `unwrapToolData` does the same unwrap for the HTTP response.)
  *
- * FAILS CLOSED: only an explicit boolean `false` at vipField is treated as
- * non-VIP. Any envelope we can't parse into a record object, a missing field,
- * or a non-boolean value returns `true` (VIP) so the caller forces a step-up.
- * A swapped upstream whose result doesn't carry vipField therefore
- * over-protects (extra step-ups) instead of silently leaking VIP data with no
- * challenge — the "policy isn't being applied" bug, closed.
+ * FAILS CLOSED: any envelope we can't parse into a record object, or a record
+ * missing the configured field, returns `true` (step up). The matchers:
+ *   equals — value === equals
+ *   in     — in.includes(value)      (allow-list)
+ *   notIn  — !notIn.includes(value)  (fail-closed safe-list: elevate for
+ *            anything NOT explicitly safe, including unknown/new levels)
+ * A swapped upstream whose result doesn't carry the field therefore
+ * over-protects (extra step-ups) instead of silently leaking sensitive data
+ * with no challenge — the "policy isn't being applied" bug, closed.
  */
-function readVipFlag(data: unknown): boolean {
+function shouldStepUp(data: unknown): boolean {
+  const rule = rarConfig.stepUp.elevateWhen;
   let record: unknown = data;
   const envelope = data as { content?: Array<{ text?: unknown }> } | null;
   if (envelope && typeof envelope === 'object' && Array.isArray(envelope.content)) {
@@ -201,9 +205,12 @@ function readVipFlag(data: unknown): boolean {
     }
   }
   if (!record || typeof record !== 'object') return true; // no record object → fail closed
-  // ONLY an explicit boolean false is "non-VIP"; true/missing/null/non-boolean
-  // all fail closed to VIP.
-  return (record as Record<string, unknown>)[rarConfig.vipElevation.vipField] !== false;
+  const value = (record as Record<string, unknown>)[rule.field];
+  if (value === undefined) return true; // field missing → fail closed
+  if (rule.equals !== undefined) return value === rule.equals;
+  if (rule.in !== undefined) return rule.in.includes(value);
+  if (rule.notIn !== undefined) return !rule.notIn.includes(value);
+  return true; // no matcher configured → fail closed
 }
 
 // ── runPipeline ───────────────────────────────────────────────
@@ -241,37 +248,38 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
     return { status: 'denied', reason: gate.reason ?? 'policy_deny' };
   }
 
-  // Step 2.5: GATEWAY-DERIVED VIP STEP-UP (config/rar.json → vipElevation).
+  // Step 2.5: GATEWAY-DERIVED STEP-UP (config/rar.json → stepUp).
   //
-  // The caller NEVER supplies `vip` — the GATEWAY decides. It runs a cheap
-  // discovery read with the standard (non-VIP) RAR, which the Verify policy
-  // allows with no push, purely to learn the record's configured VIP field.
-  // The probe calls vipElevation.probeTool (a flag-carrying read, e.g.
-  // get_record) on the SAME record id, so record-scoped reads whose own result
-  // does NOT carry vipField (get_record_detail / get_record_history) are still
-  // gated by the parent record's VIP status — not just get_record. A VIP record
-  // is NOT returned from the probe: the gateway re-runs the ACTUAL requested
-  // tool with the elevated-action RAR, which makes Verify's VIP-read policy rule
-  // fire ACTION_MFA_ALWAYS. readVipFlag FAILS CLOSED, so an unreadable probe
-  // result forces the step-up. Because the agent can't set `vip`, it cannot skip.
-  if (rarConfig.vipElevation.discoveryTools.includes(ctx.toolName) && ctx.args['vip'] !== true) {
-    const probeTool = rarConfig.vipElevation.probeTool ?? ctx.toolName;
+  // The caller NEVER supplies elevation — the GATEWAY decides. It runs a cheap
+  // discovery read with the standard (non-elevated) RAR, which the Verify policy
+  // allows with no push, purely to learn the record's classification. The probe
+  // calls stepUp.probeTool (a classification-carrying read, e.g. get_record) on
+  // the SAME record id, so record-scoped reads whose own result does NOT carry
+  // the classification field (get_record_detail / get_record_history) are still
+  // gated by the parent record's classification — not just get_record. A
+  // restricted record is NOT returned from the probe: the gateway re-runs the
+  // ACTUAL requested tool with the elevated-action RAR, which makes Verify's
+  // elevated-read policy rule fire ACTION_MFA_ALWAYS. shouldStepUp FAILS CLOSED,
+  // so an unreadable probe result forces the step-up. Because the agent can't
+  // supply elevation, it cannot skip.
+  if (rarConfig.stepUp.discoveryTools.includes(ctx.toolName)) {
+    const probeTool = rarConfig.stepUp.probeTool ?? ctx.toolName;
     const probeIsDelivery = probeTool === ctx.toolName;
     // For get_record the probe IS the requested call; for detail/history it is a
-    // separate flag-carrying read of the same record id.
+    // separate classification-carrying read of the same record id.
     const probeCtx: PipelineCtx = probeIsDelivery
       ? ctx
       : { ...ctx, toolName: probeTool, args: { [rarConfig.argIdKey]: ctx.args[rarConfig.argIdKey] } };
     const probeGate = probeIsDelivery ? gate : d.gateTool(probeTool);
-    const probe = await runExchangeAndCall({ ctx: probeCtx, gate: probeGate, verifyUserId, userEmail, startedAt, vip: false, suppressAudit: true }, d);
+    const probe = await runExchangeAndCall({ ctx: probeCtx, gate: probeGate, verifyUserId, userEmail, startedAt, elevated: false, suppressAudit: true }, d);
     if (probe.result.status !== 'ok') return probe.result;
     // NB: probe.result.data is the MCP CallToolResult envelope in production —
-    // readVipFlag unwraps content[0].text before checking vip_flag.
-    const isVip = readVipFlag(probe.result.data);
+    // shouldStepUp unwraps content[0].text before evaluating elevateWhen.
+    const elevate = shouldStepUp(probe.result.data);
 
-    if (!isVip) {
+    if (!elevate) {
       if (probeIsDelivery) {
-        // get_record on a standard record — the discovery read IS the delivery.
+        // get_record on a public record — the discovery read IS the delivery.
         d.appendAudit({
           ts: d.now(), userId: verifyUserId, tool: ctx.toolName, tier: gate.tier,
           sub: verifyUserId, actChain: [SERVICE_NAME, verifyUserId],
@@ -281,46 +289,49 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
         });
         return probe.result;
       }
-      // detail/history on a standard record — the probe only told us it is
-      // non-VIP; run the ACTUAL requested tool with the standard RAR. That call
-      // (suppressAudit:false) audits its own 'ok' result.
-      const delivered = await runExchangeAndCall({ ctx, gate, verifyUserId, userEmail, startedAt, vip: false, suppressAudit: false }, d);
+      // detail/history on a public record — the probe only told us it is not
+      // restricted; run the ACTUAL requested tool with the standard RAR. That
+      // call (suppressAudit:false) audits its own 'ok' result.
+      const delivered = await runExchangeAndCall({ ctx, gate, verifyUserId, userEmail, startedAt, elevated: false, suppressAudit: false }, d);
       return delivered.result;
     }
 
-    // VIP — discard the probe data, audit the discovery, force the step-up on
-    // the ACTUAL requested tool (get_record / detail / history) with VIP creds.
+    // Restricted — discard the probe data, audit the discovery, force the
+    // step-up on the ACTUAL requested tool (get_record / detail / history) with
+    // elevated creds.
     d.appendAudit({
       ts: d.now(), userId: verifyUserId, tool: ctx.toolName, tier: gate.tier,
-      authorizationDetails: probe.authorizationDetails, decision: 'vip_discovery',
+      authorizationDetails: probe.authorizationDetails, decision: 'stepup_discovery',
       leaseId: probe.leaseId, oboJti: probe.result.diag?.oboJti,
     });
-    const elevated = await runExchangeAndCall({ ctx, gate, verifyUserId, userEmail, startedAt, vip: true, suppressAudit: false }, d);
+    const elevated = await runExchangeAndCall({ ctx, gate, verifyUserId, userEmail, startedAt, elevated: true, suppressAudit: false }, d);
     return elevated.result;
   }
 
-  // Normal path — all other tools (list, history, writes) and any pre-elevated
-  // call. runExchangeAndCall audits the 'ok' result and clears the deny
-  // counter for MFA-gated tiers itself (suppressAudit:false).
+  // Normal path — all other tools (list, history, writes). The caller can never
+  // supply elevation; the gateway derives it (above) for discovery tools only,
+  // so this path is always elevated: false. runExchangeAndCall audits the 'ok'
+  // result and clears the deny counter for MFA-gated tiers itself
+  // (suppressAudit:false).
   const normal = await runExchangeAndCall(
-    { ctx, gate, verifyUserId, userEmail, startedAt, vip: ctx.args['vip'] === true, suppressAudit: false },
+    { ctx, gate, verifyUserId, userEmail, startedAt, elevated: false, suppressAudit: false },
     d,
   );
   return normal.result;
 }
 
 /**
- * Steps 3–6 for a single tool call at a resolved VIP level: RAR + Token
+ * Steps 3–6 for a single tool call at a resolved elevation level: RAR + Token
  * Exchange → (mfa_challenge → park pending + push) → mint → upstream → revoke.
  * Returns the terminal result plus the authorization_details and leaseId used,
  * so the caller can audit. When suppressAudit is false it also writes the 'ok'
  * audit + clears the deny counter for MFA-gated tiers (the normal-path
- * behaviour); the gateway-derived VIP discovery flow passes suppressAudit:true
- * and audits at the runPipeline level once it knows whether the probe was VIP.
+ * behaviour); the gateway-derived step-up discovery flow passes suppressAudit:true
+ * and audits at the runPipeline level once it knows whether the probe elevated.
  *
  * resolveRar is the single source of truth for BOTH authorizationDetails and
  * credsPath — deriving credsPath separately from the raw gate.rarAction would
- * miss the VIP-elevation collapse buildRAR applies (see build-rar.ts).
+ * miss the elevation collapse buildRAR applies (see build-rar.ts).
  */
 async function runExchangeAndCall(
   params: {
@@ -331,12 +342,12 @@ async function runExchangeAndCall(
      *  can put it in the CAEP sub_id (older Antenna handlers need it). */
     userEmail?: string;
     startedAt: number;
-    vip: boolean;
+    elevated: boolean;
     suppressAudit: boolean;
   },
   d: Required<RunPipelineDeps>,
 ): Promise<{ result: PipelineResult; authorizationDetails: AuthorizationDetail[]; leaseId?: string }> {
-  const { ctx, gate, verifyUserId, userEmail, startedAt, vip, suppressAudit } = params;
+  const { ctx, gate, verifyUserId, userEmail, startedAt, elevated, suppressAudit } = params;
 
   const { authorizationDetails, credsPath }: { authorizationDetails: AuthorizationDetail[]; credsPath: string } =
     d.resolveRar({
@@ -344,7 +355,7 @@ async function runExchangeAndCall(
       // The domain id rides on whatever tool-call argument config/rar.json
       // names (argIdKey; `recordId` under the default config).
       recordId: ctx.args[rarConfig.argIdKey] as string | undefined,
-      vip,
+      elevated,
     });
 
   const exchangeResult = await d.exchangeToken({
@@ -420,7 +431,7 @@ async function runExchangeAndCall(
     oboTtl: exchangeResult.expiresIn,
     oboScope: exchangeResult.scope ?? gate.scope,
     cred: { username: cred.username, leaseId: cred.leaseId, path: credsPath },
-    vipElevated: vip,
+    elevated,
   };
 
   if (!suppressAudit) {
@@ -663,7 +674,7 @@ export async function completePending(
     // Elevated iff the parked creds path belongs to an `elevatedFrom` action
     // in config/rar.json — the config, not a path-suffix naming convention,
     // defines "elevated".
-    vipElevated: isElevatedCredsPath(ctx.credsPath),
+    elevated: isElevatedCredsPath(ctx.credsPath),
   };
 
   d.appendAudit({

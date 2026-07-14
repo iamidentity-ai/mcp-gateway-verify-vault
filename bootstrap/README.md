@@ -101,7 +101,7 @@ them. Get them from the Admin console, or (better) read them live via the Vault
 | `VAULT_RUNTIME_POLICY` | no | `records-gateway` | ACL policy name |
 | `--with-ibm-verify` flag | no | off | also create the `ibm-verify` plugin roles (needs `GATEWAY_EXCHANGE_APP_ID`/`_CLIENT_ID` + `GATEWAY_AGENT_APP_ID`/`_CLIENT_ID`) |
 
-**Creates:** one **verify-rar role** per non-blocked creds path (`records`, `records-vip`,
+**Creates:** one **verify-rar role** per non-blocked creds path (`records`, `records-elevated`,
 `records-write`) with `rar_mappings` keyed `<rarType>|<action>` → GRANT the matching
 Postgres role, 5-min lease; a **runtime ACL policy** (read+update on every
 `verify-rar/creds/*` + `sys/leases/revoke`); and the **two OAuth-RS entities** the OBO
@@ -120,8 +120,8 @@ Runs against a **running** gateway with `GATEWAY_URL` + `SMOKE_SUBJECT_TOKEN` (a
 access_token - see the script header for how to grab one from browser devtools or ROPC).
 Asserts, positive **and** negative, exiting non-zero on any failure:
 
-1. **Tier-1 read** on a non-VIP id → `200 ok` + a real OBO + ephemeral cred in `_diagnostic`.
-2. **VIP read** → `202 pending` + a `txId` (the gateway forces a step-up the agent can't
+1. **Tier-1 read** on a public id → `200 ok` + a real OBO + ephemeral cred in `_diagnostic`.
+2. **Restricted read** → `202 pending` + a `txId` (the gateway forces a step-up the agent can't
    skip; approve the push on your phone, then `POST /hitl/complete {txId}` to finish).
 3. **Tier-4 delete** → `403 denied` before Verify is ever contacted.
 4. **Unknown tool** → `403 denied` (`unknown_tool`).

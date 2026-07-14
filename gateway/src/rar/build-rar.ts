@@ -30,15 +30,15 @@
  *   `default: true`. The original action is preserved verbatim in the
  *   business RAR's `subaction` for audit.
  *
- *   VIP step-up: when the caller passes `vip: true` and the collapsed action
+ *   Step-up: when the gateway passes `elevated: true` and the collapsed action
  *   has an elevation target (some action declaring `elevatedFrom` it), the
  *   collapse elevates to that target (and its creds path). Actions with no
- *   elevation target — writes, under the default config — ignore `vip`.
+ *   elevation target — writes, under the default config — ignore `elevated`.
  *
  * Callers that need BOTH the authorization_details AND the Vault creds path
  * for the same call (i.e. pipeline.ts) MUST use `resolveRar()` below rather
  * than calling `buildRAR` and `vaultCredsPath(vaultRarAction(...))`
- * separately — the latter re-derives the VIP-elevation collapse independently
+ * separately — the latter re-derives the elevation collapse independently
  * and can drift out of sync with what `buildRAR` actually sent (see
  * resolveRar's own doc comment for the incident this guards against).
  * `buildRAR`/`vaultRarAction`/`vaultCredsPath` remain exported for
@@ -60,14 +60,14 @@ import { rarConfig, type RarConfig } from './rar-config.js';
  */
 export type AuthorizationDetail =
   | {
-      type: string;
-      operationDetails: { [key: string]: string | undefined; action: string; subaction: string };
-    }
+    type: string;
+    operationDetails: { [key: string]: string | undefined; action: string; subaction: string };
+  }
   | {
-      type: 'vault:path_access';
-      path_constraint: string;
-      action: string;
-    };
+    type: 'vault:path_access';
+    path_constraint: string;
+    action: string;
+  };
 
 // ── RAR action / path resolution ────────────────────────────────
 
@@ -93,20 +93,20 @@ export function vaultCredsPath(collapsedAction: string, config: RarConfig = rarC
 }
 
 /**
- * VIP-elevation + Vault role-mapping collapse in one place. `buildRAR`
+ * Elevation + Vault role-mapping collapse in one place. `buildRAR`
  * and `resolveRar` both call THIS (never re-derive the elevation logic
  * independently) so the business RAR's `operationDetails.action` and the
  * Vault creds path it feeds can never drift apart — see resolveRar's header
  * comment for the bug class this guards against.
  *
- * VIP step-up only applies where the config declares an elevation: the
+ * Step-up only applies where the config declares an elevation: the
  * collapsed action is elevated iff some action lists it as `elevatedFrom`.
- * Under the default config that is record_read → record_read_vip only —
- * record_write has no elevation target, so writes ignore the vip flag.
+ * Under the default config that is record_read → record_read_elevated only —
+ * record_write has no elevation target, so writes ignore the elevated flag.
  */
-function collapseAction(args: { rarAction: string; vip?: boolean }, config: RarConfig): string {
+function collapseAction(args: { rarAction: string; elevated?: boolean }, config: RarConfig): string {
   const collapsed = vaultRarAction(args.rarAction, config);
-  if (args.vip === true) {
+  if (args.elevated === true) {
     const elevated = config.elevationByBase[collapsed];
     if (elevated) return elevated;
   }
@@ -128,7 +128,7 @@ export function buildRAR(
   args: {
     rarAction: string;
     recordId?: string;
-    vip?: boolean;
+    elevated?: boolean;
   },
   config: RarConfig = rarConfig,
 ): AuthorizationDetail[] {
@@ -164,13 +164,13 @@ export function buildRAR(
  *
  * Bug this fixes (found in security review): callers used to compute
  * `vaultCredsPath(vaultRarAction(rarAction))` on the RAW rarAction
- * independently of `buildRAR`, which internally elevates a
- * `vip: true` read to the configured step-up action. For a VIP read that
- * meant the RAR sent to Verify claimed the elevated action while the creds
+ * independently of `buildRAR`, which internally elevates an
+ * `elevated: true` read to the configured step-up action. For an elevated read
+ * that meant the RAR sent to Verify claimed the elevated action while the creds
  * path resolved to the non-elevated default — minting from the wrong Vault
- * role and breaking the VIP step-up flow.
+ * role and breaking the step-up flow.
  *
- * `resolveRar` runs the VIP-elevation + collapse logic (via the shared
+ * `resolveRar` runs the elevation + collapse logic (via the shared
  * `collapseAction` helper) exactly once and derives both outputs from that
  * single collapsed action, so they can never disagree.
  */
@@ -178,7 +178,7 @@ export function resolveRar(
   args: {
     rarAction: string;
     recordId?: string;
-    vip?: boolean;
+    elevated?: boolean;
   },
   config: RarConfig = rarConfig,
 ): { authorizationDetails: AuthorizationDetail[]; credsPath: string; collapsedAction: string } {

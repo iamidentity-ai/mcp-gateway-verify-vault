@@ -391,7 +391,7 @@ describe('manual two-leg sequencing (as the pipeline/HITL layer would drive it)'
     const rar = [
       {
         type: 'urn:example:agent:records',
-        operationDetails: { action: 'record_write', subaction: 'record_write', record_id: 'REC-VIP-1' },
+        operationDetails: { action: 'record_write', subaction: 'record_write', record_id: 'REC-9001' },
       },
     ];
 

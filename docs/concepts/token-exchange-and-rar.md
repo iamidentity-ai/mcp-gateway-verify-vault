@@ -78,13 +78,13 @@ the gateway at tickets, orders, or shipments by editing config, not code
 
 Callers that need *both* the `authorization_details` **and** the Vault creds path for the same call
 (the pipeline does) must use `resolveRar()` - never compute them separately. The reason is a real
-security-review finding: the RAR builder **elevates** a `vip: true` read to the configured step-up
-action (`record_read` → `record_read_vip`) and its `-vip` creds path. If you derived the creds path
-from the *raw* action independently, a VIP read would claim the elevated action to Verify while
-minting from the *non-elevated* role - the credential unbound from the approved authorization.
-`resolveRar()` runs the elevation-collapse **exactly once** and derives both outputs from that
-single collapsed action, so they can never disagree. This is the credential ⇄ authorization binding
-made concrete in one function.
+security-review finding: the RAR builder **elevates** an `elevated: true` read to the configured
+step-up action (`record_read` → `record_read_elevated`) and its `-elevated` creds path. If you
+derived the creds path from the *raw* action independently, an elevated read would claim the elevated
+action to Verify while minting from the *non-elevated* role - the credential unbound from the
+approved authorization. `resolveRar()` runs the elevation-collapse **exactly once** and derives both
+outputs from that single collapsed action, so they can never disagree. This is the credential ⇄
+authorization binding made concrete in one function.
 
 ## No standing database credentials - ever
 
