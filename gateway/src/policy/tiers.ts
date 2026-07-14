@@ -13,8 +13,16 @@
  *
  * config/tools.json is read via fs (not a JSON import) so this module has
  * no ESM import-attribute requirement to satisfy under module: Node16.
+ *
+ * GATEWAY_CONFIG_DIR, when set, points the loader at a DIFFERENT upstream's
+ * config directory (tools.json + rar.json) instead of the shipped
+ * gateway/config/ so the gateway can front a different MCP without clobbering
+ * the shipped "records" config, and two instances can run side by side. The
+ * bootstrap (bootstrap/lib/config.ts) and rar/rar-config.ts read the SAME env,
+ * so runtime and bootstrap can never diverge onto different configs.
  */
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { rarConfig } from '../rar/rar-config.js';
 
 export type Tier = 1 | 2 | 3 | 4;
@@ -34,7 +42,8 @@ export interface GateResult {
   reason?: string;
 }
 
-const toolsPath = new URL('../../config/tools.json', import.meta.url);
+const configDir = process.env['GATEWAY_CONFIG_DIR'];
+const toolsPath = configDir ? join(configDir, 'tools.json') : new URL('../../config/tools.json', import.meta.url);
 const tools = JSON.parse(readFileSync(toolsPath, 'utf-8')) as Record<string, ToolPolicy>;
 
 /**

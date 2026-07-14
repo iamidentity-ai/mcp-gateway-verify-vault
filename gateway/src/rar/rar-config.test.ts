@@ -12,9 +12,15 @@
  *   - stepUp is optional — absence just disables step-up discovery
  *   - isElevatedCredsPath keys off elevatedFrom entries, not a path-suffix
  *     naming convention
+ *   - the shipped no-DB "everything" upstream fixture
+ *     (examples/upstreams/everything) parses ONLY under requireCredsPath:false
+ *     and is tool<->action consistent, but THROWS under requireCredsPath:true,
+ *     proving a credsPath-less config must be run no-DB (UPSTREAM_DB_BACKED=false)
  */
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import { parseRarConfig, isElevatedCredsPath, rarConfig, RarConfigError } from './rar-config.js';
+import { assertToolActionsValid, type ToolPolicy } from '../policy/tiers.js';
 
 /** A valid custom-domain fixture (nothing "records" about it). Note the
  *  DIFFERENT matcher (`in`) — proving elevateWhen is generic, not a boolean. */
@@ -216,5 +222,46 @@ describe('isElevatedCredsPath', () => {
     expect(isElevatedCredsPath('verify-rar/creds/records-elevated')).toBe(true);
     expect(isElevatedCredsPath('verify-rar/creds/records')).toBe(false);
     expect(isElevatedCredsPath('verify-rar/creds/records-write')).toBe(false);
+  });
+});
+
+// ── The shipped NO-DB "everything" upstream fixture (GATEWAY_CONFIG_DIR target) ──
+// examples/upstreams/everything is the Phase 0 wire-check config: a non-database
+// upstream, so its actions carry NO credsPath. That is valid ONLY under the
+// no-DB parse rule (the gateway singleton uses requireCredsPath:false when
+// UPSTREAM_DB_BACKED=false) and MUST throw under the DB-backed default; this
+// proves a credsPath-less config cannot be run DB-backed by mistake.
+describe('examples/upstreams/everything fixture (no-DB)', () => {
+  const everythingRarRaw = JSON.parse(
+    readFileSync(new URL('../../../examples/upstreams/everything/rar.json', import.meta.url), 'utf-8'),
+  ) as unknown;
+  const everythingTools = JSON.parse(
+    readFileSync(new URL('../../../examples/upstreams/everything/tools.json', import.meta.url), 'utf-8'),
+  ) as Record<string, ToolPolicy>;
+
+  it('parses under requireCredsPath:false and is tool<->action consistent', () => {
+    const parsed = parseRarConfig(everythingRarRaw, { requireCredsPath: false });
+    expect(parsed.rarType).toBe('urn:example:agent:everything');
+    expect(parsed.defaultAction).toBe('everything_read');
+    // Both actions are credsPath-less (no Vault leg) and neither is elevated.
+    expect(parsed.actions['everything_read']).toEqual({ default: true });
+    expect(parsed.actions['everything_write']).toEqual({});
+    expect(parsed.elevationByBase).toEqual({});
+    // No stepUp block in the fixture → step-up discovery is disabled.
+    expect(parsed.stepUp.discoveryTools).toEqual([]);
+    // Every tool's rarAction is a defined, non-blocked action.
+    expect(() => assertToolActionsValid(everythingTools, parsed.actions)).not.toThrow();
+  });
+
+  it('THROWS a named RarConfigError under the DB-backed default (requireCredsPath:true)', () => {
+    let thrown: unknown;
+    try {
+      parseRarConfig(everythingRarRaw, { requireCredsPath: true });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(RarConfigError);
+    expect((thrown as Error).name).toBe('RarConfigError');
+    expect((thrown as Error).message).toMatch(/actions\.everything_read\.credsPath/);
   });
 });

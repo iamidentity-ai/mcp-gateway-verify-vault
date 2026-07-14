@@ -266,6 +266,7 @@ Full two-column threat model + the `env → vault` migration: **[docs/guides/sec
   [session kill](docs/concepts/session-kill.md) ·
   [observability](docs/concepts/observability.md)
 - **Guides (the *how*)** - [quickstart](docs/guides/quickstart.md) ·
+  [wire-check (Phase 0, no-DB)](docs/guides/wire-check.md) ·
   [bring your own MCP](docs/guides/bring-your-own-mcp.md) ·
   [any agent](docs/guides/any-agent.md) · [add a tool](docs/guides/add-a-tool.md) ·
   [step-up policies](docs/guides/step-up-policies.md) · [session kill](docs/guides/session-kill.md) ·

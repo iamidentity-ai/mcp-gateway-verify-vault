@@ -18,6 +18,7 @@
  * argument, so they unit-test against custom-domain fixtures with no I/O.
  */
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export type Tier = 1 | 2 | 3 | 4;
@@ -58,15 +59,27 @@ export interface RarConfig {
   stepUp?: RarStepUpConfig;
 }
 
-// The gateway's config directory, relative to THIS file (bootstrap/lib/).
-const GATEWAY_CONFIG_DIR = new URL('../../gateway/config/', import.meta.url);
+// The gateway's shipped config directory, relative to THIS file (bootstrap/lib/).
+// Used unless GATEWAY_CONFIG_DIR overrides it (see configPath).
+const DEFAULT_GATEWAY_CONFIG_DIR = new URL('../../gateway/config/', import.meta.url);
+
+/**
+ * Resolve a config file (tools.json / rar.json), honoring GATEWAY_CONFIG_DIR.
+ *
+ * The runtime (gateway/src/policy/tiers.ts + rar/rar-config.ts) reads the SAME
+ * env, so a bootstrap generated here can never target a different config than
+ * the gateway actually runs; a bootstrap-vs-runtime config divergence is a
+ * silent trap the shared env closes.
+ */
+function configPath(file: string): string {
+  const dir = process.env['GATEWAY_CONFIG_DIR'];
+  return dir ? join(dir, file) : fileURLToPath(new URL(file, DEFAULT_GATEWAY_CONFIG_DIR));
+}
 
 export function loadTools(): ToolsConfig {
-  const p = fileURLToPath(new URL('tools.json', GATEWAY_CONFIG_DIR));
-  return JSON.parse(readFileSync(p, 'utf-8')) as ToolsConfig;
+  return JSON.parse(readFileSync(configPath('tools.json'), 'utf-8')) as ToolsConfig;
 }
 
 export function loadRarConfig(): RarConfig {
-  const p = fileURLToPath(new URL('rar.json', GATEWAY_CONFIG_DIR));
-  return JSON.parse(readFileSync(p, 'utf-8')) as RarConfig;
+  return JSON.parse(readFileSync(configPath('rar.json'), 'utf-8')) as RarConfig;
 }

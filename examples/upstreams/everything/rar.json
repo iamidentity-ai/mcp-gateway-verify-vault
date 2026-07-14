@@ -1,0 +1,11 @@
+{
+  "rarType": "urn:example:agent:everything",
+  "idField": "resource_id",
+  "argIdKey": "resourceId",
+  "actions": {
+    "everything_read": {
+      "default": true
+    },
+    "everything_write": {}
+  }
+}

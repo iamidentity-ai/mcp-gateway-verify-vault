@@ -1,0 +1,4 @@
+{
+  "echo":     { "tier": 1, "rarAction": "everything_read",  "scope": "everything:read" },
+  "printEnv": { "tier": 2, "rarAction": "everything_write", "scope": "everything:write" }
+}

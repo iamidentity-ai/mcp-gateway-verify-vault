@@ -42,8 +42,13 @@
  * pattern as policy/tiers.ts — no ESM import-attribute requirement under
  * module: Node16), and validated immediately: a bad config throws a NAMED
  * RarConfigError at startup, not at the first request.
+ *
+ * GATEWAY_CONFIG_DIR, when set, loads rar.json from THAT directory instead of
+ * the shipped gateway/config/ (the same env policy/tiers.ts and the bootstrap
+ * honor, so runtime and bootstrap never diverge onto different configs).
  */
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 /** Named so a startup crash is grep-ably "RarConfigError: config/rar.json ...". */
 export class RarConfigError extends Error {
@@ -266,7 +271,10 @@ export function isElevatedCredsPath(credsPath: string, config: RarConfig = rarCo
 // ── The singleton every runtime module uses ─────────────────────────────
 // Loaded + validated once at import — a bad config/rar.json kills the
 // gateway at startup with a RarConfigError, never at first request.
-const rarConfigPath = new URL('../../config/rar.json', import.meta.url);
+const rarConfigDir = process.env['GATEWAY_CONFIG_DIR'];
+const rarConfigPath = rarConfigDir
+  ? join(rarConfigDir, 'rar.json')
+  : new URL('../../config/rar.json', import.meta.url);
 export const rarConfig: RarConfig = parseRarConfig(JSON.parse(readFileSync(rarConfigPath, 'utf-8')), {
   // A credsPath is required on every non-blocked action UNLESS this is a NO-DB
   // deployment (UPSTREAM_DB_BACKED=false) fronting a non-database upstream —
