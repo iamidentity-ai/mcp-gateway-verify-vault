@@ -61,6 +61,24 @@ No code change - the OBO and the ephemeral DB creds are injected as per-call hea
 Your MCP must read those DB-cred headers (that's how it receives the ephemeral credential); the
 [example naive MCP](../../examples/naive-mcp/src/db.ts) shows the pattern.
 
+**If the upstream owns `Authorization` itself** (a third-party SaaS MCP such as
+`github/github-mcp-server` uses `Authorization: Bearer <PAT>` for its *own* API), do **not** let the
+gateway put the OBO there - it would both `401` the upstream and leak IBM Verify's OBO to an audience
+that must never receive it. Switch the auth mode:
+
+```bash
+UPSTREAM_AUTH_MODE=upstream_token   # default is `obo` (OBO in Authorization)
+UPSTREAM_OBO_HEADER=X-Verify-OBO    # the OBO is relocated here (audit / a gateway-aware upstream)
+UPSTREAM_AUTH_TOKEN=ghp_your_pat    # the UPSTREAM's own token, sent in Authorization
+```
+
+In `obo` mode the OBO rides `Authorization` (the example naive-mcp and any gateway-aware upstream read
+it there). In `upstream_token` mode `Authorization` carries the upstream's token and the OBO moves to
+`X-Verify-OBO`. Either way the gateway's authorization *decision* (introspect → tier → RAR → step-up →
+SSF) still gates every call - only the forwarded credential differs per upstream. Note: a non-DB
+upstream (like GitHub's) ignores the `X-DB-*` headers, and the Vault ephemeral-cred leg is only
+meaningful when the upstream actually queries a database with those creds.
+
 ### ☐ 2. Write the tier map - `config/tools.json`
 
 One entry per tool: its tier, the RAR action it maps to, and its OAuth scope.

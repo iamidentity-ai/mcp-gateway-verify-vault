@@ -18,7 +18,7 @@
  *     env override and deps.url override both work
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { callUpstreamTool } from './upstream.js';
+import { callUpstreamTool, resolveUpstreamAuth, buildUpstreamHeaders } from './upstream.js';
 
 function makeBundle(result: unknown) {
   const connect = vi.fn().mockResolvedValue(undefined);
@@ -172,5 +172,66 @@ describe('callUpstreamTool', () => {
     vi.doUnmock('@modelcontextprotocol/sdk/client/index.js');
     vi.doUnmock('@modelcontextprotocol/sdk/client/streamableHttp.js');
     vi.resetModules();
+  });
+});
+
+// ── Finding 3: per-upstream auth mode (Authorization-header collision) ──────
+describe('resolveUpstreamAuth', () => {
+  it('defaults to obo mode with the X-Verify-OBO relocation header', () => {
+    expect(resolveUpstreamAuth({})).toEqual({ mode: 'obo', oboHeader: 'X-Verify-OBO', upstreamToken: undefined });
+  });
+  it('reads upstream_token mode + a custom obo header + the upstream token from env', () => {
+    expect(
+      resolveUpstreamAuth({
+        UPSTREAM_AUTH_MODE: 'upstream_token',
+        UPSTREAM_OBO_HEADER: 'X-Obo',
+        UPSTREAM_AUTH_TOKEN: 'ghp_pat123',
+      }),
+    ).toEqual({ mode: 'upstream_token', oboHeader: 'X-Obo', upstreamToken: 'ghp_pat123' });
+  });
+  it('an unrecognized mode falls back to obo (fail safe)', () => {
+    expect(resolveUpstreamAuth({ UPSTREAM_AUTH_MODE: 'bogus' }).mode).toBe('obo');
+  });
+});
+
+describe('buildUpstreamHeaders', () => {
+  const args = { name: 't', arguments: {}, obo: 'obo-jwt', dbUser: 'v-u', dbPass: 'v-p' };
+
+  it('obo mode: OBO in Authorization (our naive-mcp / a gateway-aware upstream reads it)', () => {
+    const h = buildUpstreamHeaders(args, { mode: 'obo', oboHeader: 'X-Verify-OBO' });
+    expect(h['Authorization']).toBe('Bearer obo-jwt');
+    expect(h['X-DB-Username']).toBe('v-u');
+    expect(h['X-DB-Password']).toBe('v-p');
+    expect(h['X-Verify-OBO']).toBeUndefined();
+  });
+
+  it('upstream_token mode: OBO relocated off Authorization; the upstream token takes Authorization', () => {
+    const h = buildUpstreamHeaders(args, { mode: 'upstream_token', oboHeader: 'X-Verify-OBO', upstreamToken: 'ghp_pat' });
+    // The third-party API sees ITS OWN token, never IBM Verify's OBO.
+    expect(h['Authorization']).toBe('Bearer ghp_pat');
+    expect(h['X-Verify-OBO']).toBe('Bearer obo-jwt');
+    expect(h['X-DB-Username']).toBe('v-u'); // DB creds still ride along (harmless to a non-DB upstream)
+  });
+
+  it('upstream_token mode WITHOUT a configured token: OBO is still off Authorization (no OBO leak to the upstream API)', () => {
+    const h = buildUpstreamHeaders(args, { mode: 'upstream_token', oboHeader: 'X-Verify-OBO' });
+    expect(h['Authorization']).toBeUndefined(); // never the OBO
+    expect(h['X-Verify-OBO']).toBe('Bearer obo-jwt');
+  });
+});
+
+describe('callUpstreamTool with upstream_token auth', () => {
+  it('forwards the upstream token in Authorization and relocates the OBO', async () => {
+    const { connect, callTool, close } = makeBundle({ ok: true });
+    const clientFactory = vi.fn().mockReturnValue({ client: { connect, callTool, close }, transport: {} });
+
+    await callUpstreamTool(
+      { name: 'list_issues', arguments: {}, obo: 'verify-obo', dbUser: 'u', dbPass: 'p' },
+      { clientFactory, authConfig: { mode: 'upstream_token', oboHeader: 'X-Verify-OBO', upstreamToken: 'ghp_x' } },
+    );
+
+    const [, headers] = clientFactory.mock.calls[0] as [string, Record<string, string>];
+    expect(headers['Authorization']).toBe('Bearer ghp_x');
+    expect(headers['X-Verify-OBO']).toBe('Bearer verify-obo');
   });
 });
