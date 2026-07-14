@@ -25,10 +25,20 @@
  * fix and the leg-2 retry.
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
 
 process.env['PORT'] = process.env['PORT'] ?? '39714';
 
-const { resolveTestVerdictOverride, pipelineResultToEnvelope } = await import('./index.js');
+const { resolveTestVerdictOverride, pipelineResultToEnvelope, mcpToolNames } = await import('./index.js');
+
+describe('mcpToolNames — /mcp surface stays in sync with config/tools.json', () => {
+  it('registers exactly the configured tools (no drift between the two transports)', () => {
+    const tools = JSON.parse(
+      readFileSync(new URL('../config/tools.json', import.meta.url), 'utf-8'),
+    ) as Record<string, unknown>;
+    expect(mcpToolNames().slice().sort()).toEqual(Object.keys(tools).sort());
+  });
+});
 
 describe('resolveTestVerdictOverride', () => {
   it('ignores a body verdict when GATEWAY_ALLOW_TEST_VERDICT is unset', () => {

@@ -308,9 +308,86 @@ app.get('/me/session-status', async (req: Request, res: Response) => {
 
 // ── Transport 2: POST /mcp (real MCP protocol over Streamable HTTP) ──────
 //
-// Registered per-tool so each tool's zod inputSchema type-checks against its
-// own callback. Every tool routes through runPipeline — the gateway never
-// talks to the database or the upstream MCP directly.
+// The tool surface (names + titles + descriptions + zod inputSchemas) is built
+// ONCE at module load — `MCP_TOOL_SPECS` — so the per-request buildMcpServer
+// does not reconstruct 7 zod schemas on every /mcp call.
+//
+// The McpServer itself is STILL created per request (not a shared global). This
+// is deliberate: `server.connect(transport)` binds the server's Protocol to a
+// SINGLE transport, and /mcp is stateless (`sessionIdGenerator: undefined`) with
+// a fresh transport per request. Sharing one server across concurrent requests
+// would clobber that per-connection binding — a known MCP transport-desync bug.
+// So we amortize the schema construction (the real cost) but keep per-request
+// isolation. Every tool routes through runPipeline — the gateway never talks to
+// the database or the upstream MCP directly.
+interface McpToolSpec {
+  name: string;
+  config: { title: string; description: string; inputSchema: z.ZodRawShape };
+}
+
+const MCP_TOOL_SPECS: McpToolSpec[] = [
+  {
+    name: 'get_record',
+    config: {
+      title: 'Get a record',
+      description: 'Returns a single record by record id. VIP step-up: pass vip=true for the elevated-trust read path.',
+      inputSchema: { recordId: z.string(), vip: z.boolean().optional() },
+    },
+  },
+  {
+    name: 'list_records',
+    config: {
+      title: "List an owner's records",
+      description: 'Returns every record assigned to the given owner, by owner UPN.',
+      inputSchema: { ownerUpn: z.string(), vip: z.boolean().optional() },
+    },
+  },
+  {
+    name: 'get_record_history',
+    config: {
+      title: 'Get history for a record',
+      description: 'Returns every history entry filed against a record id, most recent first.',
+      inputSchema: { recordId: z.string(), vip: z.boolean().optional() },
+    },
+  },
+  {
+    name: 'get_record_detail',
+    config: {
+      title: 'Get record detail lines',
+      description:
+        'Tier 1 read — every detail line under a record id with level and status. Token Exchange only. The read counterpart to update_record.',
+      inputSchema: { recordId: z.string() },
+    },
+  },
+  {
+    name: 'update_record',
+    config: {
+      title: 'Update a record field',
+      description: 'Sets a field on the record identified by record id. Tier 2 — one Verify-policy push.',
+      inputSchema: { recordId: z.string(), field: z.string(), value: z.string() },
+    },
+  },
+  {
+    name: 'update_contact',
+    config: {
+      title: "Update a record's contact email",
+      description: 'Sets the contact email on a record, by record id. Tier 3 — push every call.',
+      inputSchema: { recordId: z.string(), email: z.string() },
+    },
+  },
+  {
+    name: 'delete_record',
+    config: {
+      title: 'Delete a record',
+      description: 'Tier 4 — blocked by policy. Always denied before Verify is ever contacted.',
+      inputSchema: { recordId: z.string() },
+    },
+  },
+];
+
+/** Test/introspection helper: the /mcp tool names, in registration order. */
+export const mcpToolNames = (): string[] => MCP_TOOL_SPECS.map((s) => s.name);
+
 function buildMcpServer(bearer: string): McpServer {
   const server = new McpServer({ name: SERVICE, version: '0.1.0' });
 
@@ -319,76 +396,9 @@ function buildMcpServer(bearer: string): McpServer {
     return { content: [{ type: 'text' as const, text: JSON.stringify(pipelineResultToEnvelope(result)) }] };
   };
 
-  server.registerTool(
-    'get_record',
-    {
-      title: 'Get a record',
-      description: 'Returns a single record by record id. VIP step-up: pass vip=true for the elevated-trust read path.',
-      inputSchema: { recordId: z.string(), vip: z.boolean().optional() },
-    },
-    async (args) => call('get_record', args),
-  );
-
-  server.registerTool(
-    'list_records',
-    {
-      title: "List an owner's records",
-      description: 'Returns every record assigned to the given owner, by owner UPN.',
-      inputSchema: { ownerUpn: z.string(), vip: z.boolean().optional() },
-    },
-    async (args) => call('list_records', args),
-  );
-
-  server.registerTool(
-    'get_record_history',
-    {
-      title: 'Get history for a record',
-      description: 'Returns every history entry filed against a record id, most recent first.',
-      inputSchema: { recordId: z.string(), vip: z.boolean().optional() },
-    },
-    async (args) => call('get_record_history', args),
-  );
-
-  server.registerTool(
-    'get_record_detail',
-    {
-      title: 'Get record detail lines',
-      description:
-        'Tier 1 read — every detail line under a record id with level and status. Token Exchange only. The read counterpart to update_record.',
-      inputSchema: { recordId: z.string() },
-    },
-    async (args) => call('get_record_detail', args),
-  );
-
-  server.registerTool(
-    'update_record',
-    {
-      title: 'Update a record field',
-      description: 'Sets a field on the record identified by record id. Tier 2 — one Verify-policy push.',
-      inputSchema: { recordId: z.string(), field: z.string(), value: z.string() },
-    },
-    async (args) => call('update_record', args),
-  );
-
-  server.registerTool(
-    'update_contact',
-    {
-      title: "Update a record's contact email",
-      description: 'Sets the contact email on a record, by record id. Tier 3 — push every call.',
-      inputSchema: { recordId: z.string(), email: z.string() },
-    },
-    async (args) => call('update_contact', args),
-  );
-
-  server.registerTool(
-    'delete_record',
-    {
-      title: 'Delete a record',
-      description: 'Tier 4 — blocked by policy. Always denied before Verify is ever contacted.',
-      inputSchema: { recordId: z.string() },
-    },
-    async (args) => call('delete_record', args),
-  );
+  for (const spec of MCP_TOOL_SPECS) {
+    server.registerTool(spec.name, spec.config, async (args) => call(spec.name, args as Record<string, unknown>));
+  }
 
   return server;
 }
