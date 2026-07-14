@@ -1,0 +1,20 @@
+%% SSF/CAEP two-channel session kill: repeated denials or a suspicious
+%% verdict escalate to a tenant-wide session revoke.
+%% Ported (genericized to the records domain) from the reference deployment.
+flowchart TD
+    START["MFA verdict on a gated tool call<br/>(completePending)"] --> Q{"poll verdict?"}
+    Q -->|"approved"| OK["clearDeny -> mint -> call -> revoke -> ok"]
+    Q -->|"denied (normal)"| REC["recordDeny(user)"]
+    Q -->|"denied_suspicious / fraud"| SUS["suspicious - 1 strike is terminal"]
+
+    REC --> THRESH{"3rd strike inside<br/>5-min window?"}
+    THRESH -->|"no"| DENY["403 denied<br/>session survives"]
+    THRESH -->|"yes"| KILL["Session kill"]
+    SUS --> KILL
+
+    KILL --> EMIT["emitSessionRevoked<br/>CAEP session-revoked event"]
+    KILL --> MARK["markKilled(user)<br/>local 5-min kill-gate<br/>covers 30-75s propagation"]
+
+    EMIT --> ANT["Antenna session_revoked.js"]
+    ANT --> DEL["Verify DELETE<br/>/v1.0/auth/sessions/{user}"]
+    DEL --> TENANT["Tenant-wide revoke:<br/>every app federated to the tenant"]

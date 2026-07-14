@@ -1,0 +1,68 @@
+# Drop-in local stack: Postgres + the deliberately-naive example MCP + the gateway.
+#
+# WHAT `docker compose up` GIVES YOU vs WHAT NEEDS BOOTSTRAP
+# ---------------------------------------------------------
+# This file brings up the LOCAL pieces only:
+#   - postgres       : seeded "records" DB + naive-admin role + Vault read/write roles
+#   - naive-mcp      : the insecure example MCP (works fully on its own)
+#   - gateway        : starts, serves /healthz, and PROXIES to naive-mcp
+#
+# The gateway's security chain calls TWO EXTERNAL systems that are NOT in this
+# compose file: your IBM Verify tenant (Token Exchange + policy) and a HashiCorp
+# Vault with the verify-rar plugin (ephemeral DB creds). So:
+#   * `docker compose up` alone  -> naive-mcp works; the gateway is healthy but a
+#                                    real secured tool call needs Verify + Vault.
+#   * `docker compose up` + the bootstrap scripts (bootstrap/verify.ts,
+#     bootstrap/vault.ts) pointed at your tenant + Vault -> the full secured chain.
+# See docs/guides/quickstart.md.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: records
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_local_dev}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ./examples/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./examples/db/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+      - ./examples/db/naive-admin-role.sql:/docker-entrypoint-initdb.d/03-naive-admin.sql:ro
+      - ./examples/db/vault-roles.sql:/docker-entrypoint-initdb.d/04-vault-roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d records"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  naive-mcp:
+    build: ./examples/naive-mcp
+    environment:
+      PORT: 3015
+      NAIVE_PG_HOST: postgres
+      NAIVE_PG_PORT: 5432
+      NAIVE_PG_DB: records
+      NAIVE_PG_USER: naive_admin
+      NAIVE_PG_PASSWORD: naive_admin_local_dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Loopback only — the naive server must never be reachable except via the gateway.
+    ports:
+      - "127.0.0.1:3015:3015"
+
+  gateway:
+    build: ./gateway
+    env_file:
+      # Your Verify tenant + client creds + Vault config. Copy .env.example -> .env.
+      - path: .env
+        required: false
+    environment:
+      PORT: 3014
+      UPSTREAM_MCP_URL: http://naive-mcp:3015/mcp
+      SECRETS_BACKEND: ${SECRETS_BACKEND:-env}
+    depends_on:
+      - naive-mcp
+    ports:
+      - "127.0.0.1:3014:3014"

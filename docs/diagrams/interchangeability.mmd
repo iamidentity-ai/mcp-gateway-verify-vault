@@ -1,0 +1,24 @@
+%% Interchangeability: the generic core ships unchanged; the domain lives in
+%% five swappable config surfaces. Secure YOUR MCP by editing config, not code.
+%% Ported (genericized to the records domain) from the reference deployment.
+flowchart LR
+    subgraph CORE["Generic core - ships unchanged (the product)"]
+        direction TB
+        C1["runPipeline - 6-step PEP"]
+        C2["introspect · token-exchange · HITL step-up"]
+        C3["vault mint / revoke"]
+        C4["deny-counter · killed-sessions · antenna"]
+        C5["audit chain · pending store"]
+    end
+
+    subgraph CFG["Per-domain config - swap to secure YOUR MCP"]
+        direction TB
+        S1["config/tools.json<br/>tier map (data, not code)"]
+        S2["config/rar.json<br/>RAR vocabulary + role collapse"]
+        S3["UPSTREAM_MCP_URL<br/>upstream MCP endpoint (env)"]
+        S4["IdP: Verify TE app + access policy<br/>+ CELX attributes"]
+        S5["Secrets: Vault verify-rar roles<br/>+ DB grants"]
+    end
+
+    CFG -. "injected via env + config + IdP/Vault trust" .-> CORE
+    CORE ==> OUT["A newly secured domain<br/>same core, new trust config"]

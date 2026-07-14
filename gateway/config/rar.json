@@ -1,0 +1,16 @@
+{
+  "rarType": "urn:example:agent:records",
+  "idField": "record_id",
+  "argIdKey": "recordId",
+  "actions": {
+    "record_read":     { "credsPath": "verify-rar/creds/records", "default": true },
+    "record_read_vip": { "credsPath": "verify-rar/creds/records-vip", "elevatedFrom": "record_read" },
+    "record_write":    { "credsPath": "verify-rar/creds/records-write" },
+    "record_delete":   { "blocked": true }
+  },
+  "vipElevation": {
+    "discoveryTools": ["get_record", "get_record_detail", "get_record_history"],
+    "probeTool": "get_record",
+    "vipField": "vip_flag"
+  }
+}

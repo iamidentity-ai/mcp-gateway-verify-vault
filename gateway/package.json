@@ -1,0 +1,29 @@
+{
+  "name": "@mcp-gateway/core",
+  "private": true,
+  "version": "0.1.0",
+  "description": "MCP gateway core — RFC 8693 Token Exchange + RFC 9396 RAR + Vault verify-rar ephemeral credentials + SSF/CAEP session-kill in front of any MCP server",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "dev:watch": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.0.0",
+    "jose": "^6.2.3",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "@mcp-gateway/bootstrap",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Idempotent stand-up scripts for the Verify + Vault trust config the gateway needs, GENERATED from the gateway's own config/{tools,rar}.json so they stay in lockstep.",
+  "scripts": {
+    "bootstrap:verify": "tsx verify.ts",
+    "bootstrap:vault": "tsx vault.ts",
+    "smoke": "tsx smoke.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0"
+  }
+}

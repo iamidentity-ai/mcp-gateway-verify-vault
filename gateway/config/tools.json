@@ -1,0 +1,9 @@
+{
+  "get_record":         { "tier": 1, "rarAction": "record_read",   "scope": "records:read" },
+  "list_records":       { "tier": 1, "rarAction": "record_read",   "scope": "records:read" },
+  "get_record_history": { "tier": 1, "rarAction": "record_read",   "scope": "records:read" },
+  "get_record_detail":  { "tier": 1, "rarAction": "record_read",   "scope": "records:read" },
+  "update_record":      { "tier": 2, "rarAction": "record_write",  "scope": "records:write" },
+  "update_contact":     { "tier": 3, "rarAction": "record_write",  "scope": "records:write" },
+  "delete_record":      { "tier": 4, "rarAction": "record_delete", "scope": "records:write" }
+}

@@ -1,0 +1,28 @@
+%% The six-step secured tool call, north-face /mcp or /tool.
+%% Ported (genericized to the records domain) from the reference deployment.
+sequenceDiagram
+    autonumber
+    participant C as MCP client / agent
+    participant G as Gateway runPipeline
+    participant V as IBM Verify (IdP)
+    participant K as Vault verify-rar
+    participant N as Naive MCP
+    participant P as Postgres
+    participant A as Antenna (CAEP/SSF)
+
+    C->>G: POST /tool {name, args} + user bearer
+    G->>V: GET /oauth2/userinfo - introspect
+    V-->>G: 200 active {sub, email}
+    Note over G: kill-gate: isSessionKilled(sub)?
+    Note over G: tier gate: gateTool(name)<br/>tier 4 / unknown -> 403 deny, no Verify call
+    G->>V: POST /oauth2/token - RFC 8693 exchange<br/>subject=user, actor=SPIFFE SVID,<br/>authorization_details (RFC 9396 RAR)
+    V-->>G: 200 OBO - scope-bound, RAR-attested
+    G->>K: POST verify-rar/creds/... (OBO as X-Vault-Token)
+    K-->>G: ephemeral Postgres cred + lease_id (5-min TTL)
+    G->>N: MCP tools/call {name, args}<br/>Authorization: OBO · X-DB-Username/Password
+    N->>P: query as the ephemeral role
+    P-->>N: rows
+    N-->>G: MCP CallToolResult
+    G->>K: PUT sys/leases/revoke {lease_id}
+    Note over A: emitted only on 3-deny / suspicious verdicts
+    G-->>C: 200 {ok, data} + audit record

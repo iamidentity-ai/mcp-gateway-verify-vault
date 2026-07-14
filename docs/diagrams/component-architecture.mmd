@@ -1,0 +1,31 @@
+%% Component architecture - two MCP faces + the thin PEP between them.
+%% Ported (genericized to the records domain) from the reference deployment.
+flowchart LR
+    subgraph north["North face - MCP client (untrusted)"]
+        AGENT["AI agent / MCP client<br/>holds the user's bearer"]
+    end
+
+    subgraph gw["MCP Agent Gateway - thin PEP"]
+        direction TB
+        FACE["North MCP face<br/>POST /mcp and /tool + bearer gate"]
+        PIPE["runPipeline<br/>6-step choke point"]
+        SC["South MCP client<br/>proxy/upstream.ts"]
+        FACE --> PIPE --> SC
+    end
+
+    subgraph south["South face - naive MCP (UNMODIFIED)"]
+        NAIVE["Security-naive MCP server<br/>no auth · trusts DB-cred headers"]
+        PG[("Postgres<br/>system of record")]
+        NAIVE --> PG
+    end
+
+    IDP["Identity provider<br/>IBM Verify · RFC 8693 / 9396"]
+    VAULT["Secrets engine<br/>HashiCorp Vault · verify-rar"]
+    ANTENNA["CAEP / SSF transmitter<br/>Antenna"]
+
+    AGENT -->|"MCP call + user bearer"| FACE
+    PIPE -->|"introspect · token exchange · RAR"| IDP
+    PIPE -->|"mint one-time DB cred (OBO)"| VAULT
+    PIPE -->|"CAEP session-revoked (on abuse)"| ANTENNA
+    ANTENNA -->|"DELETE /v1.0/auth/sessions"| IDP
+    SC -->|"OBO bearer + one-time DB cred"| NAIVE

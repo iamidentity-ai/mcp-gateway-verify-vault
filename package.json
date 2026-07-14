@@ -1,0 +1,23 @@
+{
+  "name": "mcp-gateway-verify-vault",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP Agent Gateway — put per-call, policy-enforced authorization (IBM Verify Token Exchange + RFC 9396 RAR + HashiCorp Vault ephemeral credentials) in front of ANY MCP server, without modifying it.",
+  "author": "Robert Graham <rgraham@us.ibm.com>",
+  "workspaces": [
+    "gateway",
+    "examples/naive-mcp",
+    "bootstrap"
+  ],
+  "scripts": {
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint:words": "bash scripts/forbidden-words.sh",
+    "bootstrap:verify": "npm run bootstrap:verify -w bootstrap",
+    "bootstrap:vault": "npm run bootstrap:vault -w bootstrap",
+    "smoke": "npm run smoke -w bootstrap"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
