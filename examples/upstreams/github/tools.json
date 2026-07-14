@@ -1,0 +1,5 @@
+{
+  "get_me":            { "tier": 1, "rarAction": "github_read",  "scope": "github:read" },
+  "list_issues":       { "tier": 1, "rarAction": "github_read",  "scope": "github:read" },
+  "add_issue_comment": { "tier": 2, "rarAction": "github_write", "scope": "github:write" }
+}

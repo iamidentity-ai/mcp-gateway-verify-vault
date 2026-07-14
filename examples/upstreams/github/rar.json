@@ -1,0 +1,9 @@
+{
+  "rarType": "urn:example:agent:github",
+  "idField": "resource_id",
+  "argIdKey": "resourceId",
+  "actions": {
+    "github_read":  { "default": true },
+    "github_write": {}
+  }
+}
