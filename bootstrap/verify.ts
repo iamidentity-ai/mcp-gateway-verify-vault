@@ -203,12 +203,20 @@ async function preflightEntitlements(token: string): Promise<void> {
 
 // ── CELX snippets (app-body plumbing) ─────────────────────────────────────
 
-/** may_act: which actor(s) may act on the signed-in user's behalf — the
- *  SPIFFE actor sub (spiffe mode) AND the Agent Identity clientId (verify
- *  mode). Constrains RFC 8693 delegation. */
-function mayActCelx(subs: string[]): string {
-  const list = subs.map((s) => `"${s}"`).join(', ');
-  return 'statements:\n- return: >-\n   {\n     "sub": [' + list + ']\n   }';
+/** may_act: which single actor may act on the signed-in user's behalf — the
+ *  SPIFFE actor sub (spiffe mode) OR the Agent Identity clientId (verify mode).
+ *  Constrains RFC 8693 delegation.
+ *
+ *  MUST be a single-string `sub`, NOT an array. Verify matches the actor
+ *  token's `sub` against this claim by exact string equality (RFC 8693 §4.4);
+ *  a `{"sub":[...]}` array never equals the actor's scalar `sub`, so Verify
+ *  rejects the exchange with CSIAQ5201E ("actor or client is not authorized to
+ *  act on behalf of the subject"). Confirmed against the production Concierge
+ *  and IIA UI apps, which each carry a single-string `may_act.sub` — one app
+ *  authorizes one agent; multi-hop A2A works by each downstream doing its own
+ *  exchange, never by cramming several actors into one may_act. */
+function mayActCelx(sub: string): string {
+  return 'statements:\n- return: >-\n   {\n     "sub": "' + sub + '"\n   }';
 }
 
 /** Static agent_id claim stamped on every OBO. YAML-single-quoted wrapping a
@@ -292,7 +300,7 @@ function buildUiBody(agentClientId: string): Record<string, unknown> {
         grantProperties: { generateDeviceFlowQRCode: 'false' },
         token: {
           accessTokenType: 'jwt',
-          attributeMappings: [{ targetName: 'may_act', function: { custom: mayActCelx([ACTOR_SPIFFE_SUB, agentClientId]) } }],
+          attributeMappings: [{ targetName: 'may_act', function: { custom: mayActCelx(USE_SPIFFE ? ACTOR_SPIFFE_SUB : agentClientId) } }],
         },
         consentAction: 'always_prompt',
         requirePkceVerification: 'true',
@@ -503,6 +511,42 @@ async function findAppByName(token: string, name: string): Promise<{ id: string;
   return { id, raw: await api('GET', `/v1.0/applications/${id}`, token) };
 }
 
+/**
+ * Grant birthright (all-users) access to an app via its entitlements
+ * sub-resource. WITHOUT this, a freshly created app is entitled to NOBODY, and
+ * the RFC 8693 token exchange fails with CSIAQ0279E ("Only entitled users can
+ * single sign-on to the application. You must request for application access.")
+ * — even though may_act, scopes, and policy are all correct. Verify checks the
+ * subject user's entitlement live at exchange time, so this takes effect
+ * immediately (no re-login). The `restrictEntitlements`/`entitlements` fields on
+ * the OIDC body do NOT control this; the `/owner/.../entitlements` resource does.
+ *
+ * All-users is the right zero-config DEMO default (any authenticated user can
+ * drive the gateway); a customer can tighten it to specific groups later. POST
+ * is additive + sets the flag, so it is idempotent. Needs the admin client
+ * entitlement `manageAppAccessAdmin`; best-effort with a named warning so a
+ * missing entitlement degrades to a clear message, not a silent CSIAQ0279E.
+ */
+async function grantBirthrightAccess(token: string, appId: string, name: string): Promise<void> {
+  try {
+    const cur = await api('GET', `/v1.0/owner/applications/${appId}/entitlements`, token).catch(() => ({}));
+    if (cur?.birthRightAccess === true) return; // already open to all users
+    await api('POST', `/v1.0/owner/applications/${appId}/entitlements`, token, {
+      birthRightAccess: true,
+      requestAccess: Boolean(cur?.requestAccess),
+      additions: [],
+      deletions: [],
+    });
+    console.log(`[verify] app "${name}" granted birthright (all-users) access`);
+  } catch (err) {
+    console.warn(
+      `[verify] WARN: could not grant birthright access to "${name}" (${(err as Error).message}). ` +
+        `If the token exchange later fails with CSIAQ0279E, the admin client likely lacks ` +
+        `"manageAppAccessAdmin" — grant it and re-run, or entitle users to the app manually.`,
+    );
+  }
+}
+
 async function upsertApp(token: string, name: string, build: () => Record<string, unknown>): Promise<AppResult> {
   const existing = await findAppByName(token, name);
   const body = build();
@@ -511,6 +555,7 @@ async function upsertApp(token: string, name: string, build: () => Record<string
     const full = await api('GET', `/v1.0/applications/${existing.id}`, token);
     const clientId = extractClientId(full);
     console.log(`[verify] app "${name}" updated (id ${existing.id}, clientId ${clientId})`);
+    await grantBirthrightAccess(token, existing.id, name);
     return { id: existing.id, clientId };
   }
   const created = await api('POST', '/v1.0/applications', token, body);
@@ -519,6 +564,7 @@ async function upsertApp(token: string, name: string, build: () => Record<string
   const full = await api('GET', `/v1.0/applications/${appId}`, token);
   const clientId = extractClientId(full);
   console.log(`[verify] app "${name}" created (id ${appId}, clientId ${clientId})`);
+  await grantBirthrightAccess(token, appId, name);
   return { id: appId, clientId };
 }
 
