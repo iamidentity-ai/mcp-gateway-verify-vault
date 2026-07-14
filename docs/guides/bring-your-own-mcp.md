@@ -75,9 +75,22 @@ UPSTREAM_AUTH_TOKEN=ghp_your_pat    # the UPSTREAM's own token, sent in Authoriz
 In `obo` mode the OBO rides `Authorization` (the example naive-mcp and any gateway-aware upstream read
 it there). In `upstream_token` mode `Authorization` carries the upstream's token and the OBO moves to
 `X-Verify-OBO`. Either way the gateway's authorization *decision* (introspect → tier → RAR → step-up →
-SSF) still gates every call - only the forwarded credential differs per upstream. Note: a non-DB
-upstream (like GitHub's) ignores the `X-DB-*` headers, and the Vault ephemeral-cred leg is only
-meaningful when the upstream actually queries a database with those creds.
+SSF) still gates every call - only the forwarded credential differs per upstream.
+
+**Fronting a NON-database upstream?** The Vault ephemeral-cred leg only makes sense when the upstream
+actually queries a database with those creds. To put the gateway in front of a non-DB MCP (e.g.
+GitHub's MCP, or the reference "everything" server), set:
+
+```bash
+UPSTREAM_DB_BACKED=false   # default is true; only the exact string "false" disables it
+```
+
+This **skips** the Vault mint/revoke leg and the `X-DB-*` headers entirely - the upstream is called on
+the OBO alone. Everything else (introspect, tier gate, Token Exchange + RAR, HITL step-up, SSF kill,
+audit) is unchanged. In this mode your `config/rar.json` actions need **no** `credsPath` (there is no
+creds path to point at), and the RAR is reduced to just the business `operationDetails` element (the
+two `vault:path_access` elements are dropped). This pairs naturally with
+`UPSTREAM_AUTH_MODE=upstream_token` for a SaaS MCP that owns its own `Authorization`.
 
 ### ☐ 2. Write the tier map - `config/tools.json`
 

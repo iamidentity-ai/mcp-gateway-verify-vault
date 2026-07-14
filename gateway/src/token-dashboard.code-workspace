@@ -1,0 +1,35 @@
+{
+	"folders": [
+		{
+			"path": "../../../token-dashboard"
+		},
+		{
+			"path": "../../../mcp-dpop-verify-vault"
+		},
+		{
+			"path": "../../../mcp-ssf-verify-vault"
+		},
+		{
+			"path": "../../../mcp-verify-vault"
+		},
+		{
+			"path": "../../../claude-managed-agents"
+		},
+		{
+			"path": "../../../agentic-runtime-security-local"
+		},
+		{
+			"path": "../../../personal-gmail-agent"
+		},
+		{
+			"path": "../../../iamidentity-blog/blog files/posts/the-agent-that-cleans-my-inbox"
+		},
+		{
+			"path": "../../../verify-flow-analyzer"
+		},
+		{
+			"path": "../.."
+		}
+	],
+	"settings": {}
+}

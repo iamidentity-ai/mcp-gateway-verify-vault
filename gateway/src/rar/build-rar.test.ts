@@ -191,3 +191,49 @@ describe('config-driven vocabulary (custom "tickets" domain, zero code change)',
     expect(vaultCredsPath('ticket_purge', ticketsConfig)).toBe('verify-rar/creds/tickets');
   });
 });
+
+// ── NO-DB upstream (UPSTREAM_DB_BACKED=false): actions carry NO credsPath ─────
+//
+// Fronting a non-database MCP (e.g. GitHub's) there is no Vault ephemeral-cred
+// leg, so the config's actions have no credsPath and the two vault:path_access
+// elements are meaningless. buildRAR/resolveRar must emit ONLY the business
+// operationDetails element. The DB-backed default (a credsPath present) is
+// UNCHANGED — still all 3 elements.
+describe('no-DB config (credsPath-less actions): business-only authorization_details', () => {
+  const noDbConfig = parseRarConfig(
+    {
+      rarType: 'urn:example:agent:issues',
+      idField: 'issue_id',
+      argIdKey: 'issueId',
+      actions: {
+        issue_read: { default: true },
+        issue_write: {},
+      },
+      stepUp: { discoveryTools: ['get_issue'], elevateWhen: { field: 'sensitivity', in: ['high'] } },
+    },
+    { requireCredsPath: false },
+  );
+
+  it('buildRAR emits a 1-element array (business only, no vault:path_access) when the action has no credsPath', () => {
+    const rar = buildRAR({ rarAction: 'issue_read', recordId: 'ISS-1' }, noDbConfig);
+    expect(rar).toHaveLength(1);
+    expect(rar[0].type).toBe('urn:example:agent:issues');
+    expect((rar[0] as any).operationDetails.action).toBe('issue_read');
+    expect((rar[0] as any).operationDetails.issue_id).toBe('ISS-1');
+    // No vault:path_access elements at all.
+    expect(rar.some((e) => e.type === 'vault:path_access')).toBe(false);
+  });
+
+  it('resolveRar returns credsPath undefined AND a 1-element authorization_details in the no-DB case', () => {
+    const { authorizationDetails, credsPath, collapsedAction } = resolveRar({ rarAction: 'issue_write' }, noDbConfig);
+    expect(credsPath).toBeUndefined();
+    expect(collapsedAction).toBe('issue_write');
+    expect(authorizationDetails).toHaveLength(1);
+  });
+
+  it('CONTRAST: the DB-backed default config still yields all 3 elements + a real credsPath', () => {
+    const rar = buildRAR({ rarAction: 'record_read' });
+    expect(rar).toHaveLength(3);
+    expect(resolveRar({ rarAction: 'record_read' }).credsPath).toBe('verify-rar/creds/records');
+  });
+});

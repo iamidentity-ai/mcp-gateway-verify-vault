@@ -131,6 +131,24 @@ describe('parseRarConfig — validation failures (named error at startup)', () =
     expectRarConfigError(raw, /actions\.ticket_write\.credsPath/);
   });
 
+  // ── NO-DB deployment (UPSTREAM_DB_BACKED=false): credsPath requirement relaxed ──
+  it('requireCredsPath:false ACCEPTS a credsPath-less action (no-DB); the default (requireCredsPath:true) still throws the named error', () => {
+    const raw = ticketsConfig();
+    delete (raw['actions'] as Record<string, Record<string, unknown>>)['ticket_write']!['credsPath'];
+
+    // Default requirement (DB-backed) still rejects it — unchanged for every
+    // existing caller/test that passes no opts.
+    expectRarConfigError(raw, /actions\.ticket_write\.credsPath/);
+
+    // Explicitly relaxed (the singleton passes this in a no-DB deployment) → parses.
+    const cfg = parseRarConfig(raw, { requireCredsPath: false });
+    expect(cfg.actions['ticket_write']).toEqual({});
+    expect(cfg.defaultAction).toBe('ticket_read');
+    // isElevatedCredsPath still keys off elevatedFrom — a credsPath-less action
+    // is simply never an elevated creds path.
+    expect(isElevatedCredsPath('verify-rar/creds/tickets-priority', cfg)).toBe(true);
+  });
+
   it('rejects an empty actions object', () => {
     const raw = ticketsConfig();
     raw['actions'] = {};

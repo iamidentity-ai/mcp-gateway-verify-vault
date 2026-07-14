@@ -546,6 +546,86 @@ describe('runPipeline', () => {
     expect(result).toEqual({ status: 'error', error: 'invalid_scope' });
     expect(deps.mintCred).not.toHaveBeenCalled();
   });
+
+  // ── UPSTREAM_DB_BACKED: the DEFAULT is DB-backed (security-safe) ───────────
+  //
+  // list_records is NOT a discovery tool, so it takes the normal single-exchange
+  // path — the cleanest lens on the mint-vs-skip decision.
+  it('REGRESSION: the DEFAULT is DB-backed — with NO dbBacked override a tier-1 read STILL mints + revokes and the diag carries cred', async () => {
+    const { deps } = makeRunDeps({
+      callUpstreamTool: async () => ({ ok: true, record: { recordId: 'REC-1' } }),
+    });
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'list_records', args: {} },
+      deps as any,
+    );
+
+    expect(result.status).toBe('ok');
+    // Unset UPSTREAM_DB_BACKED === DB-backed: the Vault ephemeral-cred leg runs,
+    // exactly as before this feature existed.
+    expect(deps.mintCred).toHaveBeenCalledTimes(1);
+    expect(deps.revokeLease).toHaveBeenCalledTimes(1);
+    const okDiag = (result as { status: 'ok'; diag?: Record<string, unknown> }).diag;
+    expect(okDiag).toMatchObject({
+      cred: { username: 'v-records-1', leaseId: 'lease-1', path: 'verify-rar/creds/records' },
+    });
+  });
+
+  it('explicit dbBacked:true behaves identically to the default (mints + revokes + cred in diag)', async () => {
+    const { deps } = makeRunDeps({
+      dbBacked: true,
+      callUpstreamTool: async () => ({ ok: true, record: { recordId: 'REC-1' } }),
+    });
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'list_records', args: {} },
+      deps as any,
+    );
+
+    expect(result.status).toBe('ok');
+    expect(deps.mintCred).toHaveBeenCalledTimes(1);
+    expect(deps.revokeLease).toHaveBeenCalledTimes(1);
+    expect((result as { status: 'ok'; diag?: Record<string, unknown> }).diag).toHaveProperty('cred');
+  });
+
+  it('NO-DB upstream (dbBacked:false): tier-1 read SKIPS mint/revoke, calls upstream WITHOUT dbUser/dbPass, ok diag has NO cred (but oboJti/oboScope), audit still written', async () => {
+    // A real 3-segment JWT so decodeJwtJti resolves the correlation id.
+    const oboJwt = ['eyJhbGciOiJub25lIn0', Buffer.from(JSON.stringify({ jti: 'jti-nodb' })).toString('base64url'), 'sig'].join('.');
+    const { deps, calls } = makeRunDeps({
+      dbBacked: false,
+      exchangeToken: async () => ({ status: 'ok' as const, accessToken: oboJwt, expiresIn: 3600, scope: 'records:read' }),
+      callUpstreamTool: async () => ({ ok: true, record: { recordId: 'REC-1' } }),
+    });
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'list_records', args: { limit: 10 } },
+      deps as any,
+    );
+
+    expect(result.status).toBe('ok');
+    // The Vault leg is skipped ENTIRELY.
+    expect(deps.mintCred).not.toHaveBeenCalled();
+    expect(deps.revokeLease).not.toHaveBeenCalled();
+    // Upstream is called on the OBO alone — no ephemeral DB creds in the args.
+    expect(deps.callUpstreamTool).toHaveBeenCalledWith({
+      name: 'list_records',
+      arguments: { limit: 10 },
+      obo: oboJwt,
+    });
+    // diag proves the exchange happened but carries NO cred (there is none),
+    // while still carrying the non-secret oboJti/oboScope correlation fields.
+    const okDiag = (result as { status: 'ok'; diag?: Record<string, unknown> }).diag;
+    expect(okDiag).not.toHaveProperty('cred');
+    expect(okDiag).toMatchObject({ oboJti: 'jti-nodb', oboScope: 'records:read', elevated: false });
+    // Audit is still written — with no lease id (there was no lease).
+    expect(deps.appendAudit).toHaveBeenCalledTimes(1);
+    const rec = (deps.appendAudit as any).mock.calls[0][0];
+    expect(rec.decision).toBe('ok');
+    expect(rec.leaseId).toBeUndefined();
+    // Exchange -> upstream, with NO mint/revoke between them.
+    expectOrder(calls, ['introspectUser', 'gateTool', 'exchangeToken', 'callUpstreamTool', 'appendAudit']);
+  });
 });
 
 describe('completePending', () => {
@@ -698,6 +778,32 @@ describe('completePending', () => {
       'revokeLease',
       'clearDeny',
     ]);
+  });
+
+  // ── UPSTREAM_DB_BACKED=false on the post-approval (leg-2) path ─────────────
+  it('NO-DB upstream (dbBacked:false): approved step-up returns data WITHOUT minting/revoking, calls upstream on the OBO alone, diag has no cred', async () => {
+    const { deps } = makeCompleteDeps({ dbBacked: false });
+
+    const result = await completePending('tx-1', 'user-1', deps as any);
+
+    expect(result).toMatchObject({ status: 'ok', data: { ok: true } });
+    // Vault leg skipped even on the stepped-up (post-approval) path.
+    expect(deps.mintCred).not.toHaveBeenCalled();
+    expect(deps.revokeLease).not.toHaveBeenCalled();
+    expect(deps.callUpstreamTool).toHaveBeenCalledWith({
+      name: 'update_record',
+      arguments: {},
+      obo: 'final-obo',
+    });
+    const okDiag = (result as { status: 'ok'; diag?: Record<string, unknown> }).diag;
+    expect(okDiag).not.toHaveProperty('cred');
+    expect(okDiag).toMatchObject({ oboScope: 'records:write', elevated: false });
+    // Approval bookkeeping (clearDeny + audit) is unchanged.
+    expect(deps.clearDeny).toHaveBeenCalledWith('user-1');
+    expect(deps.appendAudit).toHaveBeenCalledTimes(1);
+    const rec = (deps.appendAudit as any).mock.calls[0][0];
+    expect(rec.decision).toBe('ok');
+    expect(rec.leaseId).toBeUndefined();
   });
 
   // ── FIX 2 (IMPORTANT, security review): leg-2 CSIAQ0155E retry ─────────

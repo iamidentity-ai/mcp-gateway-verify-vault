@@ -3,9 +3,8 @@
  *
  * Feeds the OBO-as-X-Vault-Token flow: Token Exchange with
  * authorization_details → OBO POSTed as X-Vault-Token to verify-rar. This
- * module only builds the 3-element authorization_details array — token
- * exchange + Vault POST live in separate modules (auth/token-exchange.ts,
- * vault/mint.ts).
+ * module only builds the authorization_details array — token exchange + Vault
+ * POST live in separate modules (auth/token-exchange.ts, vault/mint.ts).
  *
  * The RAR VOCABULARY (business RAR type, id field, action collapse rules,
  * creds paths) is NOT hardcoded here — it all comes from config/rar.json via
@@ -13,7 +12,8 @@
  * by editing config, not code. Under the shipped default config the
  * vocabulary is the "records" example domain.
  *
- * authorization_details (3 elements):
+ * authorization_details (3 elements when DB-backed; just element 1 in a NO-DB
+ * deployment, UPSTREAM_DB_BACKED=false, where there is no Vault cred leg):
  *   1. business RAR        type = config.rarType, nested under
  *      operationDetails — the CELx nav invariant every access policy on the
  *      Verify tenant depends on (CELx rules navigate
@@ -84,12 +84,15 @@ export function vaultRarAction(rarAction: string, config: RarConfig = rarConfig)
   return config.defaultAction;
 }
 
-export function vaultCredsPath(collapsedAction: string, config: RarConfig = rarConfig): string {
+export function vaultCredsPath(collapsedAction: string, config: RarConfig = rarConfig): string | undefined {
   const entry = config.actions[collapsedAction];
-  // A collapsed action always has a non-blocked entry with a credsPath (the
-  // parse-time validation guarantees the default action does); the fallback
-  // covers callers passing a raw, un-collapsed action.
-  return entry?.credsPath ?? config.actions[config.defaultAction]!.credsPath!;
+  // A DB-backed collapsed action always has a non-blocked entry with a credsPath
+  // (the parse-time validation guarantees the default action does); the fallback
+  // covers callers passing a raw, un-collapsed action. In a NO-DB deployment
+  // (UPSTREAM_DB_BACKED=false) actions carry NO credsPath — this returns
+  // undefined (it must NOT invent the default action's path, which is also
+  // absent), and buildRAR/resolveRar then omit the vault:path_access elements.
+  return entry?.credsPath ?? config.actions[config.defaultAction]?.credsPath;
 }
 
 /**
@@ -114,11 +117,15 @@ function collapseAction(args: { rarAction: string; elevated?: boolean }, config:
 }
 
 /**
- * Build the 3-element authorization_details array sent to Verify. The
- * business element preserves the FULL (original) action as `subaction`;
- * `action` carries the Vault-role-mapping-collapsed value the plugin's
- * rar_mapping lookup keys on. The two vault:path_access elements grant
- * explicit Vault path-level authority for the OAuth-RS profile.
+ * Build the authorization_details array sent to Verify. The business element
+ * preserves the FULL (original) action as `subaction`; `action` carries the
+ * Vault-role-mapping-collapsed value the plugin's rar_mapping lookup keys on.
+ *
+ * DB-backed (default): 3 elements — the business element plus two
+ * vault:path_access elements granting explicit Vault path-level authority for
+ * the OAuth-RS profile. NO-DB (UPSTREAM_DB_BACKED=false, the collapsed action
+ * has no credsPath): 1 element — the business element ONLY. There is no Vault
+ * ephemeral-cred leg, so a vault:path_access grant would be meaningless.
  *
  * `recordId` is the domain id value (pipeline.ts reads it off
  * args[config.argIdKey]); it is nested under config.idField in the business
@@ -135,15 +142,20 @@ export function buildRAR(
   const collapsedAction = collapseAction(args, config);
   const credsPath = vaultCredsPath(collapsedAction, config);
 
-  return [
-    {
-      type: config.rarType,
-      operationDetails: {
-        action: collapsedAction,
-        subaction: args.rarAction,
-        ...(args.recordId ? { [config.idField]: args.recordId } : {}),
-      },
+  const business: AuthorizationDetail = {
+    type: config.rarType,
+    operationDetails: {
+      action: collapsedAction,
+      subaction: args.rarAction,
+      ...(args.recordId ? { [config.idField]: args.recordId } : {}),
     },
+  };
+
+  // NO-DB upstream: no creds path → emit ONLY the business element.
+  if (!credsPath) return [business];
+
+  return [
+    business,
     {
       type: 'vault:path_access',
       path_constraint: credsPath,
@@ -181,8 +193,10 @@ export function resolveRar(
     elevated?: boolean;
   },
   config: RarConfig = rarConfig,
-): { authorizationDetails: AuthorizationDetail[]; credsPath: string; collapsedAction: string } {
+): { authorizationDetails: AuthorizationDetail[]; credsPath: string | undefined; collapsedAction: string } {
   const collapsedAction = collapseAction(args, config);
+  // undefined in a NO-DB deployment (UPSTREAM_DB_BACKED=false) — the caller
+  // (pipeline.ts) skips the mint/revoke leg entirely in that case.
   const credsPath = vaultCredsPath(collapsedAction, config);
   const authorizationDetails = buildRAR(args, config);
 

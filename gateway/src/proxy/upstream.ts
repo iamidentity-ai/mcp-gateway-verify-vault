@@ -45,10 +45,13 @@ export interface CallUpstreamToolArgs {
   arguments: Record<string, unknown>;
   /** The scoped OBO — sent as Authorization: Bearer <obo>. */
   obo: string;
-  /** Ephemeral verify-rar Postgres username — sent as X-DB-Username. */
-  dbUser: string;
-  /** Ephemeral verify-rar Postgres password — sent as X-DB-Password. */
-  dbPass: string;
+  /** Ephemeral verify-rar Postgres username — sent as X-DB-Username. Absent in
+   *  a NO-DB deployment (UPSTREAM_DB_BACKED=false) fronting a non-database
+   *  upstream, where the pipeline skips the Vault mint leg entirely. */
+  dbUser?: string;
+  /** Ephemeral verify-rar Postgres password — sent as X-DB-Password. Absent in
+   *  a NO-DB deployment (see dbUser). */
+  dbPass?: string;
 }
 
 /** Minimal surface the proxy needs from an MCP client — real SDK Client
@@ -104,16 +107,18 @@ export function resolveUpstreamAuth(env: NodeJS.ProcessEnv = process.env): Upstr
 }
 
 /**
- * Build the southbound headers. The ephemeral X-DB-* creds always ride along
- * (harmless to a non-DB upstream). WHERE the OBO goes depends on the auth mode,
- * so a third-party upstream's Authorization is never clobbered by the OBO.
- * Pure + exported for unit testing.
+ * Build the southbound headers. When the ephemeral verify-rar creds are present
+ * (the DB-backed default) they ride along as X-DB-* (harmless to a non-DB
+ * upstream); in a NO-DB deployment (UPSTREAM_DB_BACKED=false) the pipeline skips
+ * the mint leg, so dbUser/dbPass are absent and the X-DB-* headers are OMITTED
+ * (never sent empty). WHERE the OBO goes depends on the auth mode, so a
+ * third-party upstream's Authorization is never clobbered by the OBO. Pure +
+ * exported for unit testing.
  */
 export function buildUpstreamHeaders(args: CallUpstreamToolArgs, auth: UpstreamAuthConfig): Record<string, string> {
-  const headers: Record<string, string> = {
-    'X-DB-Username': args.dbUser,
-    'X-DB-Password': args.dbPass,
-  };
+  const headers: Record<string, string> = {};
+  if (args.dbUser) headers['X-DB-Username'] = args.dbUser;
+  if (args.dbPass) headers['X-DB-Password'] = args.dbPass;
   if (auth.mode === 'upstream_token') {
     headers[auth.oboHeader] = `Bearer ${args.obo}`;
     if (auth.upstreamToken) headers['Authorization'] = `Bearer ${auth.upstreamToken}`;

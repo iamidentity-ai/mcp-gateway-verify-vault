@@ -39,7 +39,10 @@ export interface PendingCtx {
   scope: string;
   authorizationDetails: unknown[];
   toolName: string;
-  credsPath: string;
+  /** verify-rar creds path the parked step-up will mint from. Absent in a
+   *  NO-DB deployment (UPSTREAM_DB_BACKED=false) — there is no Vault leg, so
+   *  completePending skips the mint and calls the upstream on the OBO alone. */
+  credsPath?: string;
   startedAt: number;
   /** Original tool-call arguments, round-tripped through the txId so
    *  completePending can re-invoke callUpstreamTool once the push/OTP is

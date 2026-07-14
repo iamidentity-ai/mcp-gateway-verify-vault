@@ -45,7 +45,7 @@ import {
 import { gateTool } from './policy/tiers.js';
 import { resolveRar, type AuthorizationDetail } from './rar/build-rar.js';
 import { rarConfig, isElevatedCredsPath } from './rar/rar-config.js';
-import { mintCred, revokeLease } from './vault/mint.js';
+import { mintCred, revokeLease, type MintedCred } from './vault/mint.js';
 import { callUpstreamTool } from './proxy/upstream.js';
 import { recordDeny, clearDeny } from './ssf/deny-counter.js';
 import { markKilled, isSessionKilled } from './ssf/killed-sessions.js';
@@ -140,6 +140,17 @@ export interface RunPipelineDeps {
   genTxId?: () => string;
   /** Injectable clock (tests want deterministic latency). */
   now?: () => number;
+  /**
+   * Whether the upstream MCP is database-backed. `true` (default) runs the
+   * Vault ephemeral-cred leg (mint → X-DB-* headers → revoke) before every
+   * upstream call. `false` (env UPSTREAM_DB_BACKED === 'false') fronts a
+   * NON-database upstream (e.g. GitHub's MCP): the mint/revoke leg is skipped
+   * and callUpstreamTool runs on the OBO alone. Everything else — introspect,
+   * tier gate, Token Exchange + RAR, HITL step-up, SSF kill, audit — is
+   * identical. Injectable so tests drive it without env. Security-safe DEFAULT:
+   * unset env stays DB-backed (still mints a scoped, ephemeral Vault cred).
+   */
+  dbBacked?: boolean;
 }
 
 const defaultRunPipelineDeps: Required<RunPipelineDeps> = {
@@ -158,6 +169,7 @@ const defaultRunPipelineDeps: Required<RunPipelineDeps> = {
   putPending,
   genTxId: () => randomUUID(),
   now: () => Date.now(),
+  dbBacked: process.env['UPSTREAM_DB_BACKED'] !== 'false',
 };
 
 /**
@@ -349,7 +361,7 @@ async function runExchangeAndCall(
 ): Promise<{ result: PipelineResult; authorizationDetails: AuthorizationDetail[]; leaseId?: string }> {
   const { ctx, gate, verifyUserId, userEmail, startedAt, elevated, suppressAudit } = params;
 
-  const { authorizationDetails, credsPath }: { authorizationDetails: AuthorizationDetail[]; credsPath: string } =
+  const { authorizationDetails, credsPath }: { authorizationDetails: AuthorizationDetail[]; credsPath: string | undefined } =
     d.resolveRar({
       rarAction: gate.rarAction,
       // The domain id rides on whatever tool-call argument config/rar.json
@@ -406,31 +418,40 @@ async function runExchangeAndCall(
 
   const obo = exchangeResult.accessToken;
 
-  // Mint an ephemeral verify-rar Postgres credential.
-  const cred = await d.mintCred({ obo, authorizationDetails, credsPath });
-
-  // Run the tool upstream. The revoke always runs, success or failure, so a
-  // lease never outlives its one call.
+  // DB-backed (default): mint an ephemeral verify-rar Postgres credential, hand
+  // it to the upstream as X-DB-*, and revoke the lease after the one call (the
+  // revoke always runs, success or failure, so a lease never outlives its call).
+  // NO-DB (UPSTREAM_DB_BACKED=false): the upstream has no database — SKIP the
+  // whole Vault leg and call it on the OBO alone (no X-DB-* headers).
+  let cred: MintedCred | undefined;
   let data: unknown;
-  try {
-    data = await d.callUpstreamTool({
-      name: ctx.toolName,
-      arguments: ctx.args,
-      obo,
-      dbUser: cred.username,
-      dbPass: cred.password,
-    });
-  } finally {
-    await d.revokeLease(cred.leaseId, obo);
+  if (d.dbBacked) {
+    // credsPath is guaranteed present in DB-backed mode — the rar-config parse
+    // requires it on every non-blocked action when UPSTREAM_DB_BACKED !== 'false'.
+    cred = await d.mintCred({ obo, authorizationDetails, credsPath: credsPath! });
+    try {
+      data = await d.callUpstreamTool({
+        name: ctx.toolName,
+        arguments: ctx.args,
+        obo,
+        dbUser: cred.username,
+        dbPass: cred.password,
+      });
+    } finally {
+      await d.revokeLease(cred.leaseId, obo);
+    }
+  } else {
+    data = await d.callUpstreamTool({ name: ctx.toolName, arguments: ctx.args, obo });
   }
 
-  // The observability payload — proves the exchange + mint happened. Carries
-  // the OBO's jti (correlation), never the OBO itself (a live credential).
+  // The observability payload — proves the exchange (+ mint, when DB-backed)
+  // happened. Carries the OBO's jti (correlation), never the OBO itself (a live
+  // credential). NO-DB: no `cred` field (there is no ephemeral credential).
   const diag: OboDiag = {
     oboJti: decodeJwtJti(obo),
     oboTtl: exchangeResult.expiresIn,
     oboScope: exchangeResult.scope ?? gate.scope,
-    cred: { username: cred.username, leaseId: cred.leaseId, path: credsPath },
+    ...(cred ? { cred: { username: cred.username, leaseId: cred.leaseId, path: credsPath! } } : {}),
     elevated,
   };
 
@@ -444,7 +465,7 @@ async function runExchangeAndCall(
       actChain: [SERVICE_NAME, verifyUserId],
       authorizationDetails,
       decision: 'ok',
-      leaseId: cred.leaseId,
+      leaseId: cred?.leaseId,
       oboJti: diag.oboJti,
       latencyMs: d.now() - startedAt,
     });
@@ -453,7 +474,7 @@ async function runExchangeAndCall(
     }
   }
 
-  return { result: { status: 'ok', data, diag }, authorizationDetails, leaseId: cred.leaseId };
+  return { result: { status: 'ok', data, diag }, authorizationDetails, leaseId: cred?.leaseId };
 }
 
 // ── completePending deps ─────────────────────────────────────
@@ -477,6 +498,9 @@ export interface CompletePendingDeps {
   markKilled?: typeof markKilled;
   isSessionKilled?: typeof isSessionKilled;
   now?: () => number;
+  /** See RunPipelineDeps.dbBacked — same flag for the post-approval (leg-2)
+   *  path, so a stepped-up call to a non-DB upstream also skips the Vault leg. */
+  dbBacked?: boolean;
 }
 
 const defaultCompletePendingDeps: Required<CompletePendingDeps> = {
@@ -497,6 +521,7 @@ const defaultCompletePendingDeps: Required<CompletePendingDeps> = {
   markKilled,
   isSessionKilled,
   now: () => Date.now(),
+  dbBacked: process.env['UPSTREAM_DB_BACKED'] !== 'false',
 };
 
 /**
@@ -649,32 +674,40 @@ export async function completePending(
   }
   const obo = assertionResult.accessToken;
 
-  const cred = await d.mintCred({ obo, authorizationDetails, credsPath: ctx.credsPath });
-
+  // Same DB-backed vs NO-DB branch as runExchangeAndCall — a stepped-up call to
+  // a non-database upstream (UPSTREAM_DB_BACKED=false) skips the mint/revoke leg
+  // and runs on the OBO alone.
+  let cred: MintedCred | undefined;
   let data: unknown;
-  try {
-    data = await d.callUpstreamTool({
-      name: ctx.toolName,
-      arguments: args,
-      obo,
-      dbUser: cred.username,
-      dbPass: cred.password,
-    });
-  } finally {
-    await d.revokeLease(cred.leaseId, obo);
+  if (d.dbBacked) {
+    cred = await d.mintCred({ obo, authorizationDetails, credsPath: ctx.credsPath! });
+    try {
+      data = await d.callUpstreamTool({
+        name: ctx.toolName,
+        arguments: args,
+        obo,
+        dbUser: cred.username,
+        dbPass: cred.password,
+      });
+    } finally {
+      await d.revokeLease(cred.leaseId, obo);
+    }
+  } else {
+    data = await d.callUpstreamTool({ name: ctx.toolName, arguments: args, obo });
   }
 
   // Same observability payload as runExchangeAndCall — this is the leg-2
   // (post-approval) OBO, the one actually minted after the human said yes.
+  // NO-DB: no `cred` field (there is no ephemeral credential).
   const diag: OboDiag = {
     oboJti: decodeJwtJti(obo),
     oboTtl: assertionResult.expiresIn,
     oboScope: assertionResult.scope ?? ctx.scope,
-    cred: { username: cred.username, leaseId: cred.leaseId, path: ctx.credsPath },
+    ...(cred ? { cred: { username: cred.username, leaseId: cred.leaseId, path: ctx.credsPath! } } : {}),
     // Elevated iff the parked creds path belongs to an `elevatedFrom` action
     // in config/rar.json — the config, not a path-suffix naming convention,
-    // defines "elevated".
-    elevated: isElevatedCredsPath(ctx.credsPath),
+    // defines "elevated". A NO-DB call has no creds path, so it is never elevated.
+    elevated: ctx.credsPath ? isElevatedCredsPath(ctx.credsPath) : false,
   };
 
   d.appendAudit({
@@ -686,7 +719,7 @@ export async function completePending(
     actChain: [SERVICE_NAME, ctx.verifyUserId],
     authorizationDetails,
     decision: 'ok',
-    leaseId: cred.leaseId,
+    leaseId: cred?.leaseId,
     oboJti: diag.oboJti,
     latencyMs: d.now() - startedAt,
   });

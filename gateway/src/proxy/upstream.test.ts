@@ -218,6 +218,23 @@ describe('buildUpstreamHeaders', () => {
     expect(h['Authorization']).toBeUndefined(); // never the OBO
     expect(h['X-Verify-OBO']).toBe('Bearer obo-jwt');
   });
+
+  // ── NO-DB upstream (UPSTREAM_DB_BACKED=false): no ephemeral creds to send ──
+  it('omits X-DB-Username/X-DB-Password when dbUser/dbPass are absent (non-database upstream, no Vault leg)', () => {
+    // The pipeline skips the mint leg for a non-DB upstream, so callUpstreamTool
+    // receives no dbUser/dbPass — the X-DB-* headers must NOT be sent (not even empty).
+    const noDbArgs = { name: 'list_issues', arguments: {}, obo: 'obo-jwt' };
+    const h = buildUpstreamHeaders(noDbArgs, { mode: 'obo', oboHeader: 'X-Verify-OBO' });
+    expect(h['Authorization']).toBe('Bearer obo-jwt'); // OBO still carries the authz decision
+    expect(h).not.toHaveProperty('X-DB-Username');
+    expect(h).not.toHaveProperty('X-DB-Password');
+  });
+
+  it('omits empty-string X-DB-* too (defensive: never sends a blank credential header)', () => {
+    const h = buildUpstreamHeaders({ name: 't', arguments: {}, obo: 'o', dbUser: '', dbPass: '' }, { mode: 'obo', oboHeader: 'X-Verify-OBO' });
+    expect(h).not.toHaveProperty('X-DB-Username');
+    expect(h).not.toHaveProperty('X-DB-Password');
+  });
 });
 
 describe('callUpstreamTool with upstream_token auth', () => {

@@ -112,14 +112,18 @@ function requireNonEmptyString(value: unknown, field: string): string {
  *   - rarType / idField / argIdKey non-empty strings
  *   - actions is a non-empty object
  *   - exactly one action sets `default: true`, and it is not blocked
- *   - every non-blocked action has a credsPath
+ *   - every non-blocked action has a credsPath (ONLY when opts.requireCredsPath
+ *     is true — the default. A NO-DB deployment fronting a non-database upstream
+ *     (UPSTREAM_DB_BACKED=false) has no Vault ephemeral-cred leg, so its actions
+ *     carry no credsPath; the singleton below relaxes the requirement in that mode)
  *   - every `elevatedFrom` references an existing action, and no two actions
  *     elevate from the same base (elevation must be unambiguous)
  *   - stepUp, when present, has a string[] discoveryTools and an elevateWhen
  *     rule with a non-empty field and EXACTLY ONE of equals/in/notIn; when
  *     absent, step-up discovery is simply disabled
  */
-export function parseRarConfig(raw: unknown): RarConfig {
+export function parseRarConfig(raw: unknown, opts: { requireCredsPath?: boolean } = {}): RarConfig {
+  const requireCredsPath = opts.requireCredsPath ?? true;
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     throw new RarConfigError('config/rar.json: top level must be an object');
   }
@@ -155,7 +159,7 @@ export function parseRarConfig(raw: unknown): RarConfig {
 
   const elevationByBase: Record<string, string> = {};
   for (const [name, entry] of Object.entries(actions)) {
-    if (entry.blocked !== true) {
+    if (entry.blocked !== true && requireCredsPath) {
       requireNonEmptyString(entry.credsPath, `actions.${name}.credsPath`);
     }
     if (entry.elevatedFrom !== undefined) {
@@ -247,15 +251,25 @@ export function parseElevateWhen(raw: unknown): ElevateWhenRule {
  * `elevatedFrom`). Replaces the old hardcoded `credsPath.includes('-elevated')`
  * display heuristic in pipeline.ts — the config, not a path-suffix naming
  * convention, is what defines "elevated".
+ *
+ * An action with NO credsPath (a NO-DB deployment) simply isn't an elevated
+ * creds path — the `p !== undefined` guard stops an undefined elevated-action
+ * credsPath from matching an undefined argument.
  */
 export function isElevatedCredsPath(credsPath: string, config: RarConfig = rarConfig): boolean {
-  return Object.values(config.elevationByBase).some(
-    (elevated) => config.actions[elevated]?.credsPath === credsPath,
-  );
+  return Object.values(config.elevationByBase).some((elevated) => {
+    const p = config.actions[elevated]?.credsPath;
+    return p !== undefined && p === credsPath;
+  });
 }
 
 // ── The singleton every runtime module uses ─────────────────────────────
 // Loaded + validated once at import — a bad config/rar.json kills the
 // gateway at startup with a RarConfigError, never at first request.
 const rarConfigPath = new URL('../../config/rar.json', import.meta.url);
-export const rarConfig: RarConfig = parseRarConfig(JSON.parse(readFileSync(rarConfigPath, 'utf-8')));
+export const rarConfig: RarConfig = parseRarConfig(JSON.parse(readFileSync(rarConfigPath, 'utf-8')), {
+  // A credsPath is required on every non-blocked action UNLESS this is a NO-DB
+  // deployment (UPSTREAM_DB_BACKED=false) fronting a non-database upstream —
+  // there is no Vault ephemeral-cred leg to point a creds path at.
+  requireCredsPath: process.env['UPSTREAM_DB_BACKED'] !== 'false',
+});
