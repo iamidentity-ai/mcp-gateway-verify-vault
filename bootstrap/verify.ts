@@ -82,6 +82,12 @@ const ADMIN_SECRET = reqEnv('VERIFY_ADMIN_SECRET');
 const APP_PREFIX = process.env['GATEWAY_APP_PREFIX'] || 'MCP Gateway';
 const UI_ORIGIN = (process.env['GATEWAY_UI_ORIGIN'] || 'http://localhost:5173').replace(/\/+$/, '');
 const ACTOR_TOKEN_TYPE = process.env['GATEWAY_ACTOR_TOKEN_TYPE'] || 'SPIFFE';
+// Whether to wire the SPIFFE JWT-SVID custom actor token type into the TE app.
+// Matches the runtime AUTH_METHOD (default 'spiffe'). In 'verify' mode the actor
+// is the Agent Identity app's client_credentials access_token — no SPIFFE
+// custom token type is required (and a tenant without it 400s CSIAQ0381
+// "The selected actor token type SPIFFE does not support token validation").
+const USE_SPIFFE = (process.env['AUTH_METHOD'] || 'spiffe') === 'spiffe';
 const AGENT_ID_CLAIM = process.env['GATEWAY_AGENT_ID_CLAIM'] || 'mcp-gateway-agent';
 const ACTOR_SPIFFE_SUB = process.env['GATEWAY_ACTOR_SPIFFE_SUB'] || 'spiffe://example.org/mcp-gateway';
 const COMPANY_NAME = process.env['GATEWAY_COMPANY_NAME'] || 'Example';
@@ -322,6 +328,10 @@ function buildAgentBody(): Record<string, unknown> {
             tokenExchange: 'false',
           },
           redirectUris: [],
+          // Required by some tenants on EVERY app, even a client_credentials
+          // app that issues no ID token (older tenants 400 with CSIAQ0134
+          // "The ID token signing algorithm is missing" without it).
+          idTokenSigningAlg: 'RS256',
           accessTokenExpiry: 3600,
           doNotGenerateClientSecret: 'false',
           sendAllKnownUserAttributes: 'false',
@@ -423,10 +433,12 @@ function buildTeBody(uiClientId: string, agentClientId: string, authPolicy?: Rec
             dpopProofSigningAlg: 'RS256',
             authorizeRspEncryptionAlg: 'none',
             requirePushAuthorize: false,
-            // Both actor types: the SPIFFE JWT-SVID custom type (spiffe mode)
-            // and access_token (the Agent Identity client_credentials JWT in
-            // verify mode).
-            actorTokenTypes: ['urn:ietf:params:oauth:token-type:access_token', ACTOR_TOKEN_TYPE],
+            // access_token (the Agent Identity client_credentials JWT, verify
+            // mode) is always accepted; the SPIFFE JWT-SVID custom type is added
+            // only in spiffe mode (its custom token type must exist on the tenant).
+            actorTokenTypes: USE_SPIFFE
+              ? ['urn:ietf:params:oauth:token-type:access_token', ACTOR_TOKEN_TYPE]
+              : ['urn:ietf:params:oauth:token-type:access_token'],
             // Clients permitted to perform the exchange: the UI (subject issuer)
             // and the Agent Identity app (verify-mode actor issuer).
             clientGroups: { tokenExchange: [uiClientId, agentClientId] },
@@ -443,7 +455,7 @@ function buildTeBody(uiClientId: string, agentClientId: string, authPolicy?: Rec
         grantProperties: { generateDeviceFlowQRCode: 'false' },
         token: {
           accessTokenType: 'jwt',
-          audiences: [ACTOR_TOKEN_TYPE, UI_ORIGIN],
+          audiences: USE_SPIFFE ? [ACTOR_TOKEN_TYPE, UI_ORIGIN] : [UI_ORIGIN],
           attributeMappings: [{ targetName: 'agent_id', function: { custom: agentIdCelx(AGENT_ID_CLAIM) } }],
         },
         consentAction: 'always_prompt',
