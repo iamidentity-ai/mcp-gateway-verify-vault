@@ -164,7 +164,6 @@ const PREFLIGHTS: Preflight[] = [
   { family: 'Applications', method: 'GET', path: '/v1.0/applications?limit=1', entitlement: 'Manage application lifecycle (manageApplications)', required: true },
   { family: 'Attributes', method: 'GET', path: '/v1.0/attributes', entitlement: 'Manage attributes (manageAttributes)', required: true },
   { family: 'Access policies', method: 'GET', path: '/v5.0/policyvault/accesspolicy', entitlement: 'Manage access policies (managePolicies)', required: true },
-  { family: 'Groups', method: 'GET', path: '/v2.0/Groups?count=1', entitlement: 'Manage user groups (manageUserGroups) — only needed for the optional group-entitlement fixup', required: false },
 ];
 
 async function preflightEntitlements(token: string): Promise<void> {
@@ -290,10 +289,12 @@ function buildUiBody(agentClientId: string): Record<string, unknown> {
           idTokenEncryptAlg: 'none',
           idTokenEncryptEnc: 'none',
         },
-        // The two record scopes are registered so the login can request them
-        // and they exchange cleanly; restrictScopes is off to avoid the
-        // silent-drop trap on any additional scope the customer's UI requests.
-        restrictScopes: 'false',
+        // The record scopes are registered so the login can request them and
+        // they exchange cleanly. restrictScopes locks the login to registered
+        // scopes only — SAFE only if the browser login requests nothing beyond
+        // them (standard OIDC openid/profile/email must also be registered or
+        // Verify silently drops them and login breaks). Env-gated, default off.
+        restrictScopes: process.env['GATEWAY_RESTRICT_UI_SCOPES'] === 'true' ? 'true' : 'false',
         scopes: SCOPES.map((s) => ({ name: s, description: `Allow the gateway agent to perform ${s} on your behalf` })),
         entitlements: [],
         restrictEntitlements: true,
@@ -441,6 +442,17 @@ function buildTeBody(uiClientId: string, agentClientId: string, authPolicy?: Rec
             dpopProofSigningAlg: 'RS256',
             authorizeRspEncryptionAlg: 'none',
             requirePushAuthorize: false,
+            // BACKLOG (RAR-type lock-down): `restrictAuthDetailTypes: true`
+            // constrains which authorization_details `type`s Verify accepts on
+            // the exchange (reject any RAR type this gateway does not emit: the
+            // config rarType, plus `vault:path_access` when DB-backed). Left
+            // FALSE because Verify also requires a NON-EMPTY allowed-types list
+            // when the toggle is on ("Empty restricted authorization detail type
+            // is not allowed"), and that companion list-field is not surfaced by
+            // the API while the toggle is off — confirm its exact key by enabling
+            // once in the console + GET before wiring, or the PUT 400s.
+            // `ignoreUnknownAuthDetailTypes` is the related leniency knob.
+            restrictAuthDetailTypes: false,
             // access_token (the Agent Identity client_credentials JWT, verify
             // mode) is always accepted; the SPIFFE JWT-SVID custom type is added
             // only in spiffe mode (its custom token type must exist on the tenant).
@@ -456,6 +468,11 @@ function buildTeBody(uiClientId: string, agentClientId: string, authPolicy?: Rec
         },
         // Exactly the scopes config/tools.json requests — registering both is
         // required or restrictScopes-driven policy conditions silently miss.
+        // restrictScopes TRUE is SAFE here: the TE app registers exactly the
+        // scopes it uses and the exchange requests no others (no openid/profile/
+        // email), and the Github-RAR-HITL policy keys on the RAR action, not on
+        // a scope, so no policy condition is silently dropped.
+        restrictScopes: 'true',
         scopes: SCOPES.map((s) => ({ name: s, description: `Gateway scope ${s}` })),
         entitlements: [],
         // restrictEntitlements FALSE is a sibling of `properties` (NOT inside it).
@@ -682,7 +699,7 @@ async function main(): Promise<void> {
     }),
   );
   const boundApp = await api('GET', `/v1.0/applications/${teApp.id}`, token);
-  if (boundApp?.authPolicy?.id === policyId) {
+  if (String(boundApp?.authPolicy?.id) === String(policyId)) {
     console.log(`[verify] ${APP_NAMES.exchange} — authPolicy bound to ${POLICY_NAME} (${policyId})`);
   } else {
     console.warn(
