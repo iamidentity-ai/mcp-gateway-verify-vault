@@ -87,10 +87,13 @@ export interface PushInfo {
  * boundary.
  */
 export interface OboDiag {
-  // The raw OBO bearer token is deliberately NOT a field here. It is a live
-  // credential — it mints Vault DB creds and calls downstream APIs — so it must
-  // never reach a client. `oboJti` (below) is the non-secret correlation id
-  // that proves the exchange happened without being replayable.
+  // The raw OBO bearer token is a LIVE credential — it mints Vault DB creds and
+  // calls downstream APIs — so it is normally NOT sent to a client; `oboJti`
+  // (below) is the non-secret correlation id that proves the exchange happened
+  // without being replayable. It is populated here ONLY when GATEWAY_DEBUG_OBO=true
+  // — a localhost demo affordance so the UI can decode it in a JWT viewer. NEVER
+  // enable that flag in a shipped or networked deployment.
+  obo?: string;
   oboJti?: string;
   oboTtl?: number;
   oboScope?: string;
@@ -448,6 +451,7 @@ async function runExchangeAndCall(
   // happened. Carries the OBO's jti (correlation), never the OBO itself (a live
   // credential). NO-DB: no `cred` field (there is no ephemeral credential).
   const diag: OboDiag = {
+    ...(process.env['GATEWAY_DEBUG_OBO'] === 'true' ? { obo } : {}),
     oboJti: decodeJwtJti(obo),
     oboTtl: exchangeResult.expiresIn,
     oboScope: exchangeResult.scope ?? gate.scope,
@@ -700,6 +704,7 @@ export async function completePending(
   // (post-approval) OBO, the one actually minted after the human said yes.
   // NO-DB: no `cred` field (there is no ephemeral credential).
   const diag: OboDiag = {
+    ...(process.env['GATEWAY_DEBUG_OBO'] === 'true' ? { obo } : {}),
     oboJti: decodeJwtJti(obo),
     oboTtl: assertionResult.expiresIn,
     oboScope: assertionResult.scope ?? ctx.scope,
