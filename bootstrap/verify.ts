@@ -58,6 +58,7 @@ import {
   type AttributeDef,
   type AccessPolicy,
 } from './lib/generate.js';
+import { dpopAppFields } from './lib/dpop-fields.js';
 
 // ── Config (env, with generic non-leaky defaults) ─────────────────────────
 
@@ -420,7 +421,6 @@ function buildTeBody(uiClientId: string, agentClientId: string, authPolicy?: Rec
               { name: 'authorization_details', type: 'parameter', custom: 'statements:\n- return: requestContext.authorization_details' },
             ],
             clientAuthMethod: 'default',
-            validateDPoPProofJti: false,
             subjectTokenTypes: ['urn:ietf:params:oauth:token-type:access_token'],
             certificateBoundAccessTokens: false,
             requestObjectSigningAlg: 'RS256',
@@ -435,11 +435,14 @@ function buildTeBody(uiClientId: string, agentClientId: string, authPolicy?: Rec
             refreshIntrospectMapClaimNames: [],
             suppressDefaultClaims: false,
             useUserDefaultEntitlements: true,
-            dpopBoundAccessTokens: false,
+            // DPoP (RFC 9449). ENABLE_DPOP=true makes Verify require a proof
+            // on every token call from this app and bind issued OBOs to the
+            // caller's key (cnf.jkt). String values on purpose: the admin
+            // API silently ignores JSON booleans for these three fields.
+            ...dpopAppFields(process.env['ENABLE_DPOP'] === 'true'),
             oidcv3: true,
             requestObjectRequireExp: true,
             authorizeRspEncryptionEnc: 'none',
-            dpopProofSigningAlg: 'RS256',
             authorizeRspEncryptionAlg: 'none',
             requirePushAuthorize: false,
             // BACKLOG (RAR-type lock-down): `restrictAuthDetailTypes: true`
