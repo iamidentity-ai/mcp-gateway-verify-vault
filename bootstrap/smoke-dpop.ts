@@ -31,7 +31,7 @@ const CLIENT_ID = req('GATEWAY_EXCHANGE_CLIENT_ID');
 const CLIENT_SECRET = req('GATEWAY_EXCHANGE_CLIENT_SECRET');
 const SUBJECT = req('SMOKE_SUBJECT_TOKEN');
 const TOOL = process.env['SMOKE_DPOP_TOOL'] || 'get_record';
-const TOOL_ARGS = JSON.parse(process.env['SMOKE_DPOP_ARGS'] || '{"id":"REC-1001"}') as Record<string, unknown>;
+const TOOL_ARGS = JSON.parse(process.env['SMOKE_DPOP_ARGS'] || '{"recordId":"REC-1001"}') as Record<string, unknown>;
 
 function fail(msg: string): never {
   console.error(msg);
