@@ -273,16 +273,17 @@ function buildUiBody(agentClientId: string): Record<string, unknown> {
             responseModes: ['query', 'fragment', 'form_post'],
             requestObjectParametersOnly: false,
             useUserDefaultEntitlements: true,
-            dpopBoundAccessTokens: false,
             oidcv3: true,
             requirePushAuthorize: false,
-            validateDPoPProofJti: false,
             certificateBoundAccessTokens: false,
+            // Phase 2 DPoP: bind USER access tokens (cnf.jkt) so the
+            // gateway's full mode can verify caller proofs. Only enable with
+            // a DPoP-capable client; see docs/guides/dpop-rollout.md.
+            ...dpopAppFields(process.env['ENABLE_DPOP_UI'] === 'true'),
             requestObjectSigningAlg: 'RS256',
             authorizeRspSigningAlg: 'RS256',
             authorizeRspEncryptionEnc: 'none',
             authorizeRspEncryptionAlg: 'none',
-            dpopProofSigningAlg: 'RS256',
             requestObjectMaxExpFromNbf: 1800,
             requestObjectRequireExp: true,
             suppressDefaultClaims: false,
