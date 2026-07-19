@@ -10,6 +10,8 @@ Turn this on in stages. Each stage is independently verifiable, and the first tw
    ENABLE_DPOP=true npm run bootstrap:verify
    ```
 
+   This PUT rotates every app client secret it touches: the Token Exchange app, the Agent Identity app, and the UI app. Refresh all three after the run or the next call fails client authentication with `CSIAQ0155E` (a stale UI secret shows up as a login redirect loop). Read them without the Admin console via the admin API: `GET /v1.0/applications/{id}` returns `providers.oidc.properties.clientSecret`. Update `GATEWAY_EXCHANGE_CLIENT_SECRET` and `GATEWAY_AGENT_CLIENT_SECRET` in the gateway env, and `VERIFY_UI_CLIENT_SECRET` in any sign-in client. Or use `SECRETS_BACKEND=vault` so the gateway reads the live secret and nothing goes stale.
+
 2. Restart the gateway with `TOKEN_BINDING_MODE=outbound`.
 
 3. Prove it, both directions:
