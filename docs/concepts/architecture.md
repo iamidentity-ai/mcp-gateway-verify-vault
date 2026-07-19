@@ -52,12 +52,15 @@ flowchart LR
     VAULT["Secrets engine<br/>HashiCorp Vault · verify-rar"]
     ANTENNA["CAEP / SSF transmitter<br/>Antenna"]
 
-    AGENT -->|"MCP call + user bearer"| FACE
-    PIPE -->|"introspect · token exchange · RAR"| IDP
+    AGENT -->|"MCP call + user bearer<br/>(+ DPoP proof in full binding mode)"| FACE
+    PIPE -->|"introspect · token exchange · RAR<br/>(+ DPoP proof in outbound/full mode)"| IDP
     PIPE -->|"mint one-time DB cred (OBO)"| VAULT
     PIPE -->|"CAEP session-revoked (on abuse)"| ANTENNA
     ANTENNA -->|"DELETE /v1.0/auth/sessions"| IDP
     SC -->|"OBO bearer + one-time DB cred"| NAIVE
+
+    classDef dpopnote fill:#f0f9ff,stroke:#7dd3fc,color:#0c4a6e
+    BINDING["Optional: DPoP token binding<br/>TOKEN_BINDING_MODE=none|outbound|full<br/>docs/concepts/token-binding.md"]:::dpopnote
 ```
 
 **North face** (`gateway/src/index.ts`). An Express host, bound to `127.0.0.1`, exposing two
@@ -141,12 +144,15 @@ sequenceDiagram
     participant A as Antenna (CAEP/SSF)
 
     C->>G: POST /tool {name, args} + user bearer
+    Note over C,G: full binding mode: the call also carries a caller-signed<br/>DPoP proof; the gateway rejects a bare bearer with 401
     G->>V: GET /oauth2/userinfo - introspect
     V-->>G: 200 active {sub, email}
     Note over G: kill-gate: isSessionKilled(sub)?
     Note over G: tier gate: gateTool(name)<br/>tier 4 / unknown -> 403 deny, no Verify call
-    G->>V: POST /oauth2/token - RFC 8693 exchange<br/>subject=user, actor=SPIFFE SVID,<br/>authorization_details (RFC 9396 RAR)
-    V-->>G: 200 OBO - scope-bound, RAR-attested
+    rect rgb(240, 249, 255)
+        G->>V: POST /oauth2/token - RFC 8693 exchange<br/>subject=user, actor=SPIFFE SVID,<br/>authorization_details (RFC 9396 RAR)<br/>outbound/full binding: + DPoP proof
+        V-->>G: 200 OBO - scope-bound, RAR-attested<br/>bound mode: cnf.jkt = gateway key
+    end
     G->>K: POST verify-rar/creds/... (OBO as X-Vault-Token)
     K-->>G: ephemeral Postgres cred + lease_id (5-min TTL)
     G->>N: MCP tools/call {name, args}<br/>Authorization: OBO · X-DB-Username/Password

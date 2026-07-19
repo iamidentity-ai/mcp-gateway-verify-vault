@@ -84,12 +84,15 @@ flowchart LR
     VAULT["Secrets engine<br/>HashiCorp Vault · verify-rar"]
     ANTENNA["CAEP / SSF transmitter<br/>Antenna"]
 
-    AGENT -->|"MCP call + user bearer"| FACE
-    PIPE -->|"introspect · token exchange · RAR"| IDP
+    AGENT -->|"MCP call + user bearer<br/>(+ DPoP proof in full binding mode)"| FACE
+    PIPE -->|"introspect · token exchange · RAR<br/>(+ DPoP proof in outbound/full mode)"| IDP
     PIPE -->|"mint one-time DB cred (OBO)"| VAULT
     PIPE -->|"CAEP session-revoked (on abuse)"| ANTENNA
     ANTENNA -->|"DELETE /v1.0/auth/sessions"| IDP
     SC -->|"OBO bearer + one-time DB cred"| NAIVE
+
+    classDef dpopnote fill:#f0f9ff,stroke:#7dd3fc,color:#0c4a6e
+    BINDING["Optional: DPoP token binding<br/>TOKEN_BINDING_MODE=none|outbound|full<br/>docs/concepts/token-binding.md"]:::dpopnote
 ```
 
 Full walkthrough: **[docs/concepts/architecture.md](docs/concepts/architecture.md)**. The other
