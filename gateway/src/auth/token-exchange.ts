@@ -62,6 +62,8 @@ import {
 } from './secrets.js';
 import { getSvid } from '../spiffe/svid.js';
 import { rarConfig } from '../rar/rar-config.js';
+import { resolveBindingMode, getGatewayDpopKey } from './binding-mode.js';
+import { dpopFetch } from './sender-constraints/dpop-fetch.js';
 
 const VERIFY_TENANT_URL = process.env.VERIFY_TENANT_URL || 'https://tenant.verify.ibm.com';
 const EXCHANGE_CLIENT_ID = process.env.GATEWAY_EXCHANGE_CLIENT_ID || '';
@@ -81,6 +83,23 @@ const ACTOR_TOKEN_TYPE = process.env.GATEWAY_ACTOR_TOKEN_TYPE || 'SPIFFE';
 // MFA poll defaults
 const MFA_POLL_INTERVAL_MS = Number(process.env.MFA_POLL_INTERVAL_MS) || 3000;
 const MFA_POLL_TIMEOUT_MS = Number(process.env.MFA_POLL_TIMEOUT_MS) || 120_000;
+
+/**
+ * Wrap fetch() for the /oauth2/token legs with the configured token binding.
+ * In outbound or full mode every token-endpoint call carries a fresh DPoP
+ * proof, so Verify (with dpopBoundAccessTokens on the exchange app) returns
+ * OBOs bound to the gateway's key via cnf.jkt. The factors, verification
+ * polling, and client_credentials calls stay plain bearer on purpose: they
+ * present tokens at resource endpoints and are not token issuance, and only
+ * the exchange app is DPoP-bound.
+ */
+async function bindingFetch(url: string, init: RequestInit): Promise<Response> {
+  if (resolveBindingMode() !== 'none') {
+    const key = await getGatewayDpopKey();
+    return dpopFetch(url, { ...init, key });
+  }
+  return fetch(url, init);
+}
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -388,7 +407,7 @@ export async function exchangeMfaAssertionWithRAR(
     params.authorization_details = JSON.stringify(authorizationDetails);
   }
 
-  const res = await fetch(`${VERIFY_TENANT_URL}/oauth2/token`, {
+  const res = await bindingFetch(`${VERIFY_TENANT_URL}/oauth2/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(params),
@@ -448,7 +467,7 @@ export async function exchangeToken(request: TokenExchangeRequest): Promise<Toke
     if (authorizationDetails && authorizationDetails.length > 0) {
       params.authorization_details = JSON.stringify(authorizationDetails);
     }
-    const res = await fetch(`${VERIFY_TENANT_URL}/oauth2/token`, {
+    const res = await bindingFetch(`${VERIFY_TENANT_URL}/oauth2/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams(params),

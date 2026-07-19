@@ -19,6 +19,8 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { __resetBindingForTests } from './binding-mode.js';
+import { decodeProtectedHeader } from 'jose';
 
 // vi.mock is hoisted above imports; vi.hoisted lets us share the mock fns
 // between the factory and the test bodies without TDZ errors.
@@ -82,6 +84,8 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  __resetBindingForTests();
+  vi.unstubAllEnvs();
 });
 
 // Read URL from a fetch call (handles string + URL + Request)
@@ -509,5 +513,46 @@ describe('buildPushContext', () => {
     const ctx = buildPushContext(undefined);
     expect(ctx.message).toContain('records action');
     expect(ctx.message).toContain("If you didn't request this, deny.");
+  });
+});
+
+// ── (f) TOKEN_BINDING_MODE: DPoP proofs on the token legs ────
+
+describe('bindingFetch (TOKEN_BINDING_MODE)', () => {
+  it('outbound mode attaches a fresh DPoP proof to the token-exchange leg', async () => {
+    vi.stubEnv('TOKEN_BINDING_MODE', 'outbound');
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ access_token: 'obo-1', token_type: 'Bearer', expires_in: 3600, scope: 'records:read' }),
+    );
+    const result = await exchangeToken({ subjectToken: 'subject-tok', scope: 'records:read' });
+    expect(result.status).toBe('ok');
+    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    expect(headers['DPoP']).toMatch(/^eyJ/);
+    expect(decodeProtectedHeader(headers['DPoP']!).typ).toBe('dpop+jwt');
+  });
+
+  it('none mode sends no DPoP header (byte-identical to today)', async () => {
+    vi.stubEnv('TOKEN_BINDING_MODE', 'none');
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ access_token: 'obo-2', token_type: 'Bearer', expires_in: 3600, scope: 'records:read' }),
+    );
+    await exchangeToken({ subjectToken: 'subject-tok', scope: 'records:read' });
+    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    expect(headers['DPoP']).toBeUndefined();
+  });
+
+  it('outbound mode also proofs the jwt_bearer second leg', async () => {
+    vi.stubEnv('TOKEN_BINDING_MODE', 'outbound');
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ access_token: 'obo-3', token_type: 'Bearer', expires_in: 3600, scope: 'records:write' }),
+    );
+    await exchangeMfaAssertionWithRAR('mfa-assertion', 'records:write', [{ type: 'records_api' }], 'exchange-secret-v1');
+    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    expect(headers['DPoP']).toMatch(/^eyJ/);
+    // The form body must be untouched by the wrapper
+    expect(String(init.body)).toContain('grant_type=');
   });
 });
