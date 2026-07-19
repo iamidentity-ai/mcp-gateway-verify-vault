@@ -48,7 +48,7 @@ Run one tier-2 write and approve the push. The challenge-token calls (factors, v
 
 1. Bind the UI app: `ENABLE_DPOP=true ENABLE_DPOP_UI=true npm run bootstrap:verify`
 2. Point a DPoP-capable client at the gateway. For gateway-agent-demo set `TOKEN_BINDING_MODE=dpop` in its environment. Users must sign in again (fresh tokens bind to the client's current key).
-3. Set the gateway's `GATEWAY_PUBLIC_URL` to the URL callers actually use. Proofs bind to it; behind a tunnel the public hostname is the one that matters.
+3. Set the gateway's `GATEWAY_PUBLIC_URL` to the URL callers actually use. Proofs bind to it; behind a tunnel the public hostname is the one that matters. The match is a byte-exact string compare of scheme, host, and path, so the client's base URL and `GATEWAY_PUBLIC_URL` must be the same string. `http://localhost:3014` and `http://127.0.0.1:3014` are different `htu` values even though they resolve to the same host, and a mismatch returns `401 htu_mismatch` on every call. In the local stack, point the demo's `GATEWAY_URL` and the gateway's `GATEWAY_PUBLIC_URL` at the same host string.
 4. Restart the gateway with `TOKEN_BINDING_MODE=full`.
 5. Verify enforcement with a bare replay: grab a live user token and
 
