@@ -15,7 +15,8 @@
     "lint:words": "bash scripts/forbidden-words.sh",
     "bootstrap:verify": "npm run bootstrap:verify -w bootstrap",
     "bootstrap:vault": "npm run bootstrap:vault -w bootstrap",
-    "smoke": "npm run smoke -w bootstrap"
+    "smoke": "npm run smoke -w bootstrap",
+    "smoke:dpop": "npm run smoke:dpop -w bootstrap"
   },
   "engines": {
     "node": ">=20"

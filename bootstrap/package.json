@@ -8,6 +8,7 @@
     "bootstrap:verify": "tsx verify.ts",
     "bootstrap:vault": "tsx vault.ts",
     "smoke": "tsx smoke.ts",
+    "smoke:dpop": "tsx smoke-dpop.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
