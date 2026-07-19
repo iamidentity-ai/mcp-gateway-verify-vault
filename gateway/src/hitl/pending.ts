@@ -51,6 +51,10 @@ export interface PendingCtx {
    *  that was only cleared on successful completion, leaking one entry per
    *  abandoned/timed-out mfa_challenge for the lifetime of the process. */
   args: Record<string, unknown>;
+  /** True when the request that parked this transaction passed full-mode
+   *  DPoP validation at the route layer. Carried through to completePending's
+   *  diag so a resumed step-up still surfaces `tokenBinding: 'dpop'`. */
+  senderConstrained?: boolean;
 }
 
 const DEFAULT_TTL_MS = 130 * 1000;

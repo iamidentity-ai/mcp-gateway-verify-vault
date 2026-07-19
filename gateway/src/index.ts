@@ -43,6 +43,8 @@ import { runPipeline, completePending, type PipelineResult } from './pipeline.js
 import { introspectUser } from './auth/introspect.js';
 import { isSessionKilled } from './ssf/killed-sessions.js';
 import { getAuditForUser } from './audit/chain.js';
+import { resolveBindingMode } from './auth/binding-mode.js';
+import { verifyDpopProof } from './auth/dpop-verify.js';
 
 const PORT = Number(process.env['PORT'] ?? 3014);
 /** Service name — used in log prefixes and as the MCP server identity.
@@ -64,6 +66,30 @@ function requireBearer(req: Request, res: Response): string | undefined {
     return undefined;
   }
   return bearer;
+}
+
+// ── Inbound DPoP enforcement (TOKEN_BINDING_MODE=full) ───────────────────
+// htu binds to the URL the CALLER used. Behind a tunnel or LB that is the
+// public hostname, so it must be configured; the local bind is the fallback
+// for same-host development.
+const PUBLIC_URL = (process.env['GATEWAY_PUBLIC_URL'] || `http://127.0.0.1:${PORT}`).replace(/\/+$/, '');
+
+/** Gate a route on a valid caller proof in full mode. In none/outbound mode
+ *  this is a no-op so the drop-in path stays untouched. Returns false after
+ *  writing the 401, mirroring requireBearer's contract. */
+async function requireDpopBound(req: Request, res: Response, bearer: string): Promise<boolean> {
+  if (resolveBindingMode() !== 'full') return true;
+  const proof = req.header('dpop');
+  if (!proof) {
+    res.status(401).json({ error: 'missing_dpop_proof' });
+    return false;
+  }
+  const result = await verifyDpopProof({ proof, method: req.method, url: `${PUBLIC_URL}${req.path}`, accessToken: bearer });
+  if (!result.ok) {
+    res.status(401).json({ error: result.error });
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -169,13 +195,14 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
 
 // ── Shared dispatcher both transports call ────────────────────────────────
 async function dispatchTool(toolName: string, args: Record<string, unknown>, bearer: string): Promise<PipelineResult> {
-  return runPipeline({ userToken: bearer, toolName, args });
+  return runPipeline({ userToken: bearer, toolName, args, senderConstrained: resolveBindingMode() === 'full' });
 }
 
 // ── Transport 1: POST /tool (simple REST, curl-friendly) ─────────────────
 app.post('/tool', async (req: Request, res: Response) => {
   const bearer = requireBearer(req, res);
   if (!bearer) return;
+  if (!(await requireDpopBound(req, res, bearer))) return;
 
   const body = (req.body ?? {}) as Record<string, unknown>;
   const name = (body['name'] ?? body['toolName']) as string | undefined;
@@ -234,6 +261,7 @@ export function resolveTestVerdictOverride(
 app.post('/hitl/complete', async (req: Request, res: Response) => {
   const bearer = requireBearer(req, res);
   if (!bearer) return;
+  if (!(await requireDpopBound(req, res, bearer))) return;
 
   const body = (req.body ?? {}) as Record<string, unknown>;
   const txId = body['txId'] as string | undefined;
@@ -273,6 +301,7 @@ app.post('/hitl/complete', async (req: Request, res: Response) => {
 app.get('/me/audit', async (req: Request, res: Response) => {
   const bearer = requireBearer(req, res);
   if (!bearer) return;
+  if (!(await requireDpopBound(req, res, bearer))) return;
 
   const introspection = await introspectUser(bearer);
   if (!introspection.active || !introspection.verifyUserId) {
@@ -289,6 +318,7 @@ app.get('/me/audit', async (req: Request, res: Response) => {
 app.get('/me/session-status', async (req: Request, res: Response) => {
   const bearer = requireBearer(req, res);
   if (!bearer) return;
+  if (!(await requireDpopBound(req, res, bearer))) return;
 
   try {
     const introspection = await introspectUser(bearer);
@@ -406,6 +436,7 @@ function buildMcpServer(bearer: string): McpServer {
 app.post('/mcp', async (req: Request, res: Response) => {
   const bearer = requireBearer(req, res);
   if (!bearer) return;
+  if (!(await requireDpopBound(req, res, bearer))) return;
 
   const server = buildMcpServer(bearer);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });

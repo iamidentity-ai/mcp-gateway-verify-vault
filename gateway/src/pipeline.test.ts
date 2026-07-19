@@ -411,6 +411,9 @@ describe('runPipeline', () => {
     // Security control: the raw OBO bearer token must NEVER leak into the
     // client-visible diagnostics — it is a replayable credential.
     expect(okDiag).not.toHaveProperty('obo');
+    // Baseline (no senderConstrained on ctx): tokenBinding must be absent.
+    // none/outbound mode must be byte-identical for callers.
+    expect((result as { diag?: { tokenBinding?: string } }).diag?.tokenBinding).toBeUndefined();
 
     expectOrder(calls, [
       'introspectUser',
@@ -446,6 +449,18 @@ describe('runPipeline', () => {
     // tier 1 is a pure read, never MFA-gated, so a successful call must NOT
     // reset another tool's in-flight deny count.
     expect(deps.clearDeny).not.toHaveBeenCalled();
+  });
+
+  it('marks diag.tokenBinding = "dpop" when the ctx is sender-constrained', async () => {
+    const { deps } = makeRunDeps();
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' }, senderConstrained: true },
+      deps as any,
+    );
+
+    expect(result.status).toBe('ok');
+    expect((result as { diag?: { tokenBinding?: string } }).diag?.tokenBinding).toBe('dpop');
   });
 
   it('elevated read (gateway-derived) mints from the elevated creds path AND the RAR agrees on the ' +

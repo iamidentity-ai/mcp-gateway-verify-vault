@@ -63,6 +63,9 @@ export interface PipelineCtx {
   userToken: string;
   toolName: string;
   args: Record<string, unknown>;
+  /** True when the inbound request passed full-mode DPoP validation. Pure
+   *  observability: enforcement already happened at the route layer. */
+  senderConstrained?: boolean;
 }
 
 export interface PushInfo {
@@ -99,6 +102,8 @@ export interface OboDiag {
   oboScope?: string;
   cred?: { username: string; leaseId: string; path: string };
   elevated?: boolean;
+  /** "dpop" when the inbound request carried a validated DPoP proof. */
+  tokenBinding?: 'dpop';
 }
 
 export type PipelineResult =
@@ -406,6 +411,7 @@ async function runExchangeAndCall(
       credsPath,
       startedAt,
       args: ctx.args,
+      senderConstrained: ctx.senderConstrained,
     };
     d.putPending(txId, pendingCtx);
 
@@ -457,6 +463,7 @@ async function runExchangeAndCall(
     oboScope: exchangeResult.scope ?? gate.scope,
     ...(cred ? { cred: { username: cred.username, leaseId: cred.leaseId, path: credsPath! } } : {}),
     elevated,
+    ...(ctx.senderConstrained ? { tokenBinding: 'dpop' as const } : {}),
   };
 
   if (!suppressAudit) {
@@ -713,6 +720,7 @@ export async function completePending(
     // in config/rar.json — the config, not a path-suffix naming convention,
     // defines "elevated". A NO-DB call has no creds path, so it is never elevated.
     elevated: ctx.credsPath ? isElevatedCredsPath(ctx.credsPath) : false,
+    ...(ctx.senderConstrained ? { tokenBinding: 'dpop' as const } : {}),
   };
 
   d.appendAudit({
