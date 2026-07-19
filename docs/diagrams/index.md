@@ -1,12 +1,12 @@
 # Diagrams
 
-The five source diagrams for this project, as standalone [Mermaid](https://mermaid.js.org/)
+The six source diagrams for this project, as standalone [Mermaid](https://mermaid.js.org/)
 `.mmd` files. Each is embedded inline (in a fenced `mermaid` block) wherever it is
 referenced - the README and the concept pages - so you never have to leave the page to
 see it. The `.mmd` files here are the single source: edit one place, paste it back into
 the docs that embed it.
 
-All five are rendered to the records example domain (the shipped `config/rar.json`). Point
+All six are rendered to the records example domain (the shipped `config/rar.json`). Point
 the gateway at your own domain and the same shapes hold - only the labels change.
 
 | File | Kind | What it shows | Referenced from |
@@ -16,6 +16,7 @@ the gateway at your own domain and the same shapes hold - only the labels change
 | [`elevated-discovery-stepup.mmd`](elevated-discovery-stepup.mmd) | sequence | The gateway-derived classification discovery probe and the policy-enforced step-up it forces - the agent cannot skip it. | [concepts/human-in-the-loop](../concepts/human-in-the-loop.md) |
 | [`session-kill.mmd`](session-kill.mmd) | flowchart | The two-channel CAEP/SSF kill: three denials or one suspicious verdict → tenant-wide session revoke + local kill-gate. | [concepts/session-kill](../concepts/session-kill.md) |
 | [`interchangeability.mmd`](interchangeability.mmd) | flowchart | The generic core vs. the five swappable per-domain surfaces - secure YOUR MCP by editing config, not code. | [README](../../README.md#secure-your-own-mcp) · [guides/bring-your-own-mcp](../guides/bring-your-own-mcp.md) |
+| [`token-binding.mmd`](token-binding.mmd) | sequence | The optional DPoP legs (RFC 9449): caller proof in full mode, gateway proof to Verify in outbound/full mode, and what each check rejects. | [concepts/token-binding](../concepts/token-binding.md) |
 
 ## Rendering
 

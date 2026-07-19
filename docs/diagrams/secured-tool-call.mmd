@@ -1,5 +1,7 @@
 %% The six-step secured tool call, north-face /mcp or /tool.
 %% Ported (genericized to the records domain) from the reference deployment.
+%% The light-shaded block is optional DPoP (TOKEN_BINDING_MODE), see
+%% concepts/token-binding.md.
 sequenceDiagram
     autonumber
     participant C as MCP client / agent
@@ -11,12 +13,15 @@ sequenceDiagram
     participant A as Antenna (CAEP/SSF)
 
     C->>G: POST /tool {name, args} + user bearer
+    Note over C,G: full binding mode: the call also carries a caller-signed<br/>DPoP proof; the gateway rejects a bare bearer with 401
     G->>V: GET /oauth2/userinfo - introspect
     V-->>G: 200 active {sub, email}
     Note over G: kill-gate: isSessionKilled(sub)?
     Note over G: tier gate: gateTool(name)<br/>tier 4 / unknown -> 403 deny, no Verify call
-    G->>V: POST /oauth2/token - RFC 8693 exchange<br/>subject=user, actor=SPIFFE SVID,<br/>authorization_details (RFC 9396 RAR)
-    V-->>G: 200 OBO - scope-bound, RAR-attested
+    rect rgb(240, 249, 255)
+        G->>V: POST /oauth2/token - RFC 8693 exchange<br/>subject=user, actor=SPIFFE SVID,<br/>authorization_details (RFC 9396 RAR)<br/>outbound/full binding: + DPoP proof
+        V-->>G: 200 OBO - scope-bound, RAR-attested<br/>bound mode: cnf.jkt = gateway key
+    end
     G->>K: POST verify-rar/creds/... (OBO as X-Vault-Token)
     K-->>G: ephemeral Postgres cred + lease_id (5-min TTL)
     G->>N: MCP tools/call {name, args}<br/>Authorization: OBO · X-DB-Username/Password

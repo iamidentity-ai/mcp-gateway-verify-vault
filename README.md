@@ -93,7 +93,7 @@ flowchart LR
 ```
 
 Full walkthrough: **[docs/concepts/architecture.md](docs/concepts/architecture.md)**. The other
-four diagrams live in **[docs/diagrams/](docs/diagrams/index.md)**.
+five diagrams live in **[docs/diagrams/](docs/diagrams/index.md)**.
 
 ---
 
@@ -174,6 +174,11 @@ zero network.
 | 3 | **Exchange + RAR** | RFC 8693 exchange (subject = user, actor = gateway SPIFFE SVID) carrying RFC 9396 `authorization_details`. | `mfa_challenge` → step-up; else scoped OBO. |
 | 4 | **Vault mint** | OBO POSTed as `X-Vault-Token`; `verify-rar` matches the RAR and mints a ~5-min Postgres cred. | denied if the RAR does not match a role mapping. |
 | 5 | **Upstream + teardown** | Run the tool against the naive MCP with the OBO + ephemeral cred; **revoke the lease in a `finally`**; append the audit record. | lease never outlives its one call. |
+
+- **Optional DPoP token binding (RFC 9449).** One env var (`TOKEN_BINDING_MODE`) binds the OBOs
+  to the gateway's key, or goes further and requires caller-signed proofs on every request, so a
+  stolen token is useless without the key. Off by default; `none` mode is byte-identical to not
+  having the feature. See [docs/concepts/token-binding.md](docs/concepts/token-binding.md).
 
 Read the *why* behind each: **[architecture](docs/concepts/architecture.md)** ·
 **[token exchange & RAR](docs/concepts/token-exchange-and-rar.md)** ·
@@ -264,7 +269,8 @@ Full two-column threat model + the `env → vault` migration: **[docs/guides/sec
   [token exchange & RAR](docs/concepts/token-exchange-and-rar.md) ·
   [human-in-the-loop](docs/concepts/human-in-the-loop.md) ·
   [session kill](docs/concepts/session-kill.md) ·
-  [observability](docs/concepts/observability.md)
+  [observability](docs/concepts/observability.md) ·
+  [token binding](docs/concepts/token-binding.md)
 - **Guides (the *how*)** - [quickstart](docs/guides/quickstart.md) ·
   [wire-check (Phase 0, no-DB)](docs/guides/wire-check.md) ·
   [bring your own MCP](docs/guides/bring-your-own-mcp.md) ·
