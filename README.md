@@ -268,9 +268,9 @@ Full two-column threat model + the `env → vault` migration: **[docs/guides/sec
 - **Guides (the *how*)** - [quickstart](docs/guides/quickstart.md) ·
   [wire-check (Phase 0, no-DB)](docs/guides/wire-check.md) ·
   [bring your own MCP](docs/guides/bring-your-own-mcp.md) ·
-  [any agent](docs/guides/any-agent.md) · [add a tool](docs/guides/add-a-tool.md) ·
-  [step-up policies](docs/guides/step-up-policies.md) · [session kill](docs/guides/session-kill.md) ·
-  [secrets](docs/guides/secrets.md)
+  [any agent](docs/guides/any-agent.md) · [Claude tunnels](docs/guides/claude-tunnels.md) ·
+  [add a tool](docs/guides/add-a-tool.md) · [step-up policies](docs/guides/step-up-policies.md) ·
+  [session kill](docs/guides/session-kill.md) · [secrets](docs/guides/secrets.md)
 - **Reference** - [configuration (every env var)](docs/reference/configuration.md) ·
   [API + envelope contract](docs/reference/api.md) ·
   [Verify API entitlements](docs/reference/verify-api-entitlements.md) ·

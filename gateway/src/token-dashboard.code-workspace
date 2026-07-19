@@ -29,6 +29,9 @@
 		},
 		{
 			"path": "../.."
+		},
+		{
+			"path": "../../../iamidentity-blog/blog files/posts/drop-in-mcp-gateway"
 		}
 	],
 	"settings": {}
