@@ -210,10 +210,10 @@ async function preflightEntitlements(token: string): Promise<void> {
  *  token's `sub` against this claim by exact string equality (RFC 8693 §4.4);
  *  a `{"sub":[...]}` array never equals the actor's scalar `sub`, so Verify
  *  rejects the exchange with CSIAQ5201E ("actor or client is not authorized to
- *  act on behalf of the subject"). Confirmed against the production Concierge
- *  and IIA UI apps, which each carry a single-string `may_act.sub` — one app
- *  authorizes one agent; multi-hop A2A works by each downstream doing its own
- *  exchange, never by cramming several actors into one may_act. */
+ *  act on behalf of the subject"). Confirmed against production reference apps,
+ *  which each carry a single-string `may_act.sub`. One app authorizes one
+ *  agent; multi-hop A2A works by each downstream doing its own exchange, never
+ *  by cramming several actors into one may_act. */
 function mayActCelx(sub: string): string {
   return 'statements:\n- return: >-\n   {\n     "sub": "' + sub + '"\n   }';
 }
