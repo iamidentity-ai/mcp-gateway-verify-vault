@@ -65,7 +65,7 @@ Follow the order in the [rollout guide](../guides/dpop-rollout.md). The short ve
 1. Re-run `npm run bootstrap:verify` with `ENABLE_DPOP=true`. This writes the enforcement fields on the Token Exchange app. String values, on purpose: the admin API ignores booleans.
 2. Start the gateway with `TOKEN_BINDING_MODE=outbound`.
 3. Run `npm run smoke:dpop`. It checks that OBOs carry `cnf.jkt` and, just as important, that a proof-less token call is rejected with `CSIAQ5168E`. If the negative probe passes traffic, enforcement is off no matter what the config claims.
-4. For `full` mode, run the two tenant probes in the rollout guide first, then bootstrap with `ENABLE_DPOP_UI=true` and point a DPoP-capable client at the gateway.
+4. For `full` mode, run the tenant probes in the rollout guide first, then bootstrap with `ENABLE_DPOP_UI=true` and point a DPoP-capable client at the gateway.
 
 ## Verify-side reference
 

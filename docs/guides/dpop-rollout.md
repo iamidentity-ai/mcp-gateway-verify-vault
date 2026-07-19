@@ -24,7 +24,7 @@ Callers are unaffected. Stop here if that is all you want; it already means a st
 
 ## Stage 2: probe your tenant before full mode
 
-Full mode needs user tokens to carry `cnf.jkt`, which means DPoP-binding the UI login app. Two behaviors vary by tenant configuration. Check both BEFORE flipping anything, with a throwaway DPoP-bound user token (sign in through a DPoP-capable client such as gateway-agent-demo with `TOKEN_BINDING_MODE=dpop`).
+Full mode needs user tokens to carry `cnf.jkt`, which means DPoP-binding the UI login app. Three behaviors vary by tenant configuration. Check all three BEFORE flipping anything, with a throwaway DPoP-bound user token (sign in through a DPoP-capable client such as gateway-agent-demo with `TOKEN_BINDING_MODE=dpop`).
 
 **Probe A: does userinfo still accept the bound token as a plain bearer?**
 
