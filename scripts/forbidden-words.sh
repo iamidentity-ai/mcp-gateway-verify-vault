@@ -12,13 +12,23 @@ cd "$(dirname "$0")/.."
 # NOTE: the maintainer contact rgraham@us.ibm.com is an intentional, allowed
 # email — do NOT add `rgraham` here. `github.ibm.com` (the internal mirror host)
 # stays blocked so a mirror URL can never leak into a committed file.
-PATTERN='insurance|banking|healthcare|concierge|copilot|watson|big blue|iia\b|demos\.verify\.ibm\.com|securemytechnology|ec2-user|44\.20[01]\.|34\.194\.|spire-server-demo|agenticai|Charlie|github\.ibm\.com'
+PATTERN='insurance|banking|healthcare|concierge|copilot|watson|big blue|iia\b|demos\.verify\.ibm\.com|securemytechnology|ec2-user|44\.20[01]\.|34\.194\.|spire-server-demo|agenticai|Charlie|github\.ibm\.com|myco-consulting|tryverify|vectoria'
 
 MATCHES=$(grep -rniE "$PATTERN" \
   --include='*.ts' --include='*.js' --include='*.json' --include='*.md' \
   --include='*.sql' --include='*.sh' --include='*.yml' --include='*.yaml' \
   --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git \
   . 2>/dev/null | grep -v 'scripts/forbidden-words.sh' || true)
+
+# Person names must never appear. CASE-SENSITIVE on purpose: the jose npm
+# package (the crypto library, always lowercase) is a legitimate dependency
+# and must not trip this. Only the maintainer name Robert Graham is allowed.
+NAME_MATCHES=$(grep -rnE '\bJose\b' \
+  --include='*.ts' --include='*.js' --include='*.json' --include='*.md' \
+  --include='*.sql' --include='*.sh' --include='*.yml' --include='*.yaml' \
+  --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git \
+  . 2>/dev/null | grep -v 'scripts/forbidden-words.sh' || true)
+MATCHES="${MATCHES}${NAME_MATCHES:+$'\n'}${NAME_MATCHES}"
 
 if [[ -n "$MATCHES" ]]; then
   echo "FORBIDDEN WORDS FOUND — internal names must not appear in this repo:"
