@@ -87,6 +87,16 @@ describe('verifyDpopProof', () => {
     const p2 = await buildDpopProof({ key, htm: 'POST', htu: URL_, ath: accessTokenHash(boundToOther) });
     expect(await verifyDpopProof({ proof: p2, method: 'POST', url: URL_, accessToken: boundToOther })).toEqual({ ok: false, error: 'cnf_jkt_mismatch' });
   });
+
+  it('returns malformed_target_url and never throws when the target url is invalid', async () => {
+    const { token, proof } = await boundSetup();
+    await expect(
+      verifyDpopProof({ proof, method: 'POST', url: 'not-a-url', accessToken: token }),
+    ).resolves.toEqual({ ok: false, error: 'malformed_target_url' });
+    await expect(
+      verifyDpopProof({ proof, method: 'POST', url: '', accessToken: token }),
+    ).resolves.toEqual({ ok: false, error: 'malformed_target_url' });
+  });
 });
 
 describe('helpers', () => {

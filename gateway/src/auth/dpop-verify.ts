@@ -100,9 +100,17 @@ export async function verifyDpopProof(
     return { ok: false, error: 'invalid_proof_signature' };
   }
 
-  // 3. Method + URL binding (htu excludes query and fragment on both sides)
+  // 3. Method + URL binding (htu excludes query and fragment on both sides).
+  // normalizeHtu does new URL(...), which throws on a malformed target url; the
+  // validator must never throw, so a bad url returns the union, not an exception.
   if (payload['htm'] !== args.method) return { ok: false, error: 'htm_mismatch' };
-  if (payload['htu'] !== normalizeHtu(args.url)) return { ok: false, error: 'htu_mismatch' };
+  let expectedHtu: string;
+  try {
+    expectedHtu = normalizeHtu(args.url);
+  } catch {
+    return { ok: false, error: 'malformed_target_url' };
+  }
+  if (payload['htu'] !== expectedHtu) return { ok: false, error: 'htu_mismatch' };
 
   // 4. Freshness (jwtVerify covers exp/nbf; iat is checked here)
   const iat = payload['iat'];
