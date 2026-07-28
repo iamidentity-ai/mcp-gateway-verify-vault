@@ -84,9 +84,24 @@ string so consumers see the record, not `{ content: [{ text }] }`.
 ### Error
 
 ```jsonc
-// HTTP 401 (inactive_session / session_killed / forbidden) or 500 (everything else)
+// HTTP 401 (inactive_session / session_killed / forbidden),
+// 403 (access_denied), or 500 (everything else)
 { "ok": false, "error": "inactive_session" }
 ```
+
+A Token-Exchange-level `access_denied` (Verify itself rejected the exchange —
+a real policy hard-cap deny, CSIAQ0278E, or a fresh-tenant entitlement gap,
+CSIAQ0279E) gets the `denied` shape too, so a caller doesn't need to know
+which layer produced the deny to handle it the same way:
+
+```jsonc
+// HTTP 403
+{ "ok": false, "denied": true, "error": "access_denied" }
+```
+
+Note this is `denied: true` proving "Verify said no" — not proof the policy
+itself is correctly configured. A fresh, incorrectly-entitled tenant and a
+deliberate hard-cap policy both produce this exact response.
 
 ### Status-code mapping (`statusCodeFor`)
 
@@ -98,6 +113,7 @@ string so consumers see the record, not `{ content: [{ text }] }`.
 | `session_killed_suspicious` | 401 | `{ ok: false, killed: true, reason: "suspicious" }` |
 | `error: inactive_session` / `session_killed` | 401 | `{ ok: false, error }` |
 | `error: forbidden` | 403 | `{ ok: false, error: "forbidden" }` |
+| `error: access_denied` | 403 | `{ ok: false, denied: true, error: "access_denied" }` |
 | `error: <other>` | 500 | `{ ok: false, error }` |
 
 ---

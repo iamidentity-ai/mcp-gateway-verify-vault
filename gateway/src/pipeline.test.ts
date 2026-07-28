@@ -548,18 +548,64 @@ describe('runPipeline', () => {
     expectOrder(calls, ['gateTool', 'exchangeToken', 'triggerOAuthMfaPush', 'putPending']);
   });
 
-  it('exchangeToken error -> {status:"error"}, no mint/upstream', async () => {
+  it('exchangeToken error -> {status:"error"}, no mint/upstream, audited as "exchange_error"', async () => {
+    // list_records is NOT a discovery tool (see the DB-backed tests below) —
+    // it takes the normal single-exchange, suppressAudit:false path, unlike
+    // get_record which would route through the gateway-derived step-up
+    // probe first.
     const { deps } = makeRunDeps({
       exchangeToken: async () => ({ status: 'error' as const, error: 'invalid_scope' }),
     });
 
     const result = await runPipeline(
-      { userToken: 'user-token', toolName: 'get_record', args: {} },
+      { userToken: 'user-token', toolName: 'list_records', args: {} },
       deps as any,
     );
 
     expect(result).toEqual({ status: 'error', error: 'invalid_scope' });
     expect(deps.mintCred).not.toHaveBeenCalled();
+    // AUDIT PARITY: a Token-Exchange-level failure is audited exactly like
+    // the tier-4 local-gate 'denied' path is — no more silent gap between
+    // the two deny mechanisms.
+    expect(deps.appendAudit).toHaveBeenCalledTimes(1);
+    expect((deps.appendAudit as any).mock.calls[0][0]).toMatchObject({ decision: 'exchange_error' });
+  });
+
+  it('exchangeToken access_denied (real Verify policy deny — CSIAQ0278E/CSIAQ0279E) -> {status:"error", error:"access_denied"}, audited as "exchange_denied", no mint/upstream', async () => {
+    const { deps } = makeRunDeps({
+      exchangeToken: async () => ({ status: 'error' as const, error: 'access_denied', errorDescription: 'CSIAQ0278E' }),
+    });
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'list_records', args: {} },
+      deps as any,
+    );
+
+    expect(result).toEqual({ status: 'error', error: 'access_denied' });
+    expect(deps.mintCred).not.toHaveBeenCalled();
+    expect(deps.callUpstreamTool).not.toHaveBeenCalled();
+    expect(deps.appendAudit).toHaveBeenCalledTimes(1);
+    expect((deps.appendAudit as any).mock.calls[0][0]).toMatchObject({ decision: 'exchange_denied' });
+  });
+
+  it('exchangeToken access_denied on the gateway-derived DISCOVERY PROBE (get_record) does NOT double-audit — probe failures stay suppressAudit:true and bubble the error straight up', async () => {
+    const { deps, calls } = makeRunDeps({
+      exchangeToken: async () => ({ status: 'error' as const, error: 'access_denied' }),
+    });
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } },
+      deps as any,
+    );
+
+    expect(result).toEqual({ status: 'error', error: 'access_denied' });
+    // Only ONE exchange attempt (the probe) — it failed, so the "actual"
+    // elevated/standard call after it never runs.
+    expect(calls.filter((c) => c === 'exchangeToken').length).toBe(1);
+    // The probe path passes suppressAudit:true — this must still hold for an
+    // error result, not just the 'ok' path, or a failed discovery probe would
+    // leave a spurious audit row for a call the caller never actually made.
+    expect(deps.appendAudit).not.toHaveBeenCalled();
   });
 
   // ── UPSTREAM_DB_BACKED: the DEFAULT is DB-backed (security-safe) ───────────

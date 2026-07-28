@@ -94,9 +94,11 @@ async function requireDpopBound(req: Request, res: Response, bearer: string): Pr
 
 /**
  * Map a PipelineResult to an HTTP response. Shared by both /mcp and /tool
- * so the two transports never drift on status-code semantics.
+ * so the two transports never drift on status-code semantics. Exported
+ * (like pipelineResultToEnvelope below) purely so this mapping is
+ * unit-testable without booting a real HTTP round-trip — see index.test.ts.
  */
-function statusCodeFor(result: PipelineResult): number {
+export function statusCodeFor(result: PipelineResult): number {
   switch (result.status) {
     case 'ok':
       return 200;
@@ -107,7 +109,17 @@ function statusCodeFor(result: PipelineResult): number {
     case 'session_killed_suspicious':
       return 401;
     case 'error':
-      if (result.error === 'forbidden') return 403;
+      // 'access_denied' is Verify's own Token Exchange rejecting the
+      // request — a real policy hard-cap deny (CSIAQ0278E) OR a fresh-tenant
+      // entitlement gap (CSIAQ0279E). Both come back as this exact error
+      // string from auth/token-exchange.ts, so `denied: true` here proves
+      // "Verify said no", not "the policy is correctly configured" — a
+      // caller diagnosing a surprise deny still has to check which one.
+      // No collision with any other TokenExchangeResult error string:
+      // invalid_client/CSIAQ0155E is handled by the stale-secret retry
+      // before this ever returns; invalid_scope/invalid_grant surface as
+      // their own literal strings, distinct from 'access_denied'.
+      if (result.error === 'forbidden' || result.error === 'access_denied') return 403;
       return result.error === 'inactive_session' || result.error === 'session_killed' ? 401 : 500;
   }
 }
@@ -189,7 +201,16 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
     case 'session_killed_suspicious':
       return { ok: false, killed: true, reason: 'suspicious' };
     case 'error':
-      return { ok: false, error: result.error };
+      // Mirrors the 403 in statusCodeFor: a Verify Token-Exchange
+      // access_denied is a real deny, not a generic failure — give it the
+      // same envelope shape ('denied: true') a caller already checks for
+      // on the tier-4 local-gate 'denied' status, so both deny paths look
+      // identical to a client. `error` stays present too (unlike the
+      // tier-4 case, which has no error string) so a consumer that logs
+      // the raw code for correlation still gets it.
+      return result.error === 'access_denied'
+        ? { ok: false, denied: true, error: result.error }
+        : { ok: false, error: result.error };
   }
 }
 

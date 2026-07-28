@@ -29,7 +29,9 @@ import { readFileSync } from 'node:fs';
 
 process.env['PORT'] = process.env['PORT'] ?? '39714';
 
-const { resolveTestVerdictOverride, pipelineResultToEnvelope, mcpToolNames } = await import('./index.js');
+const { resolveTestVerdictOverride, pipelineResultToEnvelope, statusCodeFor, mcpToolNames } = await import(
+  './index.js'
+);
 
 describe('mcpToolNames — /mcp surface stays in sync with config/tools.json', () => {
   it('registers exactly the configured tools (no drift between the two transports)', () => {
@@ -113,5 +115,38 @@ describe('pipelineResultToEnvelope', () => {
   it('error — maps error, ok:false, no fabricated message field (PipelineResult error variant carries no message)', () => {
     const envelope = pipelineResultToEnvelope({ status: 'error', error: 'inactive_session' });
     expect(envelope).toEqual({ ok: false, error: 'inactive_session' });
+  });
+
+  it('error: forbidden — stays the plain error shape (no denied:true) — only access_denied gets that treatment', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'error', error: 'forbidden' });
+    expect(envelope).toEqual({ ok: false, error: 'forbidden' });
+  });
+
+  it('error: access_denied — a real Verify Token-Exchange deny (CSIAQ0278E hard-cap or CSIAQ0279E entitlement gap) gets the SAME denied:true shape as a tier-4 local "denied" result', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'error', error: 'access_denied' });
+    expect(envelope).toEqual({ ok: false, denied: true, error: 'access_denied' });
+  });
+});
+
+describe('statusCodeFor', () => {
+  it.each([
+    ['ok', { status: 'ok', data: {} }, 200],
+    ['pending', { status: 'pending', txId: 'tx-1' }, 202],
+    ['denied (tier-4 local gate)', { status: 'denied', reason: 'policy_deny' }, 403],
+    ['session_killed_suspicious', { status: 'session_killed_suspicious' }, 401],
+    ['error: inactive_session', { status: 'error', error: 'inactive_session' }, 401],
+    ['error: session_killed', { status: 'error', error: 'session_killed' }, 401],
+    ['error: forbidden', { status: 'error', error: 'forbidden' }, 403],
+    // NEW: a Verify Token-Exchange access_denied (real policy deny) now maps
+    // to 403 like the tier-4 'denied' status, not the generic 500 every
+    // other exchange error still gets below.
+    ['error: access_denied', { status: 'error', error: 'access_denied' }, 403],
+    // Unchanged — any OTHER exchange-error string (bad scope, stale
+    // config, a network blip surfaced as token_exchange_failed, ...) still
+    // falls through to 500. access_denied must not have widened this.
+    ['error: invalid_scope (unrelated exchange error)', { status: 'error', error: 'invalid_scope' }, 500],
+    ['error: token_exchange_failed', { status: 'error', error: 'token_exchange_failed' }, 500],
+  ] as const)('%s -> %d', (_label, result, expected) => {
+    expect(statusCodeFor(result as Parameters<typeof statusCodeFor>[0])).toBe(expected);
   });
 });

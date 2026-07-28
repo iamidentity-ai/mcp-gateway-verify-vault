@@ -422,6 +422,27 @@ async function runExchangeAndCall(
   }
 
   if (exchangeResult.status === 'error') {
+    // AUDIT PARITY with the tier-4 local deny above: that gate always
+    // audits before returning 'denied'; this Token-Exchange-level failure
+    // — most importantly a real Verify policy deny (access_denied,
+    // CSIAQ0278E hard-cap or CSIAQ0279E entitlement gap) — previously
+    // returned with NO audit row at all, so a caller reconstructing "who
+    // got denied what" from the audit chain alone would silently miss
+    // every deny that made it past the tier gate and got rejected by
+    // Verify itself. suppressAudit still governs this (matches the 'ok'
+    // path below): the gateway-derived step-up discovery probe audits its
+    // own outcome one level up in runPipeline, so a probe-only failure here
+    // must not double-audit.
+    if (!suppressAudit) {
+      d.appendAudit({
+        ts: d.now(),
+        userId: verifyUserId,
+        tool: ctx.toolName,
+        tier: gate.tier,
+        authorizationDetails,
+        decision: exchangeResult.error === 'access_denied' ? 'exchange_denied' : 'exchange_error',
+      });
+    }
     return { result: { status: 'error', error: exchangeResult.error }, authorizationDetails };
   }
 
