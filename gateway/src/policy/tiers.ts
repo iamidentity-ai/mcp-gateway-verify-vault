@@ -27,10 +27,27 @@ import { rarConfig } from '../rar/rar-config.js';
 
 export type Tier = 1 | 2 | 3 | 4;
 
+/** Primitive types buildToolSpecs (index.ts) knows how to turn into a real
+ *  zod field for a config-driven /mcp tool's inputSchema. */
+export type ToolArgType = 'string' | 'number' | 'boolean';
+
 export interface ToolPolicy {
   tier: Tier;
   rarAction: string;
   scope: string;
+  /**
+   * Optional per-field argument schema (field name -> primitive type),
+   * matching the upstream MCP tool's real parameters — e.g.
+   * `{"table":"string","note":"string"}` for a two-field write. When
+   * present, index.ts's buildToolSpecs uses it to advertise a REAL
+   * `tools/list` inputSchema for this tool instead of the generic
+   * `z.record` passthrough (which advertises an empty `properties: {}` —
+   * a real MCP client sees no arguments and calls with `{}`). Optional
+   * because the gateway doesn't always know an upstream's exact argument
+   * names; when absent, the passthrough fallback still forwards whatever
+   * arguments a caller sends, just without an advertised schema.
+   */
+  args?: Record<string, ToolArgType>;
 }
 
 export interface GateResult {
@@ -44,7 +61,14 @@ export interface GateResult {
 
 const configDir = process.env['GATEWAY_CONFIG_DIR'];
 const toolsPath = configDir ? join(configDir, 'tools.json') : new URL('../../config/tools.json', import.meta.url);
-const tools = JSON.parse(readFileSync(toolsPath, 'utf-8')) as Record<string, ToolPolicy>;
+/**
+ * Exported (not just module-private) so index.ts's /mcp tool surface can be
+ * built from the SAME parsed map the tier gate itself uses, instead of
+ * re-reading tools.json a second time under a second GATEWAY_CONFIG_DIR
+ * resolution — one parse, one source of truth, no way for the two
+ * transports to see a different tool list for the same process.
+ */
+export const tools = JSON.parse(readFileSync(toolsPath, 'utf-8')) as Record<string, ToolPolicy>;
 
 /**
  * Cross-validate config/tools.json against config/rar.json. Every tool's
@@ -78,8 +102,32 @@ export function assertToolActionsValid(
   }
 }
 
-// Fail fast at startup on any tools.json ↔ rar.json mismatch.
+const VALID_ARG_TYPES: ToolArgType[] = ['string', 'number', 'boolean'];
+
+/**
+ * Validate every tool's optional `args` map has recognized primitive types
+ * — a typo (e.g. "sting") would otherwise silently fall through
+ * buildToolSpecs' type lookup to a default rather than failing loudly.
+ * Pure + exported for the same fail-fast-at-startup reason as
+ * assertToolActionsValid above.
+ */
+export function assertToolArgsValid(toolPolicies: Record<string, ToolPolicy>): void {
+  for (const [name, policy] of Object.entries(toolPolicies)) {
+    if (!policy.args) continue;
+    for (const [field, type] of Object.entries(policy.args)) {
+      if (!VALID_ARG_TYPES.includes(type)) {
+        throw new Error(
+          `config/tools.json: tool "${name}" arg "${field}" has unrecognized type "${type}" (want one of ${VALID_ARG_TYPES.join(', ')})`,
+        );
+      }
+    }
+  }
+}
+
+// Fail fast at startup on any tools.json ↔ rar.json mismatch, or an
+// unrecognized args field type.
 assertToolActionsValid(tools, rarConfig.actions);
+assertToolArgsValid(tools);
 
 /**
  * Gate a tool call by its tier-4 policy alone (no RAR/Verify call here).

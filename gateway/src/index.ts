@@ -45,6 +45,7 @@ import { isSessionKilled } from './ssf/killed-sessions.js';
 import { getAuditForUser } from './audit/chain.js';
 import { resolveBindingMode } from './auth/binding-mode.js';
 import { verifyDpopProof } from './auth/dpop-verify.js';
+import { tools as configuredToolPolicies, type ToolArgType, type ToolPolicy } from './policy/tiers.js';
 
 const PORT = Number(process.env['PORT'] ?? 3014);
 /** Service name — used in log prefixes and as the MCP server identity.
@@ -361,7 +362,7 @@ app.get('/me/session-status', async (req: Request, res: Response) => {
 //
 // The tool surface (names + titles + descriptions + zod inputSchemas) is built
 // ONCE at module load — `MCP_TOOL_SPECS` — so the per-request buildMcpServer
-// does not reconstruct 7 zod schemas on every /mcp call.
+// does not reconstruct the zod schemas on every /mcp call.
 //
 // The McpServer itself is STILL created per request (not a shared global). This
 // is deliberate: `server.connect(transport)` binds the server's Protocol to a
@@ -373,10 +374,15 @@ app.get('/me/session-status', async (req: Request, res: Response) => {
 // the database or the upstream MCP directly.
 interface McpToolSpec {
   name: string;
-  config: { title: string; description: string; inputSchema: z.ZodRawShape };
+  config: { title: string; description: string; inputSchema: z.ZodRawShape | z.ZodTypeAny };
 }
 
-const MCP_TOOL_SPECS: McpToolSpec[] = [
+/**
+ * Hand-authored specs for the shipped reference tools (config/tools.json's
+ * record_read/record_write vocabulary) — these get real per-field schemas
+ * because this repo owns their argument shape.
+ */
+const KNOWN_TOOL_SPECS: McpToolSpec[] = [
   {
     name: 'get_record',
     config: {
@@ -436,19 +442,141 @@ const MCP_TOOL_SPECS: McpToolSpec[] = [
   },
 ];
 
+/**
+ * Every OTHER MCP tool call parks on a push and RETURNS the pending envelope
+ * (`{ ok:false, pending:true, txId, pushInfo }`, unwrapped from the MCP
+ * CallToolResult text block) instead of blocking the call — the `/mcp`
+ * transport never polls Verify inline (see completeHitlForBearer's doc
+ * comment for why). This tool is how an MCP client resumes that parked call
+ * once the human has approved: it takes the txId and itself blocks until
+ * pollOAuthMfaStatus reaches a terminal state, exactly like the REST
+ * `/hitl/complete` route.
+ */
+const COMPLETE_HITL_TOOL_NAME = 'complete_hitl';
+const COMPLETE_HITL_SPEC: McpToolSpec = {
+  name: COMPLETE_HITL_TOOL_NAME,
+  config: {
+    title: 'Complete a pending human-in-the-loop approval',
+    description:
+      'Resumes a tool call that came back with pending:true and a txId (the human needs to approve a push/OTP on their phone first). Call this with that txId once the human says they approved it. This call blocks until Verify\'s verification transaction reaches a terminal state (approved/denied/timeout) and then returns the SAME { ok, data, _diagnostic } envelope the original call would have returned had it not needed a step-up.',
+    inputSchema: { txId: z.string() },
+  },
+};
+
+/** Maps policy/tiers.ts's ToolArgType strings to the real zod primitive —
+ *  see buildToolSpecs' doc comment for why a REAL field-by-field schema
+ *  (not a `z.record` catch-all) matters for a config-driven tool. */
+const ZOD_ARG_TYPE: Record<ToolArgType, () => z.ZodTypeAny> = {
+  string: () => z.string(),
+  number: () => z.number(),
+  boolean: () => z.boolean(),
+};
+
+/** Turn a ToolPolicy's optional `args` map into a real ZodRawShape (e.g.
+ *  `{table: z.string(), note: z.string()}`) so the tool's advertised
+ *  `tools/list` inputSchema has real named properties, not an empty
+ *  object — and so tools/call actually validates them field-by-field. */
+function shapeFromArgs(args: Record<string, ToolArgType>): z.ZodRawShape {
+  const shape: z.ZodRawShape = {};
+  for (const [field, type] of Object.entries(args)) {
+    shape[field] = ZOD_ARG_TYPE[type]();
+  }
+  return shape;
+}
+
+/**
+ * Build the /mcp tool surface from the SAME tools.json (tool name -> tier/
+ * rarAction/scope/args) that gates the REST /tool transport
+ * (policy/tiers.ts), instead of a fixed list that only ever matched the
+ * shipped reference config/tools.json. Before this, a deployment pointed
+ * at a different GATEWAY_CONFIG_DIR (a different upstream's tool names)
+ * had a REST transport that worked and an MCP transport that silently
+ * exposed the WRONG tools — /mcp advertised get_record/list_records/etc.
+ * regardless of what tools.json actually configured. Found wiring the
+ * OpenShell ARS demo's Claude Code sandbox onto this gateway over real
+ * MCP: its jira_get_ticket/gitlab_get_file/databricks_write/
+ * databricks_query tools were entirely invisible to `tools/list`.
+ *
+ * A configured name with a hand-authored spec in KNOWN_TOOL_SPECS (the
+ * shipped record_read/record_write reference tools) gets that spec, with
+ * its real per-field schema. Every other configured name gets its schema
+ * from tools.json's optional `args` map (shapeFromArgs) when the config
+ * author supplied one — a REAL per-field ZodRawShape, so `tools/list`
+ * advertises real named properties and `tools/call` validates them, not
+ * an empty `properties: {}` a real MCP client would call with `{}`
+ * against (found live: the FIRST version of this fix used a bare
+ * `z.record(...)` fallback for every config-driven tool, which the SDK's
+ * schema normalizer can't turn into a non-empty JSON Schema — see
+ * zod-compat.js's normalizeObjectSchema, which only recognizes an
+ * object/record WITH a shape, not a bare record type). When `args` is
+ * absent (an operator's tools.json genuinely doesn't know the upstream's
+ * field names), the same `z.record` catch-all from before is still the
+ * fallback — permissive on purpose, not a regression, just no longer the
+ * ONLY option.
+ *
+ * `complete_hitl` is always appended UNLESS a configured tool already
+ * uses that name — guarding against `server.registerTool` throwing on a
+ * duplicate registration (every /mcp request would then fail) if some
+ * future tools.json ever defines a tool literally called `complete_hitl`.
+ */
+// `policies` is parameterized (defaulting to the real module-level
+// tools.json map) purely so index.test.ts can exercise the complete_hitl
+// dedupe branch and the args-vs-passthrough schema choice directly, without
+// needing a second process with a different GATEWAY_CONFIG_DIR.
+export function buildToolSpecs(policies: Record<string, ToolPolicy> = configuredToolPolicies): McpToolSpec[] {
+  const known = new Map(KNOWN_TOOL_SPECS.map((s) => [s.name, s]));
+  const configured = Object.entries(policies).map(
+    ([name, policy]) =>
+      known.get(name) ?? {
+        name,
+        config: {
+          title: name,
+          description: policy.args
+            ? `Configured tool (tier ${policy.tier}, RAR action "${policy.rarAction}"). Arguments are forwarded verbatim to this deployment's upstream MCP tool of the same name.`
+            : `Configured tool (tier ${policy.tier}, RAR action "${policy.rarAction}"). Generic passthrough — arguments are forwarded verbatim to this deployment's upstream MCP tool of the same name; the gateway has no per-field schema for it (tools.json defines no "args" for it), only its tier/RAR policy.`,
+          inputSchema: policy.args ? shapeFromArgs(policy.args) : z.record(z.string(), z.unknown()),
+        },
+      },
+  );
+  return configured.some((s) => s.name === COMPLETE_HITL_TOOL_NAME) ? configured : [...configured, COMPLETE_HITL_SPEC];
+}
+
+const MCP_TOOL_SPECS: McpToolSpec[] = buildToolSpecs();
+
 /** Test/introspection helper: the /mcp tool names, in registration order. */
 export const mcpToolNames = (): string[] => MCP_TOOL_SPECS.map((s) => s.name);
+
+/**
+ * Shared by the `complete_hitl` MCP tool. Mirrors POST /hitl/complete
+ * (identity-bound: the caller's OWN bearer is introspected and its
+ * verifyUserId must match the pending transaction's owner, or
+ * completePending 403s before touching pollOAuthMfaStatus / the deny
+ * counter / session-kill — see that route's doc comment for the full
+ * rationale). Deliberately does NOT support the GATEWAY_ALLOW_TEST_VERDICT
+ * escape hatch the REST route has for integration tests — an MCP client
+ * always drives the real poll against Verify.
+ */
+async function completeHitlForBearer(txId: string, bearer: string): Promise<PipelineResult> {
+  const introspection = await introspectUser(bearer);
+  const callerVerifyUserId = introspection.active ? introspection.verifyUserId : undefined;
+  return completePending(txId, callerVerifyUserId);
+}
 
 function buildMcpServer(bearer: string): McpServer {
   const server = new McpServer({ name: SERVICE, version: '0.1.0' });
 
   const call = async (name: string, args: Record<string, unknown>) => {
-    const result = await dispatchTool(name, args, bearer);
+    const result =
+      name === COMPLETE_HITL_TOOL_NAME
+        ? await completeHitlForBearer(args['txId'] as string, bearer)
+        : await dispatchTool(name, args, bearer);
     return { content: [{ type: 'text' as const, text: JSON.stringify(pipelineResultToEnvelope(result)) }] };
   };
 
   for (const spec of MCP_TOOL_SPECS) {
-    server.registerTool(spec.name, spec.config, async (args) => call(spec.name, args as Record<string, unknown>));
+    server.registerTool(spec.name, spec.config, async (args: Record<string, unknown>) =>
+      call(spec.name, args as Record<string, unknown>),
+    );
   }
 
   return server;
