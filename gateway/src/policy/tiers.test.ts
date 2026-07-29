@@ -8,7 +8,7 @@
  *   - unknown tools are denied with reason unknown_tool
  */
 import { describe, it, expect } from 'vitest';
-import { gateTool, assertToolActionsValid } from './tiers.js';
+import { gateTool, assertToolActionsValid, assertToolArgsValid } from './tiers.js';
 
 describe('gateTool', () => {
   it('gates tier 4 delete_record as denied', () => {
@@ -88,5 +88,43 @@ describe('assertToolActionsValid', () => {
         rarActions,
       ),
     ).not.toThrow();
+  });
+});
+
+// ── assertToolArgsValid — a config-driven /mcp tool's optional per-field
+// schema (index.ts's buildToolSpecs reads this to advertise real tools/list
+// properties instead of an empty-object passthrough) ───────────────────────
+describe('assertToolArgsValid', () => {
+  it('passes a tool with no args at all (the passthrough case)', () => {
+    expect(() =>
+      assertToolArgsValid({ get_record: { tier: 1, rarAction: 'record_read', scope: 'records:read' } }),
+    ).not.toThrow();
+  });
+
+  it('passes a tool with a valid multi-field args map', () => {
+    expect(() =>
+      assertToolArgsValid({
+        databricks_write: {
+          tier: 3,
+          rarAction: 'databricks_write',
+          scope: 'databricks:write',
+          args: { table: 'string', note: 'string' },
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it('THROWS on an unrecognized arg type (the typo trap)', () => {
+    expect(() =>
+      assertToolArgsValid({
+        databricks_write: {
+          tier: 3,
+          rarAction: 'databricks_write',
+          scope: 'databricks:write',
+          // @ts-expect-error deliberately invalid for the test
+          args: { table: 'sting' },
+        },
+      }),
+    ).toThrow(/databricks_write.*table.*unrecognized type "sting"/);
   });
 });

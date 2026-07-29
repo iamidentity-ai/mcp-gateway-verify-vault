@@ -25,20 +25,66 @@
  * fix and the leg-2 retry.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 
 process.env['PORT'] = process.env['PORT'] ?? '39714';
 
-const { resolveTestVerdictOverride, pipelineResultToEnvelope, statusCodeFor, mcpToolNames } = await import(
-  './index.js'
-);
+const { resolveTestVerdictOverride, pipelineResultToEnvelope, statusCodeFor, mcpToolNames, buildToolSpecs } =
+  await import('./index.js');
+// Import the SAME config/tools.json (or GATEWAY_CONFIG_DIR override) the
+// production /mcp surface is now built from (see index.ts's buildToolSpecs),
+// instead of a hardcoded path to the shipped default — this repo's own
+// local .env can point GATEWAY_CONFIG_DIR at a different upstream's config
+// (e.g. examples/upstreams/github) for local dev, and mcpToolNames() must
+// track THAT, not the shipped reference tools.json, once GATEWAY_CONFIG_DIR
+// is honored.
+const { tools: configuredTools } = await import('./policy/tiers.js');
 
-describe('mcpToolNames — /mcp surface stays in sync with config/tools.json', () => {
-  it('registers exactly the configured tools (no drift between the two transports)', () => {
-    const tools = JSON.parse(
-      readFileSync(new URL('../config/tools.json', import.meta.url), 'utf-8'),
-    ) as Record<string, unknown>;
-    expect(mcpToolNames().slice().sort()).toEqual(Object.keys(tools).sort());
+describe('mcpToolNames — /mcp surface stays in sync with tools.json (or GATEWAY_CONFIG_DIR)', () => {
+  it('registers exactly the configured tools, plus the always-on complete_hitl tool (no drift between the two transports)', () => {
+    expect(mcpToolNames().slice().sort()).toEqual([...Object.keys(configuredTools), 'complete_hitl'].sort());
+  });
+});
+
+describe('buildToolSpecs — per-tool schema choice + complete_hitl dedupe', () => {
+  it('gives a config-driven tool with an "args" map a REAL per-field inputSchema, not an empty passthrough', () => {
+    const specs = buildToolSpecs({
+      databricks_write: {
+        tier: 3,
+        rarAction: 'databricks_write',
+        scope: 'databricks:write',
+        args: { table: 'string', note: 'string' },
+      },
+    });
+    const spec = specs.find((s) => s.name === 'databricks_write')!;
+    // A raw shape is a plain object of zod types (table/note keys present),
+    // NOT a single ZodType instance (which is what the old z.record(...)
+    // catch-all was, and what the SDK can't turn into non-empty JSON Schema
+    // for tools/list — see buildToolSpecs' own doc comment in index.ts).
+    expect(Object.keys(spec.config.inputSchema as object).sort()).toEqual(['note', 'table']);
+  });
+
+  it('falls back to the z.record passthrough for a tool with no "args" map', () => {
+    const specs = buildToolSpecs({
+      mystery_tool: { tier: 1, rarAction: 'record_read', scope: 'records:read' },
+    });
+    const spec = specs.find((s) => s.name === 'mystery_tool')!;
+    // A bare ZodType (the record) has a `_def`/parse method, unlike a raw
+    // shape's plain field-map object.
+    expect(typeof (spec.config.inputSchema as { parse?: unknown }).parse).toBe('function');
+  });
+
+  it('does NOT double-register complete_hitl when a tools.json defines a tool literally named that', () => {
+    const specs = buildToolSpecs({
+      complete_hitl: { tier: 1, rarAction: 'record_read', scope: 'records:read' },
+    });
+    expect(specs.filter((s) => s.name === 'complete_hitl')).toHaveLength(1);
+  });
+
+  it('appends complete_hitl exactly once for a normal config with no name collision', () => {
+    const specs = buildToolSpecs({
+      get_record: { tier: 1, rarAction: 'record_read', scope: 'records:read' },
+    });
+    expect(specs.filter((s) => s.name === 'complete_hitl')).toHaveLength(1);
   });
 });
 
