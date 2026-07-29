@@ -76,12 +76,15 @@ someone asks "prove the agent only did what it was allowed to do."
 Two honest caveats, both by design for a single-instance deploy:
 
 - The audit chain is an in-memory **ring buffer** (bounded, oldest-evicted, non-persistent), like
-  the deny counter and kill-gate. For production retention, tee it to durable storage; horizontal
-  scaling needs shared state or sticky routing.
-- The `_diagnostic` payload **carries the full OBO** in the response. That is a deliberate
-  observability choice for a demo/reference build - it lets a UI *show* the token. Before any
-  external trust boundary, decide whether to redact it: a raw OBO in a response body is a bearer
-  token. The envelope makes the security visible; make sure you are the only one watching.
+  the deny counter, kill-gate, and DPoP replay cache. All of it is per-process, so this build is
+  **single-instance by default**: behind two or more replicas the 3-deny kill never trips, the
+  kill-gate and replay cache are per-instance, and `/me/audit` shows only local records. Sticky
+  routing does not fix these. For production, tee the audit to durable storage and run one instance
+  or add a shared coordination store before scaling out.
+- The `_diagnostic` payload **does not carry the raw OBO by default** - it exposes `oboJti` for
+  correlation, not the replayable token (see above). Setting `GATEWAY_DEBUG_OBO=true` embeds the raw
+  OBO so a local UI can *show* it. That flag is a localhost debug affordance only: a raw OBO in a
+  response body is a bearer token, so never enable it on a networked deployment.
 
 ## The principle
 

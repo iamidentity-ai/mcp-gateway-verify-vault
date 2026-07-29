@@ -13,7 +13,7 @@ sequenceDiagram
     participant A as Antenna (CAEP/SSF)
 
     C->>G: POST /tool {name, args} + user bearer
-    Note over C,G: full binding mode: the call also carries a caller-signed<br/>DPoP proof; the gateway rejects a bare bearer with 401
+    Note over C,G: full binding mode: the call also carries a caller-signed<br/>DPoP proof, and the gateway rejects a bare bearer with 401
     G->>V: GET /oauth2/userinfo - introspect
     V-->>G: 200 active {sub, email}
     Note over G: kill-gate: isSessionKilled(sub)?

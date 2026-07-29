@@ -47,12 +47,17 @@ token. (`VAULT_KEY` is a dev-only override; never set it in a real deployment.) 
 - With a valid live bearer, an attacker **can** perform tier-1 reads of public records the user is
   entitled to (Token-Exchange only, no human check). The gateway enforces IdP policy; it is not an
   anomaly detector on reads.
-- In-memory state (deny counter, kill-gate, pending store, audit ring buffer) is **per-process and
-  non-persistent** - correct for a single-instance deploy; horizontal scaling needs shared state or
-  sticky routing.
-- The `_diagnostic` envelope **carries the full OBO** in the response - a deliberate observability
-  choice for a demo/reference build. A raw OBO is a bearer token; redact it before any external trust
-  boundary. See [observability](concepts/observability.md).
+- In-memory state (deny counter, kill-gate, pending store, DPoP replay cache, audit ring buffer) is
+  **per-process and non-persistent**, so this build is **single-instance by default**. Behind two or
+  more replicas these controls degrade: the 3-deny kill never trips, the SSF kill-gate and DPoP replay
+  cache are per-instance, and `/hitl/complete` can land on the wrong instance. Sticky routing does not
+  fix the kill-gate, deny-counter, or replay cases. Run one instance, or add a shared coordination
+  store, before scaling out.
+- The `_diagnostic` envelope **does not carry the raw OBO by default** - it exposes only the OBO's
+  `jti` (`oboJti`), which correlates a call across Verify and Vault but cannot be replayed. The raw
+  OBO is embedded only when `GATEWAY_DEBUG_OBO=true`, a localhost debug affordance that must never be
+  enabled on a networked deployment (a raw OBO is a replayable bearer token). See
+  [observability](concepts/observability.md).
 - The gateway is the highest-value box on the path. Its safety rests on **never becoming the source of
   truth about identity** - it transforms tokens and brokers credentials, and propagates identity
   downstream cryptographically (the OBO's `sub` + `act` chain + `authorization_details`), not as
