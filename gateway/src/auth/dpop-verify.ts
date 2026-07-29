@@ -44,6 +44,15 @@ function jtiSeen(jti: string, now: () => number): boolean {
   if (hit !== undefined && hit > t) return true;
   if (jtiCache.size >= JTI_CACHE_MAX) {
     for (const [k, v] of jtiCache) if (v <= t) jtiCache.delete(k);
+    // Hard cap: if the sweep freed nothing (sustained unique-jti load), evict
+    // oldest-inserted entries (Map preserves insertion order) so the cache
+    // cannot grow past JTI_CACHE_MAX. Evicted jtis are closest to iat-expiry,
+    // and the iat window independently bounds any residual replay.
+    while (jtiCache.size >= JTI_CACHE_MAX) {
+      const oldest = jtiCache.keys().next().value;
+      if (oldest === undefined) break;
+      jtiCache.delete(oldest);
+    }
   }
   jtiCache.set(jti, t + IAT_WINDOW_SEC * 2 * 1000);
   return false;
@@ -118,10 +127,12 @@ export async function verifyDpopProof(
     return { ok: false, error: 'proof_iat_out_of_window' };
   }
 
-  // 5. Replay
+  // 5. jti must be present. The replay-cache check is deferred to step 8 (after
+  // ath + cnf.jkt) so only a proof bound to a real sender-constrained token can
+  // consume a cache slot or trigger the replay scan. This stops an unauthenticated
+  // caller from driving cache growth with self-signed proofs that fail ath/cnf.jkt.
   const jti = payload['jti'];
   if (typeof jti !== 'string' || jti.length === 0) return { ok: false, error: 'missing_proof_jti' };
-  if (jtiSeen(jti, now)) return { ok: false, error: 'proof_replayed' };
 
   // 6. The proof is for THIS access token
   if (payload['ath'] !== accessTokenHash(args.accessToken)) return { ok: false, error: 'ath_mismatch' };
@@ -131,6 +142,9 @@ export async function verifyDpopProof(
   const bound = tokenCnfJkt(args.accessToken);
   if (!bound) return { ok: false, error: 'token_not_sender_constrained' };
   if (bound !== jkt) return { ok: false, error: 'cnf_jkt_mismatch' };
+
+  // 8. Replay: record the jti only now that the proof is fully valid and bound.
+  if (jtiSeen(jti, now)) return { ok: false, error: 'proof_replayed' };
 
   return { ok: true, jkt };
 }

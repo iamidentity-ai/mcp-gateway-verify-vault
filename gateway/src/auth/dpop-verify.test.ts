@@ -97,6 +97,18 @@ describe('verifyDpopProof', () => {
       verifyDpopProof({ proof, method: 'POST', url: '', accessToken: token }),
     ).resolves.toEqual({ ok: false, error: 'malformed_target_url' });
   });
+
+  it('rejects alg none and alg HS256 before any crypto (alg-confusion guard)', async () => {
+    const { token } = await boundSetup();
+    const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    for (const alg of ['none', 'HS256'] as const) {
+      const header = b64({ alg, typ: 'dpop+jwt', jwk: { kty: 'RSA', n: 'x', e: 'AQAB' } });
+      const payload = b64({ htm: 'POST', htu: URL_, jti: 'j', iat: 1700000000 });
+      const proof = `${header}.${payload}.sig`;
+      const res = await verifyDpopProof({ proof, method: 'POST', url: URL_, accessToken: token });
+      expect(res).toEqual({ ok: false, error: 'unsupported_proof_alg' });
+    }
+  });
 });
 
 describe('helpers', () => {
