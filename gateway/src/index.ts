@@ -48,6 +48,10 @@ import { verifyDpopProof } from './auth/dpop-verify.js';
 import { tools as configuredToolPolicies, type ToolArgType, type ToolPolicy } from './policy/tiers.js';
 
 const PORT = Number(process.env['PORT'] ?? 3014);
+// Interface to bind. Defaults to loopback (safe for local dev). Set GATEWAY_BIND
+// to 0.0.0.0 for container / systemd / reverse-proxied deploys where the port
+// must be reachable off the loopback interface. See docs/guides/deploy-on-rhel.md.
+const GATEWAY_BIND = process.env['GATEWAY_BIND'] || '127.0.0.1';
 /** Service name — used in log prefixes and as the MCP server identity.
  *  Override via GATEWAY_SERVICE_NAME when running multiple gateways. */
 const SERVICE = process.env['GATEWAY_SERVICE_NAME'] || 'mcp-gateway';
@@ -597,6 +601,6 @@ app.post('/mcp', async (req: Request, res: Response) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-app.listen(PORT, '127.0.0.1', () => {
-  console.log(`[${SERVICE}] listening on http://127.0.0.1:${PORT}`);
+app.listen(PORT, GATEWAY_BIND, () => {
+  console.log(`[${SERVICE}] listening on http://${GATEWAY_BIND}:${PORT}`);
 });

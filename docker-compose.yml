@@ -60,6 +60,7 @@ services:
         required: false
     environment:
       PORT: 3014
+      GATEWAY_BIND: 0.0.0.0   # bind all interfaces INSIDE the container so the published port is reachable
       UPSTREAM_MCP_URL: http://naive-mcp:3015/mcp
       SECRETS_BACKEND: ${SECRETS_BACKEND:-env}
     depends_on:
