@@ -32,6 +32,15 @@
 		},
 		{
 			"path": "../../../iamidentity-blog/blog files/posts/drop-in-mcp-gateway"
+		},
+		{
+			"path": "../../../svg-viewer"
+		},
+		{
+			"path": "../../../techxchange-agentic-lab"
+		},
+		{
+			"path": "../../../dining-map"
 		}
 	],
 	"settings": {}
