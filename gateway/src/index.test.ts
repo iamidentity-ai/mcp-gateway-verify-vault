@@ -172,6 +172,37 @@ describe('pipelineResultToEnvelope', () => {
     const envelope = pipelineResultToEnvelope({ status: 'error', error: 'access_denied' });
     expect(envelope).toEqual({ ok: false, denied: true, error: 'access_denied' });
   });
+
+  // ── HITL_METHOD=transient_email error envelopes ────────────────────────
+  it('error: otp_invalid with attemptsRemaining — carries attemptsRemaining through to the client envelope', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'error', error: 'otp_invalid', attemptsRemaining: 2 });
+    expect(envelope).toEqual({ ok: false, error: 'otp_invalid', attemptsRemaining: 2 });
+  });
+
+  it('error: otp_invalid with NO attemptsRemaining reported — the key is absent, not null/undefined-valued (mapper never fabricates values it doesn\'t have)', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'error', error: 'otp_invalid' });
+    expect(envelope).toEqual({ ok: false, error: 'otp_invalid' });
+    expect(envelope).not.toHaveProperty('attemptsRemaining');
+  });
+
+  it('error: otp_expired — plain error shape, same as any other non-access_denied error', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'error', error: 'otp_expired' });
+    expect(envelope).toEqual({ ok: false, error: 'otp_expired' });
+  });
+
+  it('pending — email_otp pushInfo shape (method + maskedDestination, no title/message/transactionUri)', () => {
+    const envelope = pipelineResultToEnvelope({
+      status: 'pending',
+      txId: 'tx-456',
+      pushInfo: { method: 'email_otp', maskedDestination: 's•••@example.com' },
+    });
+    expect(envelope).toEqual({
+      ok: false,
+      pending: true,
+      txId: 'tx-456',
+      pushInfo: { method: 'email_otp', maskedDestination: 's•••@example.com' },
+    });
+  });
 });
 
 describe('statusCodeFor', () => {
@@ -192,6 +223,17 @@ describe('statusCodeFor', () => {
     // falls through to 500. access_denied must not have widened this.
     ['error: invalid_scope (unrelated exchange error)', { status: 'error', error: 'invalid_scope' }, 500],
     ['error: token_exchange_failed', { status: 'error', error: 'token_exchange_failed' }, 500],
+    // HITL_METHOD=transient_email error codes — caller-correctable input
+    // errors get 400, not the generic 500 an unrelated exchange error gets.
+    ['error: otp_required', { status: 'error', error: 'otp_required' }, 400],
+    ['error: otp_invalid', { status: 'error', error: 'otp_invalid' }, 400],
+    ['error: otp_expired', { status: 'error', error: 'otp_expired' }, 400],
+    ['error: mfa_no_email', { status: 'error', error: 'mfa_no_email' }, 400],
+    // The trigger (push or OTP) never fired at park time — nothing to
+    // complete. Distinct from both a 400 (not the caller's fault) and the
+    // generic 500 (not an unexpected exception either).
+    ['error: no_poll_url', { status: 'error', error: 'no_poll_url' }, 409],
+    ['error: otp_init_failed', { status: 'error', error: 'otp_init_failed' }, 409],
   ] as const)('%s -> %d', (_label, result, expected) => {
     expect(statusCodeFor(result as Parameters<typeof statusCodeFor>[0])).toBe(expected);
   });

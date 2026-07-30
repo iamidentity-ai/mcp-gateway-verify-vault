@@ -56,6 +56,9 @@ import {
   pollOAuthMfaStatus,
   exchangeMfaAssertionWithRAR,
   buildPushContext,
+  triggerTransientEmailOtp,
+  submitTransientOtp,
+  maskEmail,
 } from './token-exchange.js';
 
 // ── Fetch helpers ────────────────────────────────────────────
@@ -513,6 +516,143 @@ describe('buildPushContext', () => {
     const ctx = buildPushContext(undefined);
     expect(ctx.message).toContain('records action');
     expect(ctx.message).toContain("If you didn't request this, deny.");
+  });
+});
+
+// ── transient email OTP (HITL_METHOD=transient_email) ────────
+
+describe('triggerTransientEmailOtp', () => {
+  it('POSTs the canonical flat body to /v2.0/factors/emailotp/transient/verifications and builds the submit URL from the response id', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          id: 'verif-123',
+          type: 'emailotp',
+          state: 'PENDING',
+          correlation: 'MCPGW',
+          emailAddress: 'steve@example.com',
+          attempts: 0,
+          retries: 4,
+        },
+        201,
+      ),
+    );
+
+    const { transactionUri, id } = await triggerTransientEmailOtp('challenge-token', 'steve@example.com');
+
+    expect(id).toBe('verif-123');
+    expect(transactionUri).toBe(
+      'https://tenant.verify.ibm.com/v2.0/factors/emailotp/transient/verifications/verif-123',
+    );
+
+    expect(urlOf(fetchMock.mock.calls[0])).toBe(
+      'https://tenant.verify.ibm.com/v2.0/factors/emailotp/transient/verifications',
+    );
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    // Body must be FLAT — no nested `verification: {...}` wrapper — and the
+    // default correlation must be alphanumeric only (a hyphen 400s on a real
+    // tenant with CSIBN0018E).
+    const body = JSON.parse(init.body as string);
+    expect(body).toEqual({ emailAddress: 'steve@example.com', correlation: 'MCPGW' });
+    expect(body.correlation).toMatch(/^[A-Za-z0-9]+$/);
+  });
+
+  it('throws with the response body on a non-2xx', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response('SRVE0295E: Error reported: 404', { status: 404, headers: { 'Content-Type': 'text/html' } }),
+    );
+    await expect(triggerTransientEmailOtp('challenge-token', 'steve@example.com')).rejects.toThrow(/404/);
+  });
+});
+
+describe('submitTransientOtp', () => {
+  it('returns approved with the assertion under `jwt` (the field name varies by tenant/version)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ jwt: 'mfa-assertion-from-otp' }));
+    const r = await submitTransientOtp('https://tenant.verify.ibm.com/v2.0/factors/emailotp/transient/verifications/verif-123', '123456', 'challenge-token');
+    expect(r).toEqual({ status: 'approved', assertion: 'mfa-assertion-from-otp' });
+    expect(urlOf(fetchMock.mock.calls[0])).toContain('?returnJwt=true');
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toEqual({ otp: '123456' });
+  });
+
+  // Multi-key assertion lookup — feedback_verify_transient_otp_assertion_field_lookup:
+  // the field carrying the assertion is NOT stable across endpoint versions.
+  for (const [key, value] of [
+    ['assertion', 'assertion-value'],
+    ['accessToken', 'accessToken-value'],
+    ['access_token', 'access_token-value'],
+  ] as const) {
+    it(`falls back to the "${key}" field when "jwt" is absent`, async () => {
+      fetchMock.mockResolvedValueOnce(jsonResponse({ [key]: value }));
+      const r = await submitTransientOtp('https://x/tx/verif-1', '654321', 'challenge-token');
+      expect(r).toEqual({ status: 'approved', assertion: value });
+    });
+  }
+
+  it('204 No Content success path reads the assertion from a response header', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204, headers: { 'x-jwt': 'header-assertion' } }));
+    const r = await submitTransientOtp('https://x/tx/verif-1', '111111', 'challenge-token');
+    expect(r).toEqual({ status: 'approved', assertion: 'header-assertion' });
+  });
+
+  it('204 No Content with no assertion header -> error (never silently drops the exchange)', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const r = await submitTransientOtp('https://x/tx/verif-1', '111111', 'challenge-token');
+    expect(r.status).toBe('error');
+  });
+
+  it('200 with no recognized assertion key -> error that names the actual keys (so the next operator can add the 5th key in a minute)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ someOtherField: 'x', state: 'VERIFIED' }));
+    const r = await submitTransientOtp('https://x/tx/verif-1', '111111', 'challenge-token');
+    expect(r.status).toBe('error');
+    if (r.status === 'error') {
+      expect(r.error).toContain('someOtherField');
+      expect(r.error).toContain('state');
+    }
+  });
+
+  it('401 -> otp_invalid, with attemptsRemaining when Verify reports a retries count', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ retries: 2 }), { status: 401, headers: { 'Content-Type': 'application/json' } }));
+    const r = await submitTransientOtp('https://x/tx/verif-1', '000000', 'challenge-token');
+    expect(r).toEqual({ status: 'otp_invalid', attemptsRemaining: 2 });
+  });
+
+  it('401 with no parseable body -> otp_invalid with attemptsRemaining undefined (never throws)', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('', { status: 401 }));
+    const r = await submitTransientOtp('https://x/tx/verif-1', '000000', 'challenge-token');
+    expect(r).toEqual({ status: 'otp_invalid', attemptsRemaining: undefined });
+  });
+
+  it('400 -> otp_expired (already consumed or verification window closed) — distinct from otp_invalid', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ error: 'expired' }), { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    const r = await submitTransientOtp('https://x/tx/verif-1', '000000', 'challenge-token');
+    expect(r).toEqual({ status: 'otp_expired' });
+  });
+
+  it('other non-2xx -> generic error, not swallowed as otp_invalid/otp_expired', async () => {
+    fetchMock.mockResolvedValueOnce(new Response('server error', { status: 500 }));
+    const r = await submitTransientOtp('https://x/tx/verif-1', '000000', 'challenge-token');
+    expect(r.status).toBe('error');
+  });
+
+  it('appends returnJwt=true correctly when the transactionUri already has a query string', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ jwt: 'a' }));
+    await submitTransientOtp('https://x/tx/verif-1?foo=bar', '000000', 'challenge-token');
+    expect(urlOf(fetchMock.mock.calls[0])).toBe('https://x/tx/verif-1?foo=bar&returnJwt=true');
+  });
+});
+
+describe('maskEmail', () => {
+  it('masks the local part to a single leading character + bullet, keeps the domain', () => {
+    expect(maskEmail('steve@example.com')).toBe('s•••@example.com');
+  });
+
+  it('handles a single-character local part', () => {
+    expect(maskEmail('s@example.com')).toBe('s•••@example.com');
+  });
+
+  it('returns a bullet placeholder for a string with no @', () => {
+    expect(maskEmail('not-an-email')).toBe('•••');
   });
 });
 

@@ -148,6 +148,12 @@ function makeRunDeps(overrides: Record<string, unknown> = {}) {
       title: 'MCP Gateway — approval',
       message: 'Approve: view a record.',
     }),
+    // transient_email HITL mode only — unused unless a test overrides
+    // hitlMethod:'transient_email' (default 'push' below never calls this).
+    triggerTransientEmailOtp: async () => ({
+      transactionUri: 'https://verify.test/v2.0/factors/emailotp/transient/verifications/verif-default',
+      id: 'verif-default',
+    }),
     mintCred: async () => ({ username: 'v-records-1', password: 'p4ss', leaseId: 'lease-1' }),
     // Public by default (explicit classification:'public' — shouldStepUp now
     // FAILS CLOSED, so a discovery probe with no classification is treated as
@@ -687,6 +693,124 @@ describe('runPipeline', () => {
     // Exchange -> upstream, with NO mint/revoke between them.
     expectOrder(calls, ['introspectUser', 'gateTool', 'exchangeToken', 'callUpstreamTool', 'appendAudit']);
   });
+
+  // ── HITL_METHOD=transient_email mode selection ─────────────────────────
+  //
+  // Entra-anchored / federated users JIT'd into the tenant typically have no
+  // enrolled Verify push factor — triggerOAuthMfaPush's /v2.0/factors lookup
+  // comes back empty and the push flow cannot fire. hitlMethod:'transient_email'
+  // (default 'push' — see defaultRunPipelineDeps) switches the mfa_challenge
+  // branch to mail a one-shot code instead.
+  describe('HITL_METHOD=transient_email mode selection', () => {
+    it('mode selection default (hitlMethod unset in deps): a tier-2 mfa_challenge still triggers the PUSH path, never triggerTransientEmailOtp — zero behavior change for existing deployments', async () => {
+      const { deps, calls } = makeRunDeps({
+        gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),
+        exchangeToken: async () => ({ status: 'mfa_challenge' as const, challengeToken: 'challenge-xyz' }),
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result.status).toBe('pending');
+      expect(calls).toContain('triggerOAuthMfaPush');
+      expect(calls).not.toContain('triggerTransientEmailOtp');
+
+      const [, ctx] = (deps.putPending as any).mock.calls[0];
+      expect(ctx.hitlMethod).toBe('push');
+    });
+
+    it('push-path pending envelope carries pushInfo.method:"push" alongside the existing title/message/transactionUri shape (regression guard: adding the discriminator did not drop the original fields)', async () => {
+      const { deps } = makeRunDeps({
+        gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),
+        exchangeToken: async () => ({ status: 'mfa_challenge' as const, challengeToken: 'challenge-xyz' }),
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      if (result.status !== 'pending') throw new Error('expected pending');
+      expect(result.pushInfo).toMatchObject({
+        method: 'push',
+        title: 'MCP Gateway — approval',
+        transactionUri: 'https://verify.test/tx/abc',
+      });
+    });
+
+    it('hitlMethod:"transient_email": mfa_challenge triggers triggerTransientEmailOtp (with the challenge token + the INTROSPECTED email), never triggerOAuthMfaPush', async () => {
+      const { deps, calls } = makeRunDeps({
+        gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),
+        exchangeToken: async () => ({ status: 'mfa_challenge' as const, challengeToken: 'challenge-xyz' }),
+        hitlMethod: 'transient_email' as const,
+        triggerTransientEmailOtp: async () => ({
+          transactionUri: 'https://verify.test/v2.0/factors/emailotp/transient/verifications/verif-1',
+          id: 'verif-1',
+        }),
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result.status).toBe('pending');
+      expect(deps.triggerTransientEmailOtp).toHaveBeenCalledWith('challenge-xyz', 'agent@example.com');
+      expect(calls).not.toContain('triggerOAuthMfaPush');
+
+      // Pending envelope shape: method:'email_otp' + masked destination, NOT
+      // a push-shaped title/message/transactionUri.
+      if (result.status !== 'pending') throw new Error('expected pending');
+      expect(result.pushInfo).toEqual({ method: 'email_otp', maskedDestination: 'a•••@example.com' });
+
+      // PendingCtx carries hitlMethod + the transient-verification submit URL
+      // in transactionUri (same field the push path uses for its poll URL).
+      const [, ctx] = (deps.putPending as any).mock.calls[0];
+      expect(ctx.hitlMethod).toBe('email_otp');
+      expect(ctx.transactionUri).toBe('https://verify.test/v2.0/factors/emailotp/transient/verifications/verif-1');
+    });
+
+    it('hitlMethod:"transient_email" with no email on the introspected identity -> error("mfa_no_email"), triggerTransientEmailOtp never called, no pending parked', async () => {
+      const { deps, calls } = makeRunDeps({
+        introspectUser: async () => ({ active: true, verifyUserId: 'user-1' }), // no email field
+        gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),
+        exchangeToken: async () => ({ status: 'mfa_challenge' as const, challengeToken: 'challenge-xyz' }),
+        hitlMethod: 'transient_email' as const,
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result).toEqual({ status: 'error', error: 'mfa_no_email' });
+      expect(calls).not.toContain('triggerTransientEmailOtp');
+      expect(deps.putPending).not.toHaveBeenCalled();
+    });
+
+    it('hitlMethod:"transient_email": triggerTransientEmailOtp failure still PARKS the pending tx (best-effort, mirrors the push trigger-failure behavior) with transactionUri left undefined', async () => {
+      const { deps } = makeRunDeps({
+        gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),
+        exchangeToken: async () => ({ status: 'mfa_challenge' as const, challengeToken: 'challenge-xyz' }),
+        hitlMethod: 'transient_email' as const,
+        triggerTransientEmailOtp: async () => {
+          throw new Error('Verify unreachable');
+        },
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result.status).toBe('pending');
+      const [, ctx] = (deps.putPending as any).mock.calls[0];
+      expect(ctx.hitlMethod).toBe('email_otp');
+      expect(ctx.transactionUri).toBeUndefined();
+    });
+  });
 });
 
 describe('completePending', () => {
@@ -715,6 +839,9 @@ describe('completePending', () => {
       takePending: (_txId: string) => makeCtx(),
       gateTool: () => makeGateResult({ tier: 2, rarAction: 'record_write', scope: 'records:write' }),
       pollOAuthMfaStatus: async () => ({ state: 'approved' as const, assertion: 'mfa-assertion-jwt' }),
+      // transient_email HITL mode only — unused unless a test's makeCtx has
+      // hitlMethod:'email_otp' (default makeCtx() is 'push', never calls this).
+      submitTransientOtp: async () => ({ status: 'approved' as const, assertion: 'otp-assertion-jwt-default' }),
       getExchangeClientSecret: async () => 'exchange-secret-1',
       invalidateExchangeSecret: () => undefined,
       exchangeMfaAssertionWithRAR: async () => ({
@@ -1038,5 +1165,173 @@ describe('completePending', () => {
     });
 
     resetPendingStore();
+  });
+
+  // ── Hardening fix: no-poll-URL guard (both HITL methods) ────────────────
+  //
+  // A pending tx whose push/OTP trigger never actually fired (best-effort
+  // trigger failed at park time — see runPipeline's transient_email/push
+  // tests above) has transactionUri === undefined. Before this fix,
+  // completePending fell straight into pollOAuthMfaStatus('', ...), which
+  // threw a raw "Failed to parse URL from ?returnJwt=true" instead of a
+  // clean error envelope.
+  describe('no-poll-URL guard (hardening fix)', () => {
+    it('push ctx with no transactionUri -> error("no_poll_url"), pollOAuthMfaStatus is NEVER called (does not crash)', async () => {
+      const { deps } = makeCompleteDeps({
+        peekPending: () => makeCtx({ hitlMethod: 'push', transactionUri: undefined }),
+        takePending: () => makeCtx({ hitlMethod: 'push', transactionUri: undefined }),
+      });
+
+      const result = await completePending('tx-1', 'user-1', deps as any);
+
+      expect(result).toEqual({ status: 'error', error: 'no_poll_url' });
+      expect(deps.pollOAuthMfaStatus).not.toHaveBeenCalled();
+      expect(deps.exchangeMfaAssertionWithRAR).not.toHaveBeenCalled();
+    });
+
+    it('email_otp ctx with no transactionUri (trigger never fired) -> error("otp_init_failed"), submitTransientOtp is NEVER called', async () => {
+      const { deps } = makeCompleteDeps({
+        peekPending: () => makeCtx({ hitlMethod: 'email_otp', transactionUri: undefined }),
+        takePending: () => makeCtx({ hitlMethod: 'email_otp', transactionUri: undefined }),
+        submitTransientOtp: async () => ({ status: 'approved' as const, assertion: 'should-not-be-called' }),
+      });
+
+      const result = await completePending('tx-1', 'user-1', deps as any, '123456');
+
+      expect(result).toEqual({ status: 'error', error: 'otp_init_failed' });
+      expect(deps.submitTransientOtp).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── HITL_METHOD=transient_email resume path ──────────────────────────────
+  describe('transient_email (email_otp) resume path', () => {
+    function makeOtpCtx(overrides: Partial<PendingCtx> = {}): PendingCtx {
+      return makeCtx({
+        hitlMethod: 'email_otp',
+        transactionUri: 'https://verify.test/v2.0/factors/emailotp/transient/verifications/verif-1',
+        ...overrides,
+      });
+    }
+
+    function makeOtpDeps(overrides: Record<string, unknown> = {}) {
+      return makeCompleteDeps({
+        peekPending: () => makeOtpCtx(),
+        takePending: () => makeOtpCtx(),
+        submitTransientOtp: async () => ({ status: 'approved' as const, assertion: 'otp-assertion-jwt' }),
+        ...overrides,
+      });
+    }
+
+    it('otp missing -> error("otp_required"), validated off the non-destructive PEEK — takePending/submitTransientOtp/pollOAuthMfaStatus are NEVER called (the one-shot tx is not burned by a forgotten field)', async () => {
+      const { deps } = makeOtpDeps();
+
+      const result = await completePending('tx-1', 'user-1', deps as any); // no otp arg
+
+      expect(result).toEqual({ status: 'error', error: 'otp_required' });
+      expect(deps.takePending).not.toHaveBeenCalled();
+      expect(deps.submitTransientOtp).not.toHaveBeenCalled();
+      expect(deps.pollOAuthMfaStatus).not.toHaveBeenCalled();
+    });
+
+    it('otp missing but push-parked (hitlMethod:"push") -> otp is simply ignored, normal poll-based flow proceeds', async () => {
+      const { deps } = makeCompleteDeps(); // default makeCtx() has no hitlMethod -> 'push'
+
+      const result = await completePending('tx-1', 'user-1', deps as any); // no otp
+
+      expect(result).toMatchObject({ status: 'ok' });
+      expect(deps.pollOAuthMfaStatus).toHaveBeenCalled();
+      expect(deps.submitTransientOtp).not.toHaveBeenCalled();
+    });
+
+    it('correct otp -> submitTransientOtp -> exchangeMfaAssertionWithRAR -> mint -> upstream -> revoke -> clearDeny -> ok (mirrors the push happy path)', async () => {
+      const { deps, calls } = makeOtpDeps();
+
+      const result = await completePending('tx-1', 'user-1', deps as any, '123456');
+
+      expect(result).toMatchObject({ status: 'ok', data: { ok: true } });
+      expect(deps.submitTransientOtp).toHaveBeenCalledWith(
+        'https://verify.test/v2.0/factors/emailotp/transient/verifications/verif-1',
+        '123456',
+        'challenge-xyz',
+      );
+      expect(deps.exchangeMfaAssertionWithRAR).toHaveBeenCalledWith(
+        'otp-assertion-jwt',
+        'records:write',
+        expect.any(Array),
+        'exchange-secret-1',
+      );
+      expect(deps.pollOAuthMfaStatus).not.toHaveBeenCalled();
+      expect(deps.clearDeny).toHaveBeenCalledWith('user-1');
+
+      expectOrder(calls, [
+        'peekPending',
+        'takePending',
+        'submitTransientOtp',
+        'getExchangeClientSecret',
+        'exchangeMfaAssertionWithRAR',
+        'mintCred',
+        'callUpstreamTool',
+        'revokeLease',
+        'clearDeny',
+      ]);
+    });
+
+    it('wrong otp -> error("otp_invalid") with attemptsRemaining passed through, exchangeMfaAssertionWithRAR/mint/upstream never run', async () => {
+      const { deps } = makeOtpDeps({
+        submitTransientOtp: async () => ({ status: 'otp_invalid' as const, attemptsRemaining: 2 }),
+      });
+
+      const result = await completePending('tx-1', 'user-1', deps as any, '000000');
+
+      expect(result).toEqual({ status: 'error', error: 'otp_invalid', attemptsRemaining: 2 });
+      expect(deps.exchangeMfaAssertionWithRAR).not.toHaveBeenCalled();
+      expect(deps.mintCred).not.toHaveBeenCalled();
+      expect(deps.appendAudit).toHaveBeenCalledTimes(1);
+      expect((deps.appendAudit as any).mock.calls[0][0]).toMatchObject({ decision: 'otp_invalid' });
+    });
+
+    it('wrong otp with no attemptsRemaining reported -> error("otp_invalid") with no attemptsRemaining key', async () => {
+      const { deps } = makeOtpDeps({
+        submitTransientOtp: async () => ({ status: 'otp_invalid' as const }),
+      });
+
+      const result = await completePending('tx-1', 'user-1', deps as any, '000000');
+
+      expect(result).toEqual({ status: 'error', error: 'otp_invalid' });
+      expect(result).not.toHaveProperty('attemptsRemaining');
+    });
+
+    it('expired/already-consumed otp -> error("otp_expired"), distinct from otp_invalid', async () => {
+      const { deps } = makeOtpDeps({
+        submitTransientOtp: async () => ({ status: 'otp_expired' as const }),
+      });
+
+      const result = await completePending('tx-1', 'user-1', deps as any, '123456');
+
+      expect(result).toEqual({ status: 'error', error: 'otp_expired' });
+      expect(deps.exchangeMfaAssertionWithRAR).not.toHaveBeenCalled();
+      expect((deps.appendAudit as any).mock.calls[0][0]).toMatchObject({ decision: 'otp_expired' });
+    });
+
+    it('submitTransientOtp transport/parse error -> surfaced verbatim as {status:"error"}', async () => {
+      const { deps } = makeOtpDeps({
+        submitTransientOtp: async () => ({ status: 'error' as const, error: 'submitTransientOtp: 500 upstream down' }),
+      });
+
+      const result = await completePending('tx-1', 'user-1', deps as any, '123456');
+
+      expect(result).toEqual({ status: 'error', error: 'submitTransientOtp: 500 upstream down' });
+      expect(deps.exchangeMfaAssertionWithRAR).not.toHaveBeenCalled();
+    });
+
+    it('identity binding still applies BEFORE the otp check — a mismatched caller gets forbidden without submitTransientOtp ever running (even with a correct otp supplied)', async () => {
+      const { deps } = makeOtpDeps();
+
+      const result = await completePending('tx-1', 'attacker-999', deps as any, '123456');
+
+      expect(result).toEqual({ status: 'error', error: 'forbidden' });
+      expect(deps.submitTransientOtp).not.toHaveBeenCalled();
+      expect(deps.takePending).not.toHaveBeenCalled();
+    });
   });
 });

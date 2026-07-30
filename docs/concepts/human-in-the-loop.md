@@ -44,6 +44,44 @@ denial-of-service needing zero Verify interaction. The identity binding closes i
 `verdict` field is also a dev-only escape hatch gated behind `GATEWAY_ALLOW_TEST_VERDICT=1` - in
 normal operation the verdict always comes from the real Verify poll.)
 
+### No enrolled push factor? `HITL_METHOD=transient_email`
+
+The push sequence above assumes the user has an enrolled Verify `userPresence` factor - true for
+users who signed up directly with Verify, but **not** for federated populations. A user who signs
+in through an external IdP (e.g. Microsoft Entra ID) and gets JIT-provisioned into the tenant has
+never gone through Verify's own enrollment flow, so `triggerOAuthMfaPush()`'s `/v2.0/factors`
+lookup comes back empty and the call fails with `mfa_no_factor` ("user has no registered
+userPresence factor") - there is nothing to push to.
+
+Set `HITL_METHOD=transient_email` (default `push`) to swap the step-up method for **all**
+`mfa_challenge` results this gateway instance handles: instead of a phone push, Verify mails a
+one-shot 6-digit code to the user's *introspected* email (never caller-supplied, never hardcoded -
+resolved the same way `triggerOAuthMfaPush` resolves the user's factor, off the identity Token
+Exchange already authenticated). The sequencing mirrors the push flow exactly, with different
+primitives:
+
+- **`triggerTransientEmailOtp()`** - `POST /v2.0/factors/emailotp/transient/verifications` with the
+  resolved email. Needs no prior enrollment - that's the whole point.
+- The pending envelope's `pushInfo` becomes `{ method: 'email_otp', maskedDestination: 's•••@example.com' }`
+  instead of the push shape's `{ title, message, transactionUri }` - a client checks `pushInfo.method`
+  to know which prompt to show.
+- **`submitTransientOtp()`** - verifies the code the user typed. Distinguishes a wrong code
+  (`otp_invalid`, with `attemptsRemaining` when Verify reports one) from an expired/already-consumed
+  one (`otp_expired`, telling the caller to request a fresh code rather than retype the same one).
+- **`exchangeMfaAssertionWithRAR()`** - the same second leg the push path uses, re-sending
+  `authorization_details` for the same reason.
+
+`POST /hitl/complete` and the `complete_hitl` MCP tool both take an additional `otp` field -
+**required** when the parked transaction used `email_otp` (missing it 400s with `otp_required`,
+checked before the one-shot pending entry is consumed so a caller who simply forgot the field
+doesn't burn it); ignored for a push-parked transaction.
+
+One hardening note this mode surfaces for both methods: if the push/OTP trigger itself fails at
+park time (Verify unreachable, rate-limited, ...), the transaction still parks best-effort so the
+caller sees `pending` rather than a hard error - but there is then no `transactionUri` to resume
+from. `/hitl/complete` recognizes that state and returns a clean `no_poll_url` / `otp_init_failed`
+error instead of crashing on an empty poll URL.
+
 ## 2. Classification discovery is gateway-derived
 
 Here is the trap step-up usually falls into: if the *caller* tells you "this is a restricted record,

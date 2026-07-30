@@ -13,18 +13,21 @@
  *                            HTTP, stateless — fresh server+transport per
  *                            request). tools/call -> runPipeline.
  *   POST /tool               REST { name, arguments } -> runPipeline.
- *   POST /hitl/complete      { txId, verdict? } -> completePending, IDENTITY
- *                            BOUND: the caller's own bearer is introspected
- *                            and its verifyUserId must match the pending
- *                            transaction's owner or the call 403s before
- *                            touching pollOAuthMfaStatus/the deny counter/
- *                            session-kill (security-review CRITICAL fix —
- *                            previously any bearer could complete/kill ANY
- *                            known txId). `verdict` is a dev/test escape
+ *   POST /hitl/complete      { txId, verdict?, otp? } -> completePending,
+ *                            IDENTITY BOUND: the caller's own bearer is
+ *                            introspected and its verifyUserId must match the
+ *                            pending transaction's owner or the call 403s
+ *                            before touching pollOAuthMfaStatus/the deny
+ *                            counter/session-kill (security-review CRITICAL
+ *                            fix — previously any bearer could complete/kill
+ *                            ANY known txId). `verdict` is a dev/test escape
  *                            hatch, GATED behind GATEWAY_ALLOW_TEST_VERDICT
  *                            === '1' (see below); normal operation always
  *                            polls the real Verify verification transaction
- *                            regardless of what the request body sends.
+ *                            regardless of what the request body sends. `otp`
+ *                            is REQUIRED when HITL_METHOD=transient_email
+ *                            parked the tx (400 otp_required if missing);
+ *                            ignored for a push-parked tx.
  *   GET  /me/audit           bearer -> getAuditForUser(verifyUserId).
  *   GET  /me/session-status  bearer -> introspectUser + local kill-gate.
  *
@@ -125,7 +128,24 @@ export function statusCodeFor(result: PipelineResult): number {
       // before this ever returns; invalid_scope/invalid_grant surface as
       // their own literal strings, distinct from 'access_denied'.
       if (result.error === 'forbidden' || result.error === 'access_denied') return 403;
-      return result.error === 'inactive_session' || result.error === 'session_killed' ? 401 : 500;
+      if (result.error === 'inactive_session' || result.error === 'session_killed') return 401;
+      // transient_email HITL mode (HITL_METHOD=transient_email): caller-
+      // correctable input errors, not server failures.
+      if (
+        result.error === 'otp_required' ||
+        result.error === 'otp_invalid' ||
+        result.error === 'otp_expired' ||
+        result.error === 'mfa_no_email'
+      ) {
+        return 400;
+      }
+      // The pending tx's push/OTP trigger never actually fired (best-effort
+      // trigger failed at park time) — nothing to complete. Not the caller's
+      // fault and not a generic server error: 409 signals "this transaction
+      // cannot be completed in its current state," distinct from the 500 a
+      // genuinely unexpected exception still maps to.
+      if (result.error === 'no_poll_url' || result.error === 'otp_init_failed') return 409;
+      return 500;
   }
 }
 
@@ -215,7 +235,13 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
       // the raw code for correlation still gets it.
       return result.error === 'access_denied'
         ? { ok: false, denied: true, error: result.error }
-        : { ok: false, error: result.error };
+        : {
+            ok: false,
+            error: result.error,
+            // transient_email HITL mode: how many tries are left on
+            // otp_invalid, when Verify's response reported one.
+            ...(result.attemptsRemaining !== undefined ? { attemptsRemaining: result.attemptsRemaining } : {}),
+          };
   }
 }
 
@@ -270,7 +296,7 @@ export function resolveTestVerdictOverride(
 // ── POST /hitl/complete — resume a parked mfa_challenge ───────────────────
 //
 // Body: { txId: string, verdict?: 'approved' | 'denied' | 'denied_suspicious'
-//         | 'timeout', assertion?: string, reason?: string }
+//         | 'timeout', assertion?: string, reason?: string, otp?: string }
 //
 // IDENTITY BOUND (security-review CRITICAL fix): the caller's OWN bearer is
 // introspected first — its verifyUserId is passed to completePending, which
@@ -284,6 +310,11 @@ export function resolveTestVerdictOverride(
 // process.env.GATEWAY_ALLOW_TEST_VERDICT === '1'. Outside that flag, the
 // request body's `verdict` is ignored entirely and completePending always
 // derives the verdict from the real pollOAuthMfaStatus poll against Verify.
+//
+// `otp` is REQUIRED when HITL_METHOD=transient_email parked this tx
+// (completePending 400s with otp_required if it's missing) — ignored for a
+// push-parked tx. Passed straight through; completePending is what actually
+// validates it against Verify's transient-verification endpoint.
 app.post('/hitl/complete', async (req: Request, res: Response) => {
   const bearer = requireBearer(req, res);
   if (!bearer) return;
@@ -292,6 +323,7 @@ app.post('/hitl/complete', async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const txId = body['txId'] as string | undefined;
   if (!txId) return res.status(400).json({ error: 'missing_txId' });
+  const otp = body['otp'] as string | undefined;
 
   const introspection = await introspectUser(bearer);
   const callerVerifyUserId = introspection.active ? introspection.verifyUserId : undefined;
@@ -300,16 +332,21 @@ app.post('/hitl/complete', async (req: Request, res: Response) => {
 
   try {
     const result = verdict
-      ? await completePending(txId, callerVerifyUserId, {
-        pollOAuthMfaStatus: async () => {
-          if (verdict === 'approved') {
-            return { state: 'approved', assertion: (body['assertion'] as string) ?? 'test-assertion' };
-          }
-          if (verdict === 'timeout') return { state: 'timeout' };
-          return { state: verdict, reason: (body['reason'] as string) ?? verdict };
+      ? await completePending(
+        txId,
+        callerVerifyUserId,
+        {
+          pollOAuthMfaStatus: async () => {
+            if (verdict === 'approved') {
+              return { state: 'approved', assertion: (body['assertion'] as string) ?? 'test-assertion' };
+            }
+            if (verdict === 'timeout') return { state: 'timeout' };
+            return { state: verdict, reason: (body['reason'] as string) ?? verdict };
+          },
         },
-      })
-      : await completePending(txId, callerVerifyUserId);
+        otp,
+      )
+      : await completePending(txId, callerVerifyUserId, {}, otp);
     // Return the SAME `{ ok, data, _diagnostic }` envelope as /tool and /mcp —
     // a consumer resuming a step-up must not get a different shape than the
     // one that parked it (statusCodeFor still drives the HTTP status off the
@@ -462,8 +499,8 @@ const COMPLETE_HITL_SPEC: McpToolSpec = {
   config: {
     title: 'Complete a pending human-in-the-loop approval',
     description:
-      'Resumes a tool call that came back with pending:true and a txId (the human needs to approve a push/OTP on their phone first). Call this with that txId once the human says they approved it. This call blocks until Verify\'s verification transaction reaches a terminal state (approved/denied/timeout) and then returns the SAME { ok, data, _diagnostic } envelope the original call would have returned had it not needed a step-up.',
-    inputSchema: { txId: z.string() },
+      'Resumes a tool call that came back with pending:true and a txId (the human needs to approve a push or email code first — check pushInfo.method). Call this with that txId once the human says they approved it. If pushInfo.method was "email_otp", pass the 6-digit code the human read from their email as `otp` (REQUIRED in that case — omitting it returns otp_required). This call blocks until Verify\'s verification transaction reaches a terminal state (approved/denied/timeout) and then returns the SAME { ok, data, _diagnostic } envelope the original call would have returned had it not needed a step-up.',
+    inputSchema: { txId: z.string(), otp: z.string().optional() },
   },
 };
 
@@ -560,10 +597,10 @@ export const mcpToolNames = (): string[] => MCP_TOOL_SPECS.map((s) => s.name);
  * escape hatch the REST route has for integration tests — an MCP client
  * always drives the real poll against Verify.
  */
-async function completeHitlForBearer(txId: string, bearer: string): Promise<PipelineResult> {
+async function completeHitlForBearer(txId: string, bearer: string, otp?: string): Promise<PipelineResult> {
   const introspection = await introspectUser(bearer);
   const callerVerifyUserId = introspection.active ? introspection.verifyUserId : undefined;
-  return completePending(txId, callerVerifyUserId);
+  return completePending(txId, callerVerifyUserId, {}, otp);
 }
 
 function buildMcpServer(bearer: string): McpServer {
@@ -572,7 +609,7 @@ function buildMcpServer(bearer: string): McpServer {
   const call = async (name: string, args: Record<string, unknown>) => {
     const result =
       name === COMPLETE_HITL_TOOL_NAME
-        ? await completeHitlForBearer(args['txId'] as string, bearer)
+        ? await completeHitlForBearer(args['txId'] as string, bearer, args['otp'] as string | undefined)
         : await dispatchTool(name, args, bearer);
     return { content: [{ type: 'text' as const, text: JSON.stringify(pipelineResultToEnvelope(result)) }] };
   };

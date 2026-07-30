@@ -35,6 +35,19 @@ export interface PendingCtx {
    *  "No email in sub_id" without it). */
   email?: string;
   challengeToken: string;
+  /** Which HITL method parked this transaction — decides how completePending
+   *  resumes it: 'push' (default, back-compat with entries parked before
+   *  this field existed) polls pollOAuthMfaStatus; 'email_otp' requires an
+   *  `otp` from the caller and calls submitTransientOtp instead. Set once at
+   *  park time by pipeline.ts's runExchangeAndCall off HITL_METHOD — never
+   *  chosen by the caller completing the transaction. */
+  hitlMethod?: 'push' | 'email_otp';
+  /** For 'push': the transactionUri polled for a verdict. For 'email_otp':
+   *  the transient-verification submit URL built from triggerTransientEmailOtp's
+   *  response id. Absent when the trigger call itself failed (best-effort —
+   *  the tx is still parked so the caller sees 'pending' rather than a hard
+   *  error) — completePending MUST treat an absent value as "nothing to
+   *  resume" rather than pass '' into a URL-parsing fetch call. */
   transactionUri?: string;
   scope: string;
   authorizationDetails: unknown[];

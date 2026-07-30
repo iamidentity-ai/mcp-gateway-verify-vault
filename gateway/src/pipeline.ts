@@ -41,6 +41,9 @@ import {
   pollOAuthMfaStatus,
   exchangeMfaAssertionWithRAR,
   buildPushContext,
+  triggerTransientEmailOtp,
+  submitTransientOtp,
+  maskEmail,
 } from './auth/token-exchange.js';
 import { gateTool } from './policy/tiers.js';
 import { resolveRar, type AuthorizationDetail } from './rar/build-rar.js';
@@ -69,9 +72,15 @@ export interface PipelineCtx {
 }
 
 export interface PushInfo {
-  title: string;
-  message: string;
+  /** Which HITL method parked this transaction. Absent on entries built
+   *  before this field existed — callers should treat a missing method as
+   *  'push' (the only method that existed then). */
+  method?: 'push' | 'email_otp';
+  title?: string;
+  message?: string;
   transactionUri?: string;
+  /** 'email_otp' only — masked destination for display, e.g. "s•••@example.com". */
+  maskedDestination?: string;
 }
 
 /**
@@ -111,7 +120,9 @@ export type PipelineResult =
   | { status: 'pending'; txId: string; pushInfo?: PushInfo }
   | { status: 'denied'; reason: string; killed?: boolean }
   | { status: 'session_killed_suspicious' }
-  | { status: 'error'; error: string };
+  /** attemptsRemaining is set only for error:'otp_invalid' when Verify's
+   *  response reported a retries/attemptsRemaining count. */
+  | { status: 'error'; error: string; attemptsRemaining?: number };
 
 /** Extract the `jti` claim from a JWT without verifying it (display only). */
 function decodeJwtJti(token: string): string | undefined {
@@ -138,6 +149,8 @@ export interface RunPipelineDeps {
   exchangeToken?: typeof exchangeToken;
   triggerOAuthMfaPush?: typeof triggerOAuthMfaPush;
   buildPushContext?: typeof buildPushContext;
+  /** transient_email HITL mode only — see hitlMethod below. */
+  triggerTransientEmailOtp?: typeof triggerTransientEmailOtp;
   mintCred?: typeof mintCred;
   callUpstreamTool?: typeof callUpstreamTool;
   revokeLease?: typeof revokeLease;
@@ -159,6 +172,16 @@ export interface RunPipelineDeps {
    * unset env stays DB-backed (still mints a scoped, ephemeral Vault cred).
    */
   dbBacked?: boolean;
+  /**
+   * Which HITL method to use when Token Exchange returns mfa_challenge.
+   * 'push' (default) is the original triggerOAuthMfaPush flow — zero
+   * behavior change for existing deployments with HITL_METHOD unset.
+   * 'transient_email' is for populations with no enrolled Verify factor
+   * (Entra-anchored users JIT'd into the tenant): it mails a one-shot code
+   * to the introspected user's email instead of pushing to a phone. Read
+   * from env at module load, same pattern as dbBacked above.
+   */
+  hitlMethod?: 'push' | 'transient_email';
 }
 
 const defaultRunPipelineDeps: Required<RunPipelineDeps> = {
@@ -169,6 +192,7 @@ const defaultRunPipelineDeps: Required<RunPipelineDeps> = {
   exchangeToken,
   triggerOAuthMfaPush,
   buildPushContext,
+  triggerTransientEmailOtp,
   mintCred,
   callUpstreamTool,
   revokeLease,
@@ -178,6 +202,7 @@ const defaultRunPipelineDeps: Required<RunPipelineDeps> = {
   genTxId: () => randomUUID(),
   now: () => Date.now(),
   dbBacked: process.env['UPSTREAM_DB_BACKED'] !== 'false',
+  hitlMethod: process.env['HITL_METHOD'] === 'transient_email' ? 'transient_email' : 'push',
 };
 
 /**
@@ -386,6 +411,69 @@ async function runExchangeAndCall(
 
   if (exchangeResult.status === 'mfa_challenge') {
     const txId = d.genTxId();
+
+    // ── transient_email HITL mode ─────────────────────────────────────
+    // Entra-anchored users JIT'd into the tenant have no enrolled Verify
+    // push factor (triggerOAuthMfaPush would 500 with mfa_no_factor) — mail
+    // a one-shot code to the user's introspected email instead. The
+    // destination is NEVER hardcoded or caller-supplied; it comes from
+    // Token Exchange's own introspection result the same way push resolves
+    // the user's factor from the challenge token.
+    if (d.hitlMethod === 'transient_email') {
+      if (!userEmail) {
+        if (!suppressAudit) {
+          d.appendAudit({
+            ts: d.now(),
+            userId: verifyUserId,
+            tool: ctx.toolName,
+            tier: gate.tier,
+            authorizationDetails,
+            decision: 'exchange_error',
+          });
+        }
+        return { result: { status: 'error', error: 'mfa_no_email' }, authorizationDetails };
+      }
+
+      // Best-effort, same rationale as the push trigger below: if sending
+      // the code itself fails, still park the pending ctx (transactionUri
+      // left undefined) so the caller sees 'pending' rather than a hard
+      // error — completePending's no-poll-URL guard turns that into a
+      // clear otp_init_failed instead of crashing.
+      let transactionUri: string | undefined;
+      try {
+        const txn = await d.triggerTransientEmailOtp(exchangeResult.challengeToken, userEmail);
+        transactionUri = txn.transactionUri;
+      } catch (err) {
+        console.warn('[pipeline] triggerTransientEmailOtp failed (parking pending anyway):', (err as Error).message);
+      }
+
+      const pendingCtx: PendingCtx = {
+        verifyUserId,
+        email: userEmail,
+        challengeToken: exchangeResult.challengeToken,
+        hitlMethod: 'email_otp',
+        transactionUri,
+        scope: gate.scope,
+        authorizationDetails,
+        toolName: ctx.toolName,
+        credsPath,
+        startedAt,
+        args: ctx.args,
+        senderConstrained: ctx.senderConstrained,
+      };
+      d.putPending(txId, pendingCtx);
+
+      return {
+        result: {
+          status: 'pending',
+          txId,
+          pushInfo: { method: 'email_otp', maskedDestination: maskEmail(userEmail) },
+        },
+        authorizationDetails,
+      };
+    }
+
+    // ── push HITL mode (default) ────────────────────────────────────────
     const pushContext = d.buildPushContext(authorizationDetails);
 
     // Kick the push now so the pending record already carries a
@@ -404,6 +492,7 @@ async function runExchangeAndCall(
       verifyUserId,
       email: userEmail,
       challengeToken: exchangeResult.challengeToken,
+      hitlMethod: 'push',
       transactionUri,
       scope: gate.scope,
       authorizationDetails,
@@ -416,7 +505,7 @@ async function runExchangeAndCall(
     d.putPending(txId, pendingCtx);
 
     return {
-      result: { status: 'pending', txId, pushInfo: { ...pushContext, transactionUri } },
+      result: { status: 'pending', txId, pushInfo: { method: 'push', ...pushContext, transactionUri } },
       authorizationDetails,
     };
   }
@@ -516,6 +605,10 @@ export interface CompletePendingDeps {
   takePending?: typeof takePending;
   gateTool?: typeof gateTool;
   pollOAuthMfaStatus?: typeof pollOAuthMfaStatus;
+  /** transient_email HITL mode only — verifies the caller-supplied otp
+   *  against the pending ctx's transactionUri (the transient-verification
+   *  submit URL). Not used on the push path. */
+  submitTransientOtp?: typeof submitTransientOtp;
   /** Exchange-app client secret via the secrets seam (env | vault). */
   getExchangeClientSecret?: typeof getExchangeClientSecret;
   invalidateExchangeSecret?: typeof invalidateExchangeSecret;
@@ -540,6 +633,7 @@ const defaultCompletePendingDeps: Required<CompletePendingDeps> = {
   takePending,
   gateTool,
   pollOAuthMfaStatus,
+  submitTransientOtp,
   getExchangeClientSecret,
   invalidateExchangeSecret,
   exchangeMfaAssertionWithRAR,
@@ -595,11 +689,18 @@ function isStaleSecretResult(result: { error: string; errorDescription?: string 
  * one-shot completion — and strictly BEFORE pollOAuthMfaStatus /
  * recordDeny / markKilled / emitSessionRevoked / the deny counter are ever
  * touched.
+ *
+ * `otp` is REQUIRED when the parked transaction's hitlMethod is 'email_otp'
+ * (transient_email HITL mode) — validated off the same non-destructive peek,
+ * BEFORE takePending, so a caller who simply omitted the field doesn't burn
+ * the one-shot pending entry. It is ignored for 'push' transactions (the
+ * push path has no code to submit).
  */
 export async function completePending(
   txId: string,
   callerVerifyUserId: string | undefined,
   deps: CompletePendingDeps = {},
+  otp?: string,
 ): Promise<PipelineResult> {
   const d: Required<CompletePendingDeps> = { ...defaultCompletePendingDeps, ...deps };
   const startedAt = d.now();
@@ -623,6 +724,14 @@ export async function completePending(
     return { status: 'error', error: 'session_killed' };
   }
 
+  // Back-compat: entries parked before hitlMethod existed have no field —
+  // treat as 'push' (the only method that existed then).
+  const hitlMethod = peeked.hitlMethod ?? 'push';
+
+  if (hitlMethod === 'email_otp' && !otp) {
+    return { status: 'error', error: 'otp_required' };
+  }
+
   const ctx = d.takePending(txId);
   if (!ctx) {
     // Expired in the (vanishingly small, single-threaded-Node) window
@@ -634,48 +743,98 @@ export async function completePending(
   const gate = d.gateTool(ctx.toolName);
   const authorizationDetails = ctx.authorizationDetails as AuthorizationDetail[];
 
-  const verdict = await d.pollOAuthMfaStatus(ctx.transactionUri ?? '', ctx.challengeToken);
-
-  if (verdict.state === 'denied_suspicious') {
-    await d.emitSessionRevoked({ verifyUserId: ctx.verifyUserId, email: ctx.email, reason: 'suspicious' });
-    d.markKilled(ctx.verifyUserId);
-    d.appendAudit({
-      ts: d.now(),
-      userId: ctx.verifyUserId,
-      tool: ctx.toolName,
-      tier: gate.tier,
-      authorizationDetails,
-      decision: 'suspicious_deny_killed',
-    });
-    return { status: 'session_killed_suspicious' };
+  // Hardening fix: a pending tx whose push/OTP trigger never actually fired
+  // (runExchangeAndCall's best-effort trigger failed, parked anyway so the
+  // caller still sees 'pending') has no transactionUri. This used to fall
+  // straight into pollOAuthMfaStatus('', ...), which threw a raw "Failed to
+  // parse URL from ?returnJwt=true" — a 500 with no actionable diagnostic —
+  // instead of a clean envelope the caller can act on (e.g. retry the
+  // original call to get a fresh mfa_challenge).
+  if (!ctx.transactionUri) {
+    return { status: 'error', error: hitlMethod === 'email_otp' ? 'otp_init_failed' : 'no_poll_url' };
   }
 
-  if (verdict.state === 'denied') {
-    const denyResult = d.recordDeny(ctx.verifyUserId);
-    d.appendAudit({
-      ts: d.now(),
-      userId: ctx.verifyUserId,
-      tool: ctx.toolName,
-      tier: gate.tier,
-      authorizationDetails,
-      decision: 'mfa_deny',
-    });
-    if (denyResult.thresholdReached) {
-      await d.emitSessionRevoked({ verifyUserId: ctx.verifyUserId, email: ctx.email, reason: 'deny_threshold_reached' });
-      d.markKilled(ctx.verifyUserId);
-      return { status: 'denied', reason: verdict.reason, killed: true };
+  let assertion: string;
+
+  if (hitlMethod === 'email_otp') {
+    const otpResult = await d.submitTransientOtp(ctx.transactionUri, otp!, ctx.challengeToken);
+
+    if (otpResult.status === 'otp_invalid') {
+      d.appendAudit({
+        ts: d.now(),
+        userId: ctx.verifyUserId,
+        tool: ctx.toolName,
+        tier: gate.tier,
+        authorizationDetails,
+        decision: 'otp_invalid',
+      });
+      return {
+        status: 'error',
+        error: 'otp_invalid',
+        ...(otpResult.attemptsRemaining !== undefined ? { attemptsRemaining: otpResult.attemptsRemaining } : {}),
+      };
     }
-    return { status: 'denied', reason: verdict.reason };
+    if (otpResult.status === 'otp_expired') {
+      d.appendAudit({
+        ts: d.now(),
+        userId: ctx.verifyUserId,
+        tool: ctx.toolName,
+        tier: gate.tier,
+        authorizationDetails,
+        decision: 'otp_expired',
+      });
+      return { status: 'error', error: 'otp_expired' };
+    }
+    if (otpResult.status === 'error') {
+      return { status: 'error', error: otpResult.error };
+    }
+    assertion = otpResult.assertion;
+  } else {
+    const verdict = await d.pollOAuthMfaStatus(ctx.transactionUri, ctx.challengeToken);
+
+    if (verdict.state === 'denied_suspicious') {
+      await d.emitSessionRevoked({ verifyUserId: ctx.verifyUserId, email: ctx.email, reason: 'suspicious' });
+      d.markKilled(ctx.verifyUserId);
+      d.appendAudit({
+        ts: d.now(),
+        userId: ctx.verifyUserId,
+        tool: ctx.toolName,
+        tier: gate.tier,
+        authorizationDetails,
+        decision: 'suspicious_deny_killed',
+      });
+      return { status: 'session_killed_suspicious' };
+    }
+
+    if (verdict.state === 'denied') {
+      const denyResult = d.recordDeny(ctx.verifyUserId);
+      d.appendAudit({
+        ts: d.now(),
+        userId: ctx.verifyUserId,
+        tool: ctx.toolName,
+        tier: gate.tier,
+        authorizationDetails,
+        decision: 'mfa_deny',
+      });
+      if (denyResult.thresholdReached) {
+        await d.emitSessionRevoked({ verifyUserId: ctx.verifyUserId, email: ctx.email, reason: 'deny_threshold_reached' });
+        d.markKilled(ctx.verifyUserId);
+        return { status: 'denied', reason: verdict.reason, killed: true };
+      }
+      return { status: 'denied', reason: verdict.reason };
+    }
+
+    if (verdict.state === 'timeout') {
+      return { status: 'error', error: 'mfa_timeout' };
+    }
+
+    // verdict.state === 'approved'
+    assertion = verdict.assertion;
   }
 
-  if (verdict.state === 'timeout') {
-    return { status: 'error', error: 'mfa_timeout' };
-  }
-
-  // verdict.state === 'approved'
   let exchangeSecret = await d.getExchangeClientSecret();
   let assertionResult = await d.exchangeMfaAssertionWithRAR(
-    verdict.assertion,
+    assertion,
     ctx.scope,
     authorizationDetails,
     exchangeSecret,
@@ -691,7 +850,7 @@ export async function completePending(
     d.invalidateExchangeSecret();
     exchangeSecret = await d.getExchangeClientSecret();
     assertionResult = await d.exchangeMfaAssertionWithRAR(
-      verdict.assertion,
+      assertion,
       ctx.scope,
       authorizationDetails,
       exchangeSecret,

@@ -38,6 +38,24 @@
  *      once — no sleep, never a global flush. In env mode invalidate is a
  *      no-op (a static env secret does not rotate) so the retry is harmless.
  *
+ * 4. Transient email-OTP HITL mode (HITL_METHOD=transient_email):
+ *      Some populations (e.g. Entra-anchored users JIT'd into the tenant)
+ *      have no enrolled Verify push factor — triggerOAuthMfaPush's
+ *      `/v2.0/factors` lookup comes back empty and the push flow cannot
+ *      fire. Verify offers a "transient" factor that needs no prior
+ *      enrollment: a one-shot 6-digit code mailed to an address, verified
+ *      with no persistent registration. `triggerTransientEmailOtp` sends
+ *      it; `submitTransientOtp` verifies the code the user typed and
+ *      returns the assertion JWT for the same jwt_bearer second leg the
+ *      push path uses. The pipeline layer (pipeline.ts), not this module,
+ *      decides which HITL method to use per HITL_METHOD — this module only
+ *      exposes both primitives. See:
+ *        - feedback_verify_transient_otp_canonical_endpoints (endpoint/body
+ *          shape + alphanumeric `correlation` requirement)
+ *        - feedback_verify_transient_otp_assertion_field_lookup (the
+ *          assertion arrives under a key that varies by tenant/version —
+ *          multi-key lookup, never a single hardcoded field)
+ *
  * The two client secrets are resolved ONLY through auth/secrets.ts — this
  * module never reads GATEWAY_*_CLIENT_SECRET or a Vault role directly, so it
  * is identical whether SECRETS_BACKEND is env or vault.
@@ -52,6 +70,10 @@
  *   GATEWAY_ACTOR_TOKEN_TYPE   — actor_token_type sent for the SPIFFE SVID;
  *                                 must match the custom token type configured
  *                                 on the Verify tenant (default "SPIFFE")
+ *   HITL_METHOD                 — "push" (default) or "transient_email";
+ *                                 read by pipeline.ts, documented here
+ *                                 because it decides which of this module's
+ *                                 HITL primitives get called
  */
 
 import {
@@ -430,6 +452,157 @@ export async function exchangeMfaAssertionWithRAR(
     scope: data.scope,
     authorizationDetails: data.authorization_details,
   };
+}
+
+// ── Transient email OTP (HITL_METHOD=transient_email) ────────
+//
+// Used instead of the push flow when the user has no enrolled Verify
+// factor — the population this exists for is Entra-anchored users JIT'd
+// into the tenant, who were never issued a Verify authenticator. Both
+// functions operate on the SAME mfa_challenge token the push flow uses;
+// the pipeline layer picks one or the other based on HITL_METHOD, never
+// both.
+
+/**
+ * Ask Verify to mail a one-shot 6-digit code to `emailAddress`. Requires no
+ * prior enrollment — that is the whole point.
+ *
+ * Canonical endpoint + body shape (validated against a live tenant —
+ * feedback_verify_transient_otp_canonical_endpoints):
+ *   POST /v2.0/factors/emailotp/transient/verifications
+ *   body: { emailAddress, correlation }        (FLAT — no nested wrapper)
+ *
+ * Bugs this deliberately avoids (all empirically hit before):
+ *   - factor type name is `emailotp`, NOT `transientotpemail` (wrong name
+ *     404s with WebSphere SRVE0295E, not a normal 4xx)
+ *   - URL ends `/transient/verifications`, NOT `/transient`
+ *   - `correlation` MUST be alphanumeric only — a hyphen 400s with
+ *     CSIBN0018E ("correlation is either invalid or missing")
+ */
+export async function triggerTransientEmailOtp(
+  challengeToken: string,
+  emailAddress: string,
+  correlation = 'MCPGW',
+): Promise<{ transactionUri: string; id: string }> {
+  const url = `${VERIFY_TENANT_URL}/v2.0/factors/emailotp/transient/verifications`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${challengeToken}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ emailAddress, correlation }),
+  });
+  if (!res.ok) {
+    throw new Error(`triggerTransientEmailOtp: ${res.status} ${await res.text()}`);
+  }
+  const body = (await res.json()) as Record<string, unknown>;
+  const id = body['id'] as string | undefined;
+  if (!id) {
+    throw new Error(`triggerTransientEmailOtp: response missing id: ${JSON.stringify(body)}`);
+  }
+  // Verify's CREATE response does not always include a fully-qualified
+  // self-link — build the submit URL from the id, same as the push flow
+  // builds its poll URL from transactionUri.
+  return { transactionUri: `${url}/${id}`, id };
+}
+
+/**
+ * Discriminated verdict for submitTransientOtp. A discriminated result
+ * (rather than throwing) lets pipeline.ts map each case to a distinct HTTP
+ * envelope (otp_invalid / otp_expired / generic error) instead of parsing a
+ * thrown Error's message.
+ */
+export type SubmitOtpResult =
+  | { status: 'approved'; assertion: string }
+  | { status: 'otp_invalid'; attemptsRemaining?: number }
+  | { status: 'otp_expired' }
+  | { status: 'error'; error: string };
+
+/**
+ * Submit the code the user typed back. Distinguishes:
+ *   - 401 → wrong code (otp_invalid). If Verify's error body reports a
+ *     `retries` or `attemptsRemaining` count, it's surfaced so the caller
+ *     can tell the user how many tries are left.
+ *   - 400 → the code was already consumed or the verification expired
+ *     (otp_expired) — distinct from "wrong code" so the caller knows to
+ *     request a NEW code rather than let the user retype the same one.
+ *
+ * On success the assertion JWT's field name varies by tenant/factor-type
+ * version (feedback_verify_transient_otp_assertion_field_lookup) — try
+ * `jwt`, `assertion`, `accessToken`, `access_token` in that order, plus the
+ * 204-with-header path, and log the actual response keys on a miss so the
+ * next operator can add a 5th key in a minute instead of debugging for an
+ * hour.
+ */
+export async function submitTransientOtp(
+  transactionUri: string,
+  otp: string,
+  challengeToken: string,
+): Promise<SubmitOtpResult> {
+  const url = transactionUri.includes('?')
+    ? `${transactionUri}&returnJwt=true`
+    : `${transactionUri}?returnJwt=true`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${challengeToken}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ otp }),
+  });
+
+  if (res.status === 401) {
+    let attemptsRemaining: number | undefined;
+    try {
+      const body = JSON.parse(await res.text()) as Record<string, unknown>;
+      const retries = body['retries'] ?? body['attemptsRemaining'];
+      if (typeof retries === 'number') attemptsRemaining = retries;
+    } catch {
+      // Body wasn't JSON or had neither field — leave attemptsRemaining
+      // undefined; the caller still gets a clear otp_invalid.
+    }
+    return { status: 'otp_invalid', attemptsRemaining };
+  }
+  if (res.status === 400) {
+    return { status: 'otp_expired' };
+  }
+  if (!res.ok) {
+    return { status: 'error', error: `submitTransientOtp: ${res.status} ${await res.text()}` };
+  }
+
+  const text = await res.text();
+  if (!text) {
+    // 204 No Content — the assertion (if any) is in a response header.
+    const hdr = res.headers.get('x-jwt') || res.headers.get('jwt') || res.headers.get('assertion');
+    if (hdr) return { status: 'approved', assertion: hdr };
+    return { status: 'error', error: 'submitTransientOtp: 204 No Content with no assertion header' };
+  }
+  const body = JSON.parse(text) as Record<string, unknown>;
+  const assertion = (body['jwt'] ?? body['assertion'] ?? body['accessToken'] ?? body['access_token']) as
+    | string
+    | undefined;
+  if (!assertion) {
+    console.warn('[token-exchange] submitTransientOtp: no assertion in response, keys=', Object.keys(body));
+    return {
+      status: 'error',
+      error: `submitTransientOtp: Verify response missing assertion; keys=${Object.keys(body).join(',')}`,
+    };
+  }
+  return { status: 'approved', assertion };
+}
+
+/**
+ * Mask an email for safe display in a pending-HITL envelope, e.g.
+ * "steve@example.com" -> "s•••@example.com". Never sent anywhere as a
+ * credential — purely a UI hint so the user knows which inbox to check.
+ */
+export function maskEmail(email: string): string {
+  const at = email.indexOf('@');
+  if (at <= 0) return '•••';
+  return `${email[0]}•••@${email.slice(at + 1)}`;
 }
 
 // ── Top-level exchange ───────────────────────────────────────
