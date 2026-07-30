@@ -88,6 +88,37 @@ describe('introspectUser', () => {
 
     expect(result).toEqual({ active: true, verifyUserId: undefined, email: undefined });
   });
+
+  // ── preferred_username (transient_email HITL fallback source) ─────────
+  it('surfaces preferred_username from the userinfo body alongside email', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      jsonResponse({ sub: 'u1', email: 'agent@example.com', preferred_username: 'agent@example.com' }),
+    );
+
+    const result = await introspectUser('tok', { fetchImpl: fetchMock, tenantUrl: 'https://verify.test' });
+
+    expect(result).toEqual({
+      active: true,
+      verifyUserId: 'u1',
+      email: 'agent@example.com',
+      preferredUsername: 'agent@example.com',
+    });
+  });
+
+  it('surfaces preferred_username even when email is entirely absent from the body (the STS-custom-token-type case)', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      jsonResponse({ sub: '6430083FU5', preferred_username: 'operator@example.com' }),
+    );
+
+    const result = await introspectUser('tok', { fetchImpl: fetchMock, tenantUrl: 'https://verify.test' });
+
+    expect(result).toEqual({
+      active: true,
+      verifyUserId: '6430083FU5',
+      email: undefined,
+      preferredUsername: 'operator@example.com',
+    });
+  });
 });
 
 // ── Positive-only introspection cache (perf: 1 fewer /userinfo hop per call) ──

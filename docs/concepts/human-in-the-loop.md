@@ -60,6 +60,12 @@ resolved the same way `triggerOAuthMfaPush` resolves the user's factor, off the 
 Exchange already authenticated). The sequencing mirrors the push flow exactly, with different
 primitives:
 
+The destination comes from `/oauth2/userinfo`'s `email` claim - but some STS custom token types
+(Okta, and Entra with certain claim mappings) emit no `email` claim at all. When that happens,
+`pipeline.ts` falls back to `preferred_username`, and only if it looks like an email address
+(contains `@`) - a UPN-shaped `preferred_username` with no `@` is never treated as a delivery
+address. `mfa_no_email` means both sources came up empty, not just `email` specifically.
+
 - **`triggerTransientEmailOtp()`** - `POST /v2.0/factors/emailotp/transient/verifications` with the
   resolved email. Needs no prior enrollment - that's the whole point.
 - The pending envelope's `pushInfo` becomes `{ method: 'email_otp', maskedDestination: 's•••@example.com' }`

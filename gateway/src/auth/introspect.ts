@@ -38,6 +38,13 @@ export interface IntrospectResult {
   active: boolean;
   verifyUserId?: string;
   email?: string;
+  /** `preferred_username` from the userinfo body. Some STS custom token
+   *  types (Okta, and Entra with certain claim mappings) emit NO `email`
+   *  claim at all — pipeline.ts falls back to this (only when it looks like
+   *  an email address) to resolve a transient_email HITL destination. See
+   *  mcp-refund-okta-verify-vault's token-exchange.ts selectTransientOtpChannel
+   *  for the proven pattern this mirrors. */
+  preferredUsername?: string;
 }
 
 export interface IntrospectDeps {
@@ -115,6 +122,7 @@ export async function introspectUser(token: string, deps: IntrospectDeps = {}): 
       active: true,
       verifyUserId: typeof data['sub'] === 'string' ? (data['sub'] as string) : undefined,
       email: typeof data['email'] === 'string' ? (data['email'] as string) : undefined,
+      preferredUsername: typeof data['preferred_username'] === 'string' ? (data['preferred_username'] as string) : undefined,
     };
     if (ttlMs > 0) cachePut(key, result, now, ttlMs, token);
     return result;

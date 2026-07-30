@@ -790,6 +790,93 @@ describe('runPipeline', () => {
       expect(deps.putPending).not.toHaveBeenCalled();
     });
 
+    // ── Live finding (2026-07-30): some STS custom token types (Okta, and
+    // Entra with certain claim mappings) emit NO `email` claim at all —
+    // /oauth2/userinfo then has nothing under `email` even though the token
+    // DOES carry `preferred_username`. userEmail's resolution in
+    // runPipeline falls back to preferred_username, but only when it's
+    // email-shaped (contains '@') — proven pattern from
+    // mcp-refund-okta-verify-vault's selectTransientOtpChannel.
+    describe('userEmail resolution: email claim vs. preferred_username fallback', () => {
+      it('email claim present -> wins outright, preferred_username is never consulted even if also present', async () => {
+        const { deps } = makeRunDeps({
+          introspectUser: async () => ({
+            active: true,
+            verifyUserId: 'user-1',
+            email: 'real-email@example.com',
+            preferredUsername: 'different-value-not-an-email',
+          }),
+          gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),
+          exchangeToken: async () => ({ status: 'mfa_challenge' as const, challengeToken: 'challenge-xyz' }),
+          hitlMethod: 'transient_email' as const,
+          triggerTransientEmailOtp: async () => ({
+            transactionUri: 'https://verify.test/v2.0/factors/emailotp/transient/verifications/verif-1',
+            id: 'verif-1',
+          }),
+        });
+
+        const result = await runPipeline(
+          { userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1' } },
+          deps as any,
+        );
+
+        expect(result.status).toBe('pending');
+        expect(deps.triggerTransientEmailOtp).toHaveBeenCalledWith('challenge-xyz', 'real-email@example.com');
+      });
+
+      it('no email claim, preferred_username IS email-shaped -> falls back to preferred_username (the live-found gap this fixes)', async () => {
+        const { deps } = makeRunDeps({
+          introspectUser: async () => ({
+            active: true,
+            verifyUserId: '6430083FU5',
+            // no `email` field at all — the STS custom token type case
+            preferredUsername: 'operator@example.com',
+          }),
+          gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),
+          exchangeToken: async () => ({ status: 'mfa_challenge' as const, challengeToken: 'challenge-xyz' }),
+          hitlMethod: 'transient_email' as const,
+          triggerTransientEmailOtp: async () => ({
+            transactionUri: 'https://verify.test/v2.0/factors/emailotp/transient/verifications/verif-1',
+            id: 'verif-1',
+          }),
+        });
+
+        const result = await runPipeline(
+          { userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1' } },
+          deps as any,
+        );
+
+        expect(result.status).toBe('pending');
+        expect(deps.triggerTransientEmailOtp).toHaveBeenCalledWith(
+          'challenge-xyz',
+          'operator@example.com',
+        );
+        if (result.status !== 'pending') throw new Error('expected pending');
+        expect(result.pushInfo).toEqual({ method: 'email_otp', maskedDestination: 'o•••@example.com' });
+      });
+
+      it('no email claim, preferred_username is NOT email-shaped (no "@") -> still mfa_no_email, never sent as a destination', async () => {
+        const { deps, calls } = makeRunDeps({
+          introspectUser: async () => ({
+            active: true,
+            verifyUserId: 'user-1',
+            preferredUsername: 'not-an-email-just-a-upn',
+          }),
+          gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),
+          exchangeToken: async () => ({ status: 'mfa_challenge' as const, challengeToken: 'challenge-xyz' }),
+          hitlMethod: 'transient_email' as const,
+        });
+
+        const result = await runPipeline(
+          { userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1' } },
+          deps as any,
+        );
+
+        expect(result).toEqual({ status: 'error', error: 'mfa_no_email' });
+        expect(calls).not.toContain('triggerTransientEmailOtp');
+      });
+    });
+
     it('hitlMethod:"transient_email": triggerTransientEmailOtp failure still PARKS the pending tx (best-effort, mirrors the push trigger-failure behavior) with transactionUri left undefined', async () => {
       const { deps } = makeRunDeps({
         gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),

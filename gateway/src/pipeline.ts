@@ -272,7 +272,20 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
     return { status: 'error', error: 'inactive_session' };
   }
   const verifyUserId = introspection.verifyUserId ?? '';
-  const userEmail = introspection.email;
+  // Some STS custom token types (Okta, and Entra with certain claim
+  // mappings) emit NO `email` claim at all — /oauth2/userinfo then has
+  // nothing under `email` even though the token DOES carry
+  // `preferred_username` (often the same address, e.g.
+  // "operator@example.com"). Fall back to it, but ONLY when it looks like
+  // an email (contains '@') — a UPN-shaped preferred_username with no '@'
+  // must NOT be treated as a delivery address. Live-found: a
+  // transient_email HITL deployment returned mfa_no_email for an identity
+  // that plainly had a deliverable address, just not under the `email`
+  // claim. Proven pattern: the same fallback used in the portfolio's Okta-
+  // fronted token-exchange variant's selectTransientOtpChannel.
+  const userEmail =
+    introspection.email ??
+    (introspection.preferredUsername?.includes('@') ? introspection.preferredUsername : undefined);
 
   // Step 0: local kill-gate, BEFORE any gate/exchange work. Covers the
   // 30-75s Antenna -> Verify session-revoke propagation window.
@@ -418,7 +431,11 @@ async function runExchangeAndCall(
     // a one-shot code to the user's introspected email instead. The
     // destination is NEVER hardcoded or caller-supplied; it comes from
     // Token Exchange's own introspection result the same way push resolves
-    // the user's factor from the challenge token.
+    // the user's factor from the challenge token — `userEmail` above
+    // already folds in the `email`-claim-missing fallback to
+    // `preferred_username`, so mfa_no_email below means BOTH sources came
+    // up empty (or preferred_username wasn't email-shaped), not just that
+    // one specific claim was absent.
     if (d.hitlMethod === 'transient_email') {
       if (!userEmail) {
         if (!suppressAudit) {
