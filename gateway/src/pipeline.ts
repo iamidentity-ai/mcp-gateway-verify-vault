@@ -135,6 +135,86 @@ export type PipelineResult =
    *  response reported a retries/attemptsRemaining count. */
   | { status: 'error'; error: string; attemptsRemaining?: number };
 
+// ── GATEWAY_NARRATE: one readable line per call ───────────────
+//
+// A demo/operations affordance in the same spirit as GATEWAY_DEBUG_OBO above,
+// and gated the same way — DEFAULT OFF, opt in with GATEWAY_NARRATE=true.
+// When off, this module logs exactly what it always did (nothing per-request):
+// narrate() returns before touching console, so stdout is byte-identical.
+//
+// When on, every tool call emits ONE line summarizing the whole chain — who
+// called, which tool, its tier, the RAR action, what Token Exchange said
+// (including mfa_challenge and Verify policy denies), the Vault lease that got
+// minted, and whether the post-call revoke succeeded — so `tail -F` on the
+// gateway's log is legible on a projector while the pipeline runs.
+//
+// HARD RULE: this line NEVER carries a live credential. No OBO, no ephemeral DB
+// password, no client secret, no MFA challenge token, no OTP. `oboJti` and the
+// Vault `lease_id` are non-secret correlation ids and are the ONLY token-shaped
+// values allowed here. The whole thesis of this gateway is that credentials
+// stay out of view — a narration mode that leaked one would refute it.
+//
+// Unlike GATEWAY_DEBUG_OBO (which puts a replayable token in an HTTP response
+// body and must never be enabled outside localhost), this flag only writes
+// non-secret metadata to the gateway's own log. It is still off by default:
+// per-call logging is a demo/debug posture, and the caller identity it prints
+// is PII you should not emit into a shipped deployment's logs by accident.
+const NARRATE_PREFIX = '[gateway:narrate]';
+
+/** Non-secret facts a single tool call accumulates, rendered by narrate(). */
+export interface NarrateFacts {
+  /** Terminal PipelineResult status: ok | pending | denied | error | killed. */
+  outcome: string;
+  tool: string;
+  /** Caller identity — the introspected email when there is one, else the
+   *  Verify user id. Never a token. */
+  user?: string;
+  tier?: number;
+  /** RFC 9396 action the RAR was built for (gate.rarAction). */
+  rar?: string;
+  /** Token Exchange verdict: ok | mfa_challenge | denied:<code> | error:<code>. */
+  exchange?: string;
+  /** Gateway-derived step-up marker: 'discovery' | 'elevated' | 'resumed'. */
+  stepUp?: string;
+  /** Vault lease id — a correlation id, NOT the credential it leased. */
+  lease?: string;
+  /** revokeLease outcome. Printed verbatim; `false` is a real signal. */
+  revoked?: boolean;
+  /** OBO jti — correlation id, not the token. */
+  jti?: string;
+  /** HITL transaction id for a parked step-up. */
+  tx?: string;
+  latencyMs?: number;
+}
+
+/** True when narration is enabled. Read per-call (not cached at module load)
+ *  so a test can toggle the env var the same way the GATEWAY_DEBUG_OBO
+ *  branches above are exercised. */
+function narrateEnabled(): boolean {
+  return process.env['GATEWAY_NARRATE'] === 'true';
+}
+
+/**
+ * Emit the one-line-per-call narration. No-op unless GATEWAY_NARRATE=true.
+ * Fields are printed in a fixed order and omitted when absent, so the lines
+ * column-align well enough to read while scrolling.
+ */
+function narrate(f: NarrateFacts): void {
+  if (!narrateEnabled()) return;
+  const parts = [NARRATE_PREFIX, f.outcome.toUpperCase(), `tool=${f.tool}`];
+  if (f.user) parts.push(`user=${f.user}`);
+  if (f.tier !== undefined) parts.push(`tier=${f.tier}`);
+  if (f.rar) parts.push(`rar=${f.rar}`);
+  if (f.exchange) parts.push(`exchange=${f.exchange}`);
+  if (f.stepUp) parts.push(`stepup=${f.stepUp}`);
+  if (f.lease) parts.push(`lease=${f.lease}`);
+  if (f.revoked !== undefined) parts.push(`revoked=${f.revoked}`);
+  if (f.jti) parts.push(`jti=${f.jti}`);
+  if (f.tx) parts.push(`tx=${f.tx}`);
+  if (f.latencyMs !== undefined) parts.push(`${f.latencyMs}ms`);
+  console.log(parts.join(' '));
+}
+
 /** Extract the `jti` claim from a JWT without verifying it (display only). */
 function decodeJwtJti(token: string): string | undefined {
   const parts = token.split('.');
@@ -280,6 +360,7 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
   // can give us.
   const introspection = await d.introspectUser(ctx.userToken);
   if (!introspection.active) {
+    narrate({ outcome: 'error', tool: ctx.toolName, exchange: 'error:inactive_session', latencyMs: d.now() - startedAt });
     return { status: 'error', error: 'inactive_session' };
   }
   const verifyUserId = introspection.verifyUserId ?? '';
@@ -301,6 +382,10 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
   // Step 0: local kill-gate, BEFORE any gate/exchange work. Covers the
   // 30-75s Antenna -> Verify session-revoke propagation window.
   if (d.isSessionKilled(verifyUserId)) {
+    narrate({
+      outcome: 'error', tool: ctx.toolName, ...(userEmail || verifyUserId ? { user: userEmail || verifyUserId } : {}),
+      exchange: 'error:session_killed', latencyMs: d.now() - startedAt,
+    });
     return { status: 'error', error: 'session_killed' };
   }
 
@@ -313,6 +398,10 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
       tool: ctx.toolName,
       tier: gate.tier,
       decision: gate.reason === 'policy_deny' ? 'tier4_deny' : 'unknown_tool_deny',
+    });
+    narrate({
+      outcome: 'denied', tool: ctx.toolName, ...(userEmail || verifyUserId ? { user: userEmail || verifyUserId } : {}),
+      tier: gate.tier, exchange: `denied:${gate.reason ?? 'policy_deny'}`, latencyMs: d.now() - startedAt,
     });
     return { status: 'denied', reason: gate.reason ?? 'policy_deny' };
   }
@@ -341,7 +430,12 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
       : { ...ctx, toolName: probeTool, args: { [rarConfig.argIdKey]: ctx.args[rarConfig.argIdKey] } };
     const probeGate = probeIsDelivery ? gate : d.gateTool(probeTool);
     const probe = await runExchangeAndCall({ ctx: probeCtx, gate: probeGate, verifyUserId, userEmail, startedAt, elevated: false, suppressAudit: true }, d);
-    if (probe.result.status !== 'ok') return probe.result;
+    if (probe.result.status !== 'ok') {
+      // The probe failed — that IS this inbound call's outcome. Narrate once,
+      // marked as the discovery leg so the line is not mistaken for a delivery.
+      narrate({ ...probe.facts, tool: ctx.toolName, stepUp: 'discovery', latencyMs: d.now() - startedAt });
+      return probe.result;
+    }
     // NB: probe.result.data is the MCP CallToolResult envelope in production —
     // shouldStepUp unwraps content[0].text before evaluating elevateWhen.
     const elevate = shouldStepUp(probe.result.data);
@@ -356,12 +450,14 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
           leaseId: probe.leaseId, oboJti: probe.result.diag?.oboJti,
           latencyMs: d.now() - startedAt,
         });
+        narrate({ ...probe.facts, latencyMs: d.now() - startedAt });
         return probe.result;
       }
       // detail/history on a public record — the probe only told us it is not
       // restricted; run the ACTUAL requested tool with the standard RAR. That
       // call (suppressAudit:false) audits its own 'ok' result.
       const delivered = await runExchangeAndCall({ ctx, gate, verifyUserId, userEmail, startedAt, elevated: false, suppressAudit: false }, d);
+      narrate({ ...delivered.facts, latencyMs: d.now() - startedAt });
       return delivered.result;
     }
 
@@ -374,6 +470,7 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
       leaseId: probe.leaseId, oboJti: probe.result.diag?.oboJti,
     });
     const elevated = await runExchangeAndCall({ ctx, gate, verifyUserId, userEmail, startedAt, elevated: true, suppressAudit: false }, d);
+    narrate({ ...elevated.facts, stepUp: 'elevated', latencyMs: d.now() - startedAt });
     return elevated.result;
   }
 
@@ -386,6 +483,7 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
     { ctx, gate, verifyUserId, userEmail, startedAt, elevated: false, suppressAudit: false },
     d,
   );
+  narrate({ ...normal.facts, latencyMs: d.now() - startedAt });
   return normal.result;
 }
 
@@ -415,8 +513,25 @@ async function runExchangeAndCall(
     suppressAudit: boolean;
   },
   d: Required<RunPipelineDeps>,
-): Promise<{ result: PipelineResult; authorizationDetails: AuthorizationDetail[]; leaseId?: string }> {
+): Promise<{
+  result: PipelineResult;
+  authorizationDetails: AuthorizationDetail[];
+  leaseId?: string;
+  /** Non-secret narration facts accumulated by this leg. runPipeline (the
+   *  choke point) renders them — this function never prints, so a
+   *  discovery-probe leg cannot emit a second line for one inbound call. */
+  facts: NarrateFacts;
+}> {
   const { ctx, gate, verifyUserId, userEmail, startedAt, elevated, suppressAudit } = params;
+
+  // Narration accumulator — non-secret metadata only (see narrate() above).
+  const facts: NarrateFacts = {
+    outcome: 'error',
+    tool: ctx.toolName,
+    ...(userEmail || verifyUserId ? { user: userEmail || verifyUserId } : {}),
+    tier: gate.tier,
+    ...(gate.rarAction ? { rar: gate.rarAction } : {}),
+  };
 
   const { authorizationDetails, credsPath }: { authorizationDetails: AuthorizationDetail[]; credsPath: string | undefined } =
     d.resolveRar({
@@ -435,6 +550,8 @@ async function runExchangeAndCall(
 
   if (exchangeResult.status === 'mfa_challenge') {
     const txId = d.genTxId();
+    facts.exchange = 'mfa_challenge';
+    facts.tx = txId;
 
     // ── transient_email HITL mode ─────────────────────────────────────
     // Entra-anchored users JIT'd into the tenant have no enrolled Verify
@@ -459,7 +576,9 @@ async function runExchangeAndCall(
             decision: 'exchange_error',
           });
         }
-        return { result: { status: 'error', error: 'mfa_no_email' }, authorizationDetails };
+        facts.outcome = 'error';
+        facts.exchange = 'error:mfa_no_email';
+        return { result: { status: 'error', error: 'mfa_no_email' }, authorizationDetails, facts };
       }
 
       // Best-effort, same rationale as the push trigger below: if sending
@@ -491,6 +610,7 @@ async function runExchangeAndCall(
       };
       d.putPending(txId, pendingCtx);
 
+      facts.outcome = 'pending';
       return {
         result: {
           status: 'pending',
@@ -498,6 +618,7 @@ async function runExchangeAndCall(
           pushInfo: { method: 'email_otp', maskedDestination: maskEmail(userEmail) },
         },
         authorizationDetails,
+        facts,
       };
     }
 
@@ -532,9 +653,11 @@ async function runExchangeAndCall(
     };
     d.putPending(txId, pendingCtx);
 
+    facts.outcome = 'pending';
     return {
       result: { status: 'pending', txId, pushInfo: { method: 'push', ...pushContext, transactionUri } },
       authorizationDetails,
+      facts,
     };
   }
 
@@ -560,10 +683,14 @@ async function runExchangeAndCall(
         decision: exchangeResult.error === 'access_denied' ? 'exchange_denied' : 'exchange_error',
       });
     }
-    return { result: { status: 'error', error: exchangeResult.error }, authorizationDetails };
+    facts.outcome = 'error';
+    facts.exchange =
+      exchangeResult.error === 'access_denied' ? 'denied:access_denied' : `error:${exchangeResult.error}`;
+    return { result: { status: 'error', error: exchangeResult.error }, authorizationDetails, facts };
   }
 
   const obo = exchangeResult.accessToken;
+  facts.exchange = 'ok';
 
   // DB-backed (default): mint an ephemeral verify-rar Postgres credential, hand
   // it to the upstream as X-DB-*, and revoke the lease after the one call (the
@@ -581,6 +708,7 @@ async function runExchangeAndCall(
     // credsPath is guaranteed present in DB-backed mode — the rar-config parse
     // requires it on every non-blocked action when UPSTREAM_DB_BACKED !== 'false'.
     cred = await d.mintCred({ obo, authorizationDetails, credsPath: credsPath! });
+    facts.lease = cred.leaseId;
     try {
       data = await d.callUpstreamTool({
         name: ctx.toolName,
@@ -591,7 +719,10 @@ async function runExchangeAndCall(
       });
     } finally {
       const revoked = await d.revokeLease(cred.leaseId, obo);
-      if (typeof revoked === 'boolean') credRevoked = revoked;
+      if (typeof revoked === 'boolean') {
+        credRevoked = revoked;
+        facts.revoked = revoked;
+      }
     }
   } else {
     data = await d.callUpstreamTool({ name: ctx.toolName, arguments: ctx.args, obo });
@@ -630,7 +761,10 @@ async function runExchangeAndCall(
     }
   }
 
-  return { result: { status: 'ok', data, diag }, authorizationDetails, leaseId: cred?.leaseId };
+  facts.outcome = 'ok';
+  if (diag.oboJti) facts.jti = diag.oboJti;
+
+  return { result: { status: 'ok', data, diag }, authorizationDetails, leaseId: cred?.leaseId, facts };
 }
 
 // ── completePending deps ─────────────────────────────────────
@@ -742,10 +876,12 @@ export async function completePending(
 
   const peeked = d.peekPending(txId);
   if (!peeked) {
+    narrate({ outcome: 'error', tool: 'complete_hitl', stepUp: 'resumed', tx: txId, exchange: 'error:unknown_or_expired_tx' });
     return { status: 'error', error: 'unknown_or_expired_tx' };
   }
 
   if (!callerVerifyUserId || callerVerifyUserId !== peeked.verifyUserId) {
+    narrate({ outcome: 'error', tool: peeked.toolName, stepUp: 'resumed', tx: txId, exchange: 'error:forbidden' });
     return { status: 'error', error: 'forbidden' };
   }
 
@@ -756,6 +892,7 @@ export async function completePending(
   // this parked tx, mint fresh Vault creds, and return the withheld data. Check
   // the tx OWNER's verifyUserId (== the identity-bound caller) before takePending.
   if (d.isSessionKilled(peeked.verifyUserId)) {
+    narrate({ outcome: 'error', tool: peeked.toolName, user: peeked.email ?? peeked.verifyUserId, stepUp: 'resumed', tx: txId, exchange: 'error:session_killed' });
     return { status: 'error', error: 'session_killed' };
   }
 
@@ -764,6 +901,7 @@ export async function completePending(
   const hitlMethod = peeked.hitlMethod ?? 'push';
 
   if (hitlMethod === 'email_otp' && !otp) {
+    narrate({ outcome: 'error', tool: peeked.toolName, user: peeked.email ?? peeked.verifyUserId, stepUp: 'resumed', tx: txId, exchange: 'error:otp_required' });
     return { status: 'error', error: 'otp_required' };
   }
 
@@ -771,12 +909,30 @@ export async function completePending(
   if (!ctx) {
     // Expired in the (vanishingly small, single-threaded-Node) window
     // between peek and take — treat exactly like a normal expiry.
+    narrate({ outcome: 'error', tool: peeked.toolName, stepUp: 'resumed', tx: txId, exchange: 'error:unknown_or_expired_tx' });
     return { status: 'error', error: 'unknown_or_expired_tx' };
   }
 
   const args = ctx.args;
   const gate = d.gateTool(ctx.toolName);
   const authorizationDetails = ctx.authorizationDetails as AuthorizationDetail[];
+
+  // Narration accumulator for the resumed leg — same non-secret contract as
+  // runExchangeAndCall's. `stepUp: 'resumed'` is what distinguishes this line
+  // from the original call's `pending` line carrying the same tx id.
+  const facts: NarrateFacts = {
+    outcome: 'error',
+    tool: ctx.toolName,
+    ...(ctx.email || ctx.verifyUserId ? { user: ctx.email || ctx.verifyUserId } : {}),
+    tier: gate.tier,
+    ...(gate.rarAction ? { rar: gate.rarAction } : {}),
+    stepUp: 'resumed',
+    tx: txId,
+  };
+  /** Render `facts` with the terminal outcome + this leg's elapsed time. */
+  const narrateFinish = (outcome: string, exchange?: string): void => {
+    narrate({ ...facts, outcome, ...(exchange ? { exchange } : {}), latencyMs: d.now() - startedAt });
+  };
 
   // Hardening fix: a pending tx whose push/OTP trigger never actually fired
   // (runExchangeAndCall's best-effort trigger failed, parked anyway so the
@@ -786,7 +942,9 @@ export async function completePending(
   // instead of a clean envelope the caller can act on (e.g. retry the
   // original call to get a fresh mfa_challenge).
   if (!ctx.transactionUri) {
-    return { status: 'error', error: hitlMethod === 'email_otp' ? 'otp_init_failed' : 'no_poll_url' };
+    const err = hitlMethod === 'email_otp' ? 'otp_init_failed' : 'no_poll_url';
+    narrateFinish('error', `error:${err}`);
+    return { status: 'error', error: err };
   }
 
   let assertion: string;
@@ -803,6 +961,7 @@ export async function completePending(
         authorizationDetails,
         decision: 'otp_invalid',
       });
+      narrateFinish('error', 'error:otp_invalid');
       return {
         status: 'error',
         error: 'otp_invalid',
@@ -818,9 +977,11 @@ export async function completePending(
         authorizationDetails,
         decision: 'otp_expired',
       });
+      narrateFinish('error', 'error:otp_expired');
       return { status: 'error', error: 'otp_expired' };
     }
     if (otpResult.status === 'error') {
+      narrateFinish('error', `error:${otpResult.error}`);
       return { status: 'error', error: otpResult.error };
     }
     assertion = otpResult.assertion;
@@ -838,6 +999,7 @@ export async function completePending(
         authorizationDetails,
         decision: 'suspicious_deny_killed',
       });
+      narrateFinish('killed', 'denied:suspicious');
       return { status: 'session_killed_suspicious' };
     }
 
@@ -854,12 +1016,15 @@ export async function completePending(
       if (denyResult.thresholdReached) {
         await d.emitSessionRevoked({ verifyUserId: ctx.verifyUserId, email: ctx.email, reason: 'deny_threshold_reached' });
         d.markKilled(ctx.verifyUserId);
+        narrateFinish('denied', 'denied:deny_threshold_reached');
         return { status: 'denied', reason: verdict.reason, killed: true };
       }
+      narrateFinish('denied', `denied:${verdict.reason ?? 'mfa_deny'}`);
       return { status: 'denied', reason: verdict.reason };
     }
 
     if (verdict.state === 'timeout') {
+      narrateFinish('error', 'error:mfa_timeout');
       return { status: 'error', error: 'mfa_timeout' };
     }
 
@@ -893,12 +1058,12 @@ export async function completePending(
   }
 
   if (assertionResult.status !== 'ok') {
-    return {
-      status: 'error',
-      error: assertionResult.status === 'error' ? assertionResult.error : 'jwt_bearer_failed',
-    };
+    const err = assertionResult.status === 'error' ? assertionResult.error : 'jwt_bearer_failed';
+    narrateFinish('error', `error:${err}`);
+    return { status: 'error', error: err };
   }
   const obo = assertionResult.accessToken;
+  facts.exchange = 'ok:jwt_bearer';
 
   // Same DB-backed vs NO-DB branch as runExchangeAndCall — a stepped-up call to
   // a non-database upstream (UPSTREAM_DB_BACKED=false) skips the mint/revoke leg
@@ -912,6 +1077,7 @@ export async function completePending(
   let credRevoked: boolean | undefined;
   if (d.dbBacked) {
     cred = await d.mintCred({ obo, authorizationDetails, credsPath: ctx.credsPath! });
+    facts.lease = cred.leaseId;
     try {
       data = await d.callUpstreamTool({
         name: ctx.toolName,
@@ -922,7 +1088,10 @@ export async function completePending(
       });
     } finally {
       const revoked = await d.revokeLease(cred.leaseId, obo);
-      if (typeof revoked === 'boolean') credRevoked = revoked;
+      if (typeof revoked === 'boolean') {
+        credRevoked = revoked;
+        facts.revoked = revoked;
+      }
     }
   } else {
     data = await d.callUpstreamTool({ name: ctx.toolName, arguments: args, obo });
@@ -961,6 +1130,9 @@ export async function completePending(
 
   // Approval just proved the user holds the MFA factor — fresh slate.
   d.clearDeny(ctx.verifyUserId);
+
+  if (diag.oboJti) facts.jti = diag.oboJti;
+  narrateFinish('ok');
 
   return { status: 'ok', data, diag };
 }

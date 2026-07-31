@@ -1569,4 +1569,191 @@ describe('OboDiag.credRevoked on the HITL (completePending) path', () => {
     expect(diag).not.toHaveProperty('cred');
     expect(diag).not.toHaveProperty('credRevoked');
   });
+
+  // ── narration on the HITL path ─────────────────────────────────────────
+  it('GATEWAY_NARRATE=true narrates the RESUMED leg (stepup=resumed) with the tx id, lease and revoke outcome', async () => {
+    const prev = process.env['GATEWAY_NARRATE'];
+    process.env['GATEWAY_NARRATE'] = 'true';
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => { });
+    try {
+      const { deps } = makeHitlDeps({ revokeLease: async () => true });
+      await completePending('tx-1', 'user-1', deps as any);
+
+      const lines = logSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[gateway:narrate]'));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('OK');
+      expect(lines[0]).toContain('tool=update_record');
+      expect(lines[0]).toContain('user=agent@example.com');
+      expect(lines[0]).toContain('tier=2');
+      expect(lines[0]).toContain('stepup=resumed');
+      expect(lines[0]).toContain('tx=tx-1');
+      expect(lines[0]).toContain('lease=lease-2');
+      expect(lines[0]).toContain('revoked=true');
+      // NEVER a live credential: not the leg-2 OBO, not the ephemeral DB
+      // password, not the exchange client secret, not the MFA assertion.
+      expect(lines[0]).not.toContain('final-obo');
+      expect(lines[0]).not.toContain('p4ss');
+      expect(lines[0]).not.toContain('exchange-secret-1');
+      expect(lines[0]).not.toContain('mfa-assertion-jwt');
+      expect(lines[0]).not.toContain('challenge-xyz');
+    } finally {
+      logSpy.mockRestore();
+      if (prev === undefined) delete process.env['GATEWAY_NARRATE'];
+      else process.env['GATEWAY_NARRATE'] = prev;
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// GATEWAY_NARRATE — env-gated per-call narration, DEFAULT OFF
+//
+// Same posture as GATEWAY_DEBUG_OBO: an opt-in demo affordance. The first test
+// is the important one — with the var unset the gateway's stdout must be
+// exactly what it was before this feature existed.
+// ──────────────────────────────────────────────────────────────────────────
+describe('GATEWAY_NARRATE', () => {
+  /** Run `fn` with GATEWAY_NARRATE set (or deleted), capturing console.log. */
+  async function withNarrate<T>(value: string | undefined, fn: () => Promise<T>): Promise<{ result: T; lines: string[]; allLogs: string[] }> {
+    const prev = process.env['GATEWAY_NARRATE'];
+    if (value === undefined) delete process.env['GATEWAY_NARRATE'];
+    else process.env['GATEWAY_NARRATE'] = value;
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => { });
+    try {
+      const result = await fn();
+      const allLogs = logSpy.mock.calls.map((c) => String(c[0]));
+      return { result, allLogs, lines: allLogs.filter((l) => l.startsWith('[gateway:narrate]')) };
+    } finally {
+      logSpy.mockRestore();
+      if (prev === undefined) delete process.env['GATEWAY_NARRATE'];
+      else process.env['GATEWAY_NARRATE'] = prev;
+    }
+  }
+
+  it('UNSET: emits NOTHING — behaviour and stdout are byte-identical to before the flag existed', async () => {
+    const { deps } = makeRunDeps({ revokeLease: async () => true });
+
+    const { result, allLogs } = await withNarrate(undefined, () =>
+      runPipeline({ userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } }, deps as any),
+    );
+
+    // Not just "no narrate lines" — NO console.log at all from this path.
+    expect(allLogs).toEqual([]);
+    // ...and the result is unchanged.
+    expect(result).toMatchObject({ status: 'ok', data: { ok: true, record: { recordId: 'REC-1' } } });
+  });
+
+  it('any value other than the literal "true" is OFF (no accidental enablement from GATEWAY_NARRATE=1/false/yes)', async () => {
+    for (const value of ['1', 'false', 'yes', 'TRUE', '']) {
+      const { deps } = makeRunDeps({ revokeLease: async () => true });
+      const { allLogs } = await withNarrate(value, () =>
+        runPipeline({ userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } }, deps as any),
+      );
+      expect(allLogs, `GATEWAY_NARRATE=${JSON.stringify(value)} must stay OFF`).toEqual([]);
+    }
+  });
+
+  it('ON: exactly ONE line per call, carrying tool / user / tier / RAR action / exchange / lease / revoke outcome', async () => {
+    const { deps } = makeRunDeps({ revokeLease: async () => true });
+
+    const { lines } = await withNarrate('true', () =>
+      runPipeline({ userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } }, deps as any),
+    );
+
+    expect(lines).toHaveLength(1);
+    const line = lines[0]!;
+    expect(line).toContain('[gateway:narrate] OK');
+    expect(line).toContain('tool=get_record');
+    expect(line).toContain('user=agent@example.com');
+    expect(line).toContain('tier=1');
+    expect(line).toContain('rar=record_read');
+    expect(line).toContain('exchange=ok');
+    expect(line).toContain('lease=lease-1');
+    expect(line).toContain('revoked=true');
+  });
+
+  it('ON: NEVER logs a live credential — no OBO, no ephemeral DB password, no user token', async () => {
+    const { deps } = makeRunDeps({ revokeLease: async () => true });
+
+    const { lines } = await withNarrate('true', () =>
+      runPipeline({ userToken: 'super-secret-user-token', toolName: 'get_record', args: { recordId: 'REC-1' } }, deps as any),
+    );
+
+    const line = lines[0]!;
+    expect(line).not.toContain('obo-token-1');            // the OBO itself
+    expect(line).not.toContain('p4ss');                    // ephemeral DB password
+    expect(line).not.toContain('super-secret-user-token'); // the inbound bearer
+  });
+
+  it('ON: a FAILED revoke narrates revoked=false — the line is evidence, not decoration', async () => {
+    const { deps } = makeRunDeps({ revokeLease: async () => false });
+
+    const { lines } = await withNarrate('true', () =>
+      runPipeline({ userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } }, deps as any),
+    );
+
+    expect(lines[0]).toContain('revoked=false');
+  });
+
+  it('ON: a parked step-up narrates exchange=mfa_challenge + the tx id, with no lease (nothing was minted)', async () => {
+    const { deps } = makeRunDeps({
+      gateTool: () => makeGateResult({ tier: 2, rarAction: 'record_write', scope: 'records:write' }),
+      exchangeToken: async () => ({ status: 'mfa_challenge' as const, challengeToken: 'challenge-jwt-abc' }),
+    });
+
+    const { lines } = await withNarrate('true', () =>
+      runPipeline({ userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1' } }, deps as any),
+    );
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('PENDING');
+    expect(lines[0]).toContain('exchange=mfa_challenge');
+    expect(lines[0]).toContain('tx=tx-fixed-1');
+    expect(lines[0]).not.toContain('lease=');
+    expect(lines[0]).not.toContain('challenge-jwt-abc'); // the challenge token is a credential
+  });
+
+  it('ON: a Verify policy deny narrates exchange=denied:access_denied', async () => {
+    const { deps } = makeRunDeps({
+      exchangeToken: async () => ({ status: 'error' as const, error: 'access_denied' }),
+    });
+
+    const { lines } = await withNarrate('true', () =>
+      runPipeline({ userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } }, deps as any),
+    );
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('ERROR');
+    expect(lines[0]).toContain('exchange=denied:access_denied');
+  });
+
+  it('ON: a tier-4 local deny narrates before Verify is ever called', async () => {
+    const { deps } = makeRunDeps({ gateTool: () => makeGateResult({ tier: 4, allowed: false, reason: 'policy_deny' }) });
+
+    const { lines } = await withNarrate('true', () =>
+      runPipeline({ userToken: 'user-token', toolName: 'delete_everything', args: {} }, deps as any),
+    );
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('DENIED');
+    expect(lines[0]).toContain('tool=delete_everything');
+    expect(lines[0]).toContain('exchange=denied:policy_deny');
+    expect(deps.exchangeToken).not.toHaveBeenCalled();
+  });
+
+  it('ON: a gateway-derived step-up emits ONE line for the whole inbound call, marked stepup=', async () => {
+    const { deps } = makeRunDeps({
+      callUpstreamTool: async () => ({ ok: true, classification: 'restricted', record: { recordId: 'REC-9' } }),
+      gateTool: () => makeGateResult({ tier: 1, rarAction: 'record_read', scope: 'records:read' }),
+      revokeLease: async () => true,
+    });
+
+    const { lines } = await withNarrate('true', () =>
+      runPipeline({ userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-9' } }, deps as any),
+    );
+
+    // The discovery probe + the elevated delivery are ONE inbound tool call —
+    // a projector-readable log must not show two lines for it.
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('stepup=');
+  });
 });

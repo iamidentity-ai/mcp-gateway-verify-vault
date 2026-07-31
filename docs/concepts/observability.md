@@ -91,6 +91,40 @@ Two honest caveats, both by design for a single-instance deploy:
   OBO so a local UI can *show* it. That flag is a localhost debug affordance only: a raw OBO in a
   response body is a bearer token, so never enable it on a networked deployment.
 
+## `GATEWAY_NARRATE` - the same evidence, as a live log
+
+`_diagnostic` answers "did the chain run?" *per response*, which is perfect for a UI and useless
+for a projector. `GATEWAY_NARRATE=true` (**default off**) makes the gateway emit **one line per
+tool call** to its own stdout, so `tail -F` on the gateway log is a readable narration of the
+pipeline while it runs:
+
+```
+[gateway:narrate] OK tool=databricks_write user=operator@example.com tier=2 rar=databricks_write exchange=ok lease=verify-rar/creds/databricks-write/7Xk2Qm4pLz revoked=true jti=7b2f9c14d8 412ms
+[gateway:narrate] PENDING tool=databricks_write user=operator@example.com tier=2 rar=databricks_write exchange=mfa_challenge tx=tx-9c1a 631ms
+[gateway:narrate] OK tool=databricks_write user=operator@example.com tier=2 rar=databricks_write exchange=ok:jwt_bearer stepup=resumed lease=verify-rar/creds/databricks-write/Qz8Nr3Tv revoked=true jti=aa11bb22cc tx=tx-9c1a 2894ms
+[gateway:narrate] DENIED tool=gitlab_delete_repo user=operator@example.com tier=4 exchange=denied:policy_deny 3ms
+```
+
+Fields are omitted when they do not apply, so the line stays short for a deny and long for a full
+mint. `stepup=resumed` marks a step-up that a human approved (the second and third lines above are
+the two halves of *one* write). A gateway-derived step-up still emits exactly **one** line for the
+inbound call, not one per internal exchange.
+
+Two properties matter:
+
+- **It never logs a live credential.** No OBO, no ephemeral database password, no client secret, no
+  MFA challenge token, no OTP. `jti` and `lease` are non-secret correlation ids and are the only
+  token-shaped values allowed on the line. A narration mode that leaked a credential would refute
+  the entire point of the gateway, so this is pinned by tests.
+- **Off means off.** With the variable unset the gateway's stdout is byte-identical to a build
+  without the feature - `narrate()` returns before it touches `console`. Only the literal string
+  `true` enables it (`1`, `yes`, `TRUE` do not).
+
+Unlike `GATEWAY_DEBUG_OBO`, this writes only non-secret metadata, and to the gateway's own log
+rather than an HTTP response - but it stays off by default, because per-call logging is a demo and
+debugging posture and the caller identity on the line is PII you should not start emitting by
+accident.
+
 ## The principle
 
 Build the security so it can be *seen*. Not because opacity is insecure, but because unseeable

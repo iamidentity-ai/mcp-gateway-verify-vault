@@ -89,6 +89,8 @@ for the kill to actually happen; the dashboard is observability only.
 | Variable | Default | Purpose |
 |---|---|---|
 | `GATEWAY_ALLOW_TEST_VERDICT` | *(unset)* | When `1`, `POST /hitl/complete` honours a request-body `verdict` override so integration scripts can drive HITL without a phone. **Never enable outside local dev/CI** - see the [API reference](api.md#post-hitlcomplete). |
+| `GATEWAY_NARRATE` | *(unset)* | When `true`, emits one readable `[gateway:narrate] …` line per tool call to stdout (tool, caller, tier, RAR action, exchange verdict, Vault lease, revoke outcome) so `tail -F` narrates the pipeline on a projector. Never logs a credential. Off means byte-identical output. See [observability](../concepts/observability.md#gateway_narrate---the-same-evidence-as-a-live-log). |
+| `GATEWAY_DEBUG_OBO` | *(unset)* | When `true`, embeds the **raw OBO** in `_diagnostic.obo` so a local UI can decode it in a JWT viewer. That is a replayable bearer token in a response body - **localhost only, never on a networked deployment.** |
 
 ## Example stack (docker-compose)
 
