@@ -75,6 +75,52 @@ describe('emitSessionRevoked', () => {
     expect('email' in body.sub_id).toBe(false);
   });
 
+  it('carries the Entra object id as sub_id.entraUserId when one is supplied', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse({ ok: true }, 201));
+
+    await emitSessionRevoked(
+      { verifyUserId: 'U6', email: 'a@b.com', reason: 'dual-kill', entraOid: '11111111-2222-3333-4444-555555555555' },
+      { fetchImpl },
+    );
+
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+
+    // The key name is the handler's, not ours: `entraUserId`, alongside
+    // verifyUserId, both TOP-LEVEL under sub_id.
+    expect(body.sub_id).toEqual({
+      format: 'email',
+      verifyUserId: 'U6',
+      email: 'a@b.com',
+      entraUserId: '11111111-2222-3333-4444-555555555555',
+    });
+  });
+
+  it('omits sub_id.entraUserId entirely when no oid is supplied (never an empty string)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse({ ok: true }, 201));
+
+    await emitSessionRevoked({ verifyUserId: 'U7', email: 'a@b.com', reason: 'single-kill' }, { fetchImpl });
+
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // An empty entraUserId would make the handler attempt Graph with a blank
+    // key; absence makes it skip the leg, which is the correct behaviour.
+    expect('entraUserId' in body.sub_id).toBe(false);
+  });
+
+  it('warns loudly when emitting with no email, because the handler aborts on it while the ingester 201s', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse({ ok: true }, 201));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await emitSessionRevoked({ verifyUserId: 'U8', reason: 'no-email' }, { fetchImpl });
+      const warned = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(warned).toContain('NO email');
+      expect(warned).toContain('U8');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('returns { ok: false, status, body } on a non-2xx fetch response', async () => {
     const fetchImpl = vi.fn().mockResolvedValueOnce(
       new Response(JSON.stringify({ error: 'bad request' }), {
