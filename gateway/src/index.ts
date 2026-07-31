@@ -222,7 +222,22 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
     case 'pending':
       return { ok: false, pending: true, txId: result.txId, pushInfo: result.pushInfo };
     case 'denied':
-      return { ok: false, denied: true, reason: result.reason };
+      // `killed` rides along when this deny is the one that crossed the
+      // deny-counter threshold and fired the session kill. Without it the
+      // envelope was indistinguishable from an ordinary policy deny, so
+      // every client — including this product's own reference UI, which
+      // branches on `killed` to render a terminal "session ended" state —
+      // treated the 3rd strike as a retryable deny and silently missed the
+      // kill that had, in fact, already happened server-side. The HTTP
+      // status stays 403 (see statusCodeFor): read the ENVELOPE, never the
+      // status, is this product's contract, and moving the code would break
+      // consumers that already special-case 401 for `inactive_session`.
+      return {
+        ok: false,
+        denied: true,
+        reason: result.reason,
+        ...(result.killed ? { killed: true } : {}),
+      };
     case 'session_killed_suspicious':
       return { ok: false, killed: true, reason: 'suspicious' };
     case 'error':
@@ -241,6 +256,11 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
             // transient_email HITL mode: how many tries are left on
             // otp_invalid, when Verify's response reported one.
             ...(result.attemptsRemaining !== undefined ? { attemptsRemaining: result.attemptsRemaining } : {}),
+            // ...and how far this user is along THIS gateway's own
+            // 3-strike kill threshold (a separate budget from Verify's
+            // per-code retry count above). Present only on otp_invalid.
+            ...(result.denyCount !== undefined ? { denyCount: result.denyCount } : {}),
+            ...(result.denyThreshold !== undefined ? { denyThreshold: result.denyThreshold } : {}),
           };
   }
 }

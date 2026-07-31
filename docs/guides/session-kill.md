@@ -90,9 +90,19 @@ fire-and-forget). Leave `WEBHOOK_API_KEY` unset in local dev and it's a no-op. S
 From `completePending` (`gateway/src/pipeline.ts`), on the MFA verdict of a gated call:
 
 - **3 normal denials in a 5-minute rolling window** → kill.
+- **3 wrong one-time codes in that same window**, when the instance runs
+  `HITL_METHOD=transient_email` → kill. A wrong code (`otp_invalid`) feeds the same counter as a
+  denied push; an **expired** code (`otp_expired`) does not, because that is a slow human rather
+  than a wrong one. A wrong code with attempts left re-parks the transaction so the same `txId`
+  stays retryable — the counter is per user, so the three strikes can be spread across one parked
+  step-up or three.
 - **1 "suspicious"/fraud verdict** → kill immediately (terminal - the user reported the agent, don't
   keep pushing).
 - **An approval** → clears the deny counter (a fresh slate; MFA-gated tiers only).
+
+The kill-crossing deny returns `{ ok: false, denied: true, reason, killed: true }`. The `killed`
+flag is what tells a client this deny was terminal rather than retryable — read the **envelope**,
+not the HTTP status (which stays `403`).
 
 On a kill, the gateway *also* sets a **local kill-gate** (`markKilled`) so the very next call from
 that user 401s immediately - covering the 30–75s window before the tenant-wide revoke fully
@@ -100,8 +110,9 @@ propagates. That gate is automatic; there's nothing to wire.
 
 ## 6. Prove it
 
-Trigger three denials (deny the push three times within five minutes) on a tier-2/3 tool, or send
-one "suspicious" verdict, then confirm:
+Trigger three denials on a tier-2/3 tool within five minutes — deny the push three times, or (on a
+`transient_email` instance) submit a wrong one-time code three times — or send one "suspicious"
+verdict, then confirm:
 
 - the next call from that user returns **`401 { killed: ... }`** (local kill-gate), and
 - `GET /me/session-status` returns `{ active: false, reason: "session_killed" }`, and

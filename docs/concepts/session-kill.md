@@ -11,9 +11,10 @@ channels, two jobs - keep them distinct.
 
 ```mermaid
 flowchart TD
-    START["MFA verdict on a gated tool call<br/>(completePending)"] --> Q{"poll verdict?"}
+    START["MFA verdict on a gated tool call<br/>(completePending)"] --> Q{"push verdict, or<br/>emailed-code result?"}
     Q -->|"approved"| OK["clearDeny -> mint -> call -> revoke -> ok"]
     Q -->|"denied (normal)"| REC["recordDeny(user)"]
+    Q -->|"wrong one-time code<br/>(otp_invalid)"| REC
     Q -->|"denied_suspicious / fraud"| SUS["suspicious - 1 strike is terminal"]
 
     REC --> THRESH{"3rd strike inside<br/>5-min window?"}
@@ -34,6 +35,14 @@ flowchart TD
 - **Normal denial** (`ssf/deny-counter.ts`) - `recordDeny()` increments a per-user counter in a
   **5-minute rolling window**. The **3rd strike** trips the threshold. A user who legitimately
   fat-fingers one approval is not punished; a loop hammering step-up is.
+- **A wrong one-time code** (`HITL_METHOD=transient_email`) counts as a normal denial against the
+  same counter, with the same 3-strike threshold. The person typing codes into the approval box did
+  not prove they are the approver, which is the same signal a denied push carries. An **expired**
+  code (`otp_expired`) does **not** count: that is a slow human, not a wrong one, and must never
+  cost someone their session. A wrong code that still leaves attempts **re-parks** the same
+  transaction so the box can be retried under the same `txId` - the counter is per *user*, not per
+  transaction, so three wrong codes trip the kill whether they were typed into one parked step-up
+  or three.
 - **Suspicious / fraud** - a "report suspicious" verdict from the phone is a **1-strike,
   immediately terminal** kill. The reasoning: a user who reports the agent as fraudulent should not
   be pestered with more pushes - take the strong action at once.

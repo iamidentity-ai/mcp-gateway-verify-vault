@@ -924,6 +924,10 @@ describe('completePending', () => {
     const base = {
       peekPending: (_txId: string) => makeCtx(),
       takePending: (_txId: string) => makeCtx(),
+      // Stubbed (never the real module function) so an otp_invalid re-park in
+      // one test cannot leave an entry in the real process-singleton store and
+      // leak into the next.
+      putPending: (_txId: string, _ctx: unknown) => undefined,
       gateTool: () => makeGateResult({ tier: 2, rarAction: 'record_write', scope: 'records:write' }),
       pollOAuthMfaStatus: async () => ({ state: 'approved' as const, assertion: 'mfa-assertion-jwt' }),
       // transient_email HITL mode only — unused unless a test's makeCtx has
@@ -1296,6 +1300,10 @@ describe('completePending', () => {
       return makeCtx({
         hitlMethod: 'email_otp',
         transactionUri: 'https://verify.test/v2.0/factors/emailotp/transient/verifications/verif-1',
+        // A transient-email step-up always has an email (it is the OTP
+        // destination) — and the kill fired off a 3rd wrong code must carry it
+        // into the CAEP sub_id, so the parked ctx is where it has to live.
+        email: 'otp-user@example.com',
         ...overrides,
       });
     }
@@ -1370,7 +1378,13 @@ describe('completePending', () => {
 
       const result = await completePending('tx-1', 'user-1', deps as any, '000000');
 
-      expect(result).toEqual({ status: 'error', error: 'otp_invalid', attemptsRemaining: 2 });
+      expect(result).toEqual({
+        status: 'error',
+        error: 'otp_invalid',
+        attemptsRemaining: 2,
+        denyCount: 1,
+        denyThreshold: 3,
+      });
       expect(deps.exchangeMfaAssertionWithRAR).not.toHaveBeenCalled();
       expect(deps.mintCred).not.toHaveBeenCalled();
       expect(deps.appendAudit).toHaveBeenCalledTimes(1);
@@ -1384,8 +1398,75 @@ describe('completePending', () => {
 
       const result = await completePending('tx-1', 'user-1', deps as any, '000000');
 
-      expect(result).toEqual({ status: 'error', error: 'otp_invalid' });
+      expect(result).toEqual({ status: 'error', error: 'otp_invalid', denyCount: 1, denyThreshold: 3 });
       expect(result).not.toHaveProperty('attemptsRemaining');
+    });
+
+    // ── the transient_email kill chain (2026-07-31) ──────────────────────
+    //
+    // Before these, `recordDeny`/`markKilled`/`emitSessionRevoked` were only
+    // reachable from the push branch: a deployment running
+    // HITL_METHOD=transient_email had the entire 3-strike kill built and
+    // wired and NOTHING that could ever trigger it.
+
+    it('wrong otp counts as a DENIAL against the same 3-strike counter the push path uses', async () => {
+      const { deps } = makeOtpDeps({
+        submitTransientOtp: async () => ({ status: 'otp_invalid' as const }),
+      });
+
+      await completePending('tx-1', 'user-1', deps as any, '000000');
+
+      expect(deps.recordDeny).toHaveBeenCalledWith('user-1');
+    });
+
+    it('wrong otp with attempts remaining RE-PARKS the same txId so a retry is actually possible', async () => {
+      const { deps } = makeOtpDeps({
+        submitTransientOtp: async () => ({ status: 'otp_invalid' as const, attemptsRemaining: 2 }),
+      });
+
+      await completePending('tx-1', 'user-1', deps as any, '000000');
+
+      // takePending is destructive; without this re-put the next attempt on
+      // the same txId returns unknown_or_expired_tx and no consumer's
+      // "N attempts remaining, try again" flow can ever work.
+      expect(deps.putPending).toHaveBeenCalled();
+      expect((deps.putPending as any).mock.calls[0][0]).toBe('tx-1');
+      expect((deps.putPending as any).mock.calls[0][1]).toMatchObject({ verifyUserId: 'user-1' });
+    });
+
+    it('THIRD wrong otp (threshold reached) -> emitSessionRevoked + markKilled + denied{killed:true}, and does NOT re-park', async () => {
+      const { deps } = makeOtpDeps({
+        submitTransientOtp: async () => ({ status: 'otp_invalid' as const, attemptsRemaining: 0 }),
+        recordDeny: (_id: string) => ({ count: 3, thresholdReached: true, windowMs: 300_000, threshold: 3 }),
+      });
+
+      const result = await completePending('tx-1', 'user-1', deps as any, '000000');
+
+      expect(result).toEqual({ status: 'denied', reason: 'otp_deny_threshold_reached', killed: true });
+      expect(deps.emitSessionRevoked).toHaveBeenCalledWith({
+        verifyUserId: 'user-1',
+        email: 'otp-user@example.com',
+        reason: 'otp_deny_threshold_reached',
+      });
+      expect(deps.markKilled).toHaveBeenCalledWith('user-1');
+      // A killed transaction must not be resumable.
+      expect(deps.putPending).not.toHaveBeenCalled();
+      // Nothing downstream of the deny ran.
+      expect(deps.exchangeMfaAssertionWithRAR).not.toHaveBeenCalled();
+      expect(deps.mintCred).not.toHaveBeenCalled();
+      expect(deps.callUpstreamTool).not.toHaveBeenCalled();
+    });
+
+    it('an EXPIRED otp is a slow human, not a wrong one — it never touches the deny counter', async () => {
+      const { deps } = makeOtpDeps({
+        submitTransientOtp: async () => ({ status: 'otp_expired' as const }),
+      });
+
+      await completePending('tx-1', 'user-1', deps as any, '123456');
+
+      expect(deps.recordDeny).not.toHaveBeenCalled();
+      expect(deps.emitSessionRevoked).not.toHaveBeenCalled();
+      expect(deps.markKilled).not.toHaveBeenCalled();
     });
 
     it('expired/already-consumed otp -> error("otp_expired"), distinct from otp_invalid', async () => {

@@ -132,8 +132,18 @@ export type PipelineResult =
   | { status: 'denied'; reason: string; killed?: boolean }
   | { status: 'session_killed_suspicious' }
   /** attemptsRemaining is set only for error:'otp_invalid' when Verify's
-   *  response reported a retries/attemptsRemaining count. */
-  | { status: 'error'; error: string; attemptsRemaining?: number };
+   *  response reported a retries/attemptsRemaining count. denyCount /
+   *  denyThreshold ride along on the same case so a caller can show
+   *  "strike 2 of 3" without maintaining its own counter — they describe
+   *  THIS gateway's own kill threshold, not Verify's per-code retry budget
+   *  (which is what attemptsRemaining reports; the two are independent). */
+  | {
+      status: 'error';
+      error: string;
+      attemptsRemaining?: number;
+      denyCount?: number;
+      denyThreshold?: number;
+    };
 
 // ── GATEWAY_NARRATE: one readable line per call ───────────────
 //
@@ -772,6 +782,10 @@ async function runExchangeAndCall(
 export interface CompletePendingDeps {
   peekPending?: typeof peekPending;
   takePending?: typeof takePending;
+  /** Re-park a transaction whose one-shot entry takePending already consumed
+   *  — used by the transient_email retry path (a wrong code that still has
+   *  attempts left must stay resumable under the same txId). */
+  putPending?: typeof putPending;
   gateTool?: typeof gateTool;
   pollOAuthMfaStatus?: typeof pollOAuthMfaStatus;
   /** transient_email HITL mode only — verifies the caller-supplied otp
@@ -800,6 +814,7 @@ export interface CompletePendingDeps {
 const defaultCompletePendingDeps: Required<CompletePendingDeps> = {
   peekPending,
   takePending,
+  putPending,
   gateTool,
   pollOAuthMfaStatus,
   submitTransientOtp,
@@ -953,6 +968,18 @@ export async function completePending(
     const otpResult = await d.submitTransientOtp(ctx.transactionUri, otp!, ctx.challengeToken);
 
     if (otpResult.status === 'otp_invalid') {
+      // A wrong one-time code is a DENIAL, exactly like a denied push — the
+      // person on the other end of the step-up did not prove they are the
+      // approver. It therefore feeds the SAME per-user deny counter the push
+      // path feeds, with the SAME 3-strike threshold and the SAME kill.
+      //
+      // This wire did not exist until 2026-07-31. `recordDeny`/`markKilled`/
+      // `emitSessionRevoked` were only reachable from the push branch below,
+      // so a deployment running HITL_METHOD=transient_email had a fully-built
+      // kill chain that nothing could ever trigger. Counting only `otp_invalid`
+      // (never `otp_expired`) is deliberate: an expired code means a slow
+      // human, not a wrong one, and must not cost anyone their session.
+      const denyResult = d.recordDeny(ctx.verifyUserId);
       d.appendAudit({
         ts: d.now(),
         userId: ctx.verifyUserId,
@@ -961,11 +988,44 @@ export async function completePending(
         authorizationDetails,
         decision: 'otp_invalid',
       });
+
+      if (denyResult.thresholdReached) {
+        await d.emitSessionRevoked({
+          verifyUserId: ctx.verifyUserId,
+          email: ctx.email,
+          reason: 'otp_deny_threshold_reached',
+        });
+        d.markKilled(ctx.verifyUserId);
+        d.appendAudit({
+          ts: d.now(),
+          userId: ctx.verifyUserId,
+          tool: ctx.toolName,
+          tier: gate.tier,
+          authorizationDetails,
+          decision: 'otp_deny_threshold_killed',
+        });
+        narrateFinish('killed', 'denied:otp_deny_threshold_reached');
+        return { status: 'denied', reason: 'otp_deny_threshold_reached', killed: true };
+      }
+
+      // Attempts remain — RE-PARK the transaction under the same txId so the
+      // caller can genuinely retry. takePending() above was destructive, so
+      // without this re-put the very next attempt on this txId returns
+      // `unknown_or_expired_tx`: every consumer's documented "wrong code, N
+      // attempts remaining, try again" flow was unreachable, and a 3-strike
+      // threshold could never be walked to on a single parked step-up.
+      // Re-putting also refreshes the entry's TTL, which is correct — the
+      // clock a retry should race is the OTP's own validity, which Verify
+      // enforces itself and reports back as `otp_expired`.
+      d.putPending(txId, ctx);
+
       narrateFinish('error', 'error:otp_invalid');
       return {
         status: 'error',
         error: 'otp_invalid',
         ...(otpResult.attemptsRemaining !== undefined ? { attemptsRemaining: otpResult.attemptsRemaining } : {}),
+        denyCount: denyResult.count,
+        denyThreshold: denyResult.threshold,
       };
     }
     if (otpResult.status === 'otp_expired') {

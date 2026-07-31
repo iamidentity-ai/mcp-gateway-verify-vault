@@ -153,6 +153,20 @@ describe('pipelineResultToEnvelope', () => {
     expect(envelope).toEqual({ ok: false, denied: true, reason: 'policy_deny' });
   });
 
+  it('denied WITH killed — the deny that crossed the 3-strike threshold carries killed:true so a client can tell it apart from an ordinary policy deny', () => {
+    const envelope = pipelineResultToEnvelope({
+      status: 'denied',
+      reason: 'otp_deny_threshold_reached',
+      killed: true,
+    });
+    expect(envelope).toEqual({
+      ok: false,
+      denied: true,
+      reason: 'otp_deny_threshold_reached',
+      killed: true,
+    });
+  });
+
   it('session_killed_suspicious — maps to ok:false, killed:true, reason: "suspicious"', () => {
     const envelope = pipelineResultToEnvelope({ status: 'session_killed_suspicious' });
     expect(envelope).toEqual({ ok: false, killed: true, reason: 'suspicious' });
@@ -177,6 +191,23 @@ describe('pipelineResultToEnvelope', () => {
   it('error: otp_invalid with attemptsRemaining — carries attemptsRemaining through to the client envelope', () => {
     const envelope = pipelineResultToEnvelope({ status: 'error', error: 'otp_invalid', attemptsRemaining: 2 });
     expect(envelope).toEqual({ ok: false, error: 'otp_invalid', attemptsRemaining: 2 });
+  });
+
+  it('error: otp_invalid also carries denyCount/denyThreshold — this gateway\'s own kill budget, distinct from Verify\'s per-code retry budget', () => {
+    const envelope = pipelineResultToEnvelope({
+      status: 'error',
+      error: 'otp_invalid',
+      attemptsRemaining: 2,
+      denyCount: 2,
+      denyThreshold: 3,
+    });
+    expect(envelope).toEqual({
+      ok: false,
+      error: 'otp_invalid',
+      attemptsRemaining: 2,
+      denyCount: 2,
+      denyThreshold: 3,
+    });
   });
 
   it('error: otp_invalid with NO attemptsRemaining reported — the key is absent, not null/undefined-valued (mapper never fabricates values it doesn\'t have)', () => {
