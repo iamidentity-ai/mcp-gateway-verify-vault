@@ -162,6 +162,12 @@ function makeRunDeps(overrides: Record<string, unknown> = {}) {
     revokeLease: async () => undefined,
     appendAudit: (_rec: unknown) => undefined,
     clearDeny: (_id: string) => undefined,
+    // Blocked-action escalation kill (BLOCKED_ACTION_KILL). Stubbed here so
+    // the default-OFF tests can assert they were never called without ever
+    // reaching the real ssf/ modules; the opt-in tests override recordDeny.
+    recordDeny: (_id: string) => ({ count: 1, thresholdReached: false, windowMs: 300_000, threshold: 3 }),
+    emitSessionRevoked: async (_e: unknown) => ({ ok: true, status: 202 }),
+    markKilled: (_id: string) => undefined,
     putPending: (_txId: string, _ctx: PendingCtx) => undefined,
     genTxId: () => 'tx-fixed-1',
     now: () => 1_000,
@@ -379,6 +385,115 @@ describe('runPipeline', () => {
     const rec = (deps.appendAudit as any).mock.calls[0][0];
     expect(rec.decision).toBe('tier4_deny');
     expect(rec.tool).toBe('delete_record');
+    // DEFAULT OFF: the escalation kill must not engage unless opted in.
+    expect(deps.recordDeny).not.toHaveBeenCalled();
+    expect(deps.emitSessionRevoked).not.toHaveBeenCalled();
+    expect(deps.markKilled).not.toHaveBeenCalled();
+  });
+
+  // ── BLOCKED_ACTION_KILL: repeated tier-4 attempts revoke the session ─────
+  //
+  // The behaviour a prompt-injection containment story rests on. NOTE what is
+  // asserted and what is NOT: the gateway counts DENIALS. Nothing here looks
+  // at content, and no test claims it does.
+  describe('BLOCKED_ACTION_KILL (blocked-action escalation kill)', () => {
+    const blockedGate = () => ({
+      tier: 4 as const,
+      rarAction: 'record_delete',
+      scope: 'records:write',
+      allowed: false,
+      reason: 'policy_deny',
+    });
+
+    it('below threshold: records the deny and reports the strike count, no kill', async () => {
+      const { deps } = makeRunDeps({
+        blockedActionKill: true,
+        gateTool: blockedGate,
+        recordDeny: () => ({ count: 2, thresholdReached: false, windowMs: 300_000, threshold: 3 }),
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'delete_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result).toEqual({ status: 'denied', reason: 'policy_deny', denyCount: 2, denyThreshold: 3 });
+      expect(deps.recordDeny).toHaveBeenCalledWith('user-1');
+      expect(deps.emitSessionRevoked).not.toHaveBeenCalled();
+      expect(deps.markKilled).not.toHaveBeenCalled();
+      expect(deps.exchangeToken).not.toHaveBeenCalled();
+    });
+
+    it('third strike: emits the CAEP session-revoked event, marks killed, returns killed:true', async () => {
+      const { deps } = makeRunDeps({
+        blockedActionKill: true,
+        gateTool: blockedGate,
+        recordDeny: () => ({ count: 3, thresholdReached: true, windowMs: 300_000, threshold: 3 }),
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'delete_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result).toEqual({
+        status: 'denied',
+        reason: 'blocked_action_threshold_reached',
+        killed: true,
+        denyCount: 3,
+        denyThreshold: 3,
+      });
+      expect(deps.emitSessionRevoked).toHaveBeenCalledWith({
+        verifyUserId: 'user-1',
+        email: 'agent@example.com',
+        reason: 'blocked_action_threshold_reached',
+      });
+      expect(deps.markKilled).toHaveBeenCalledWith('user-1');
+      // Verify is never contacted — the whole sequence is decided locally.
+      expect(deps.exchangeToken).not.toHaveBeenCalled();
+      const decisions = (deps.appendAudit as any).mock.calls.map((c: any[]) => c[0].decision);
+      expect(decisions).toEqual(['tier4_deny', 'tier4_deny_threshold_killed']);
+    });
+
+    it('an UNKNOWN tool never counts toward the kill, even with the flag on', async () => {
+      const { deps } = makeRunDeps({
+        blockedActionKill: true,
+        gateTool: () => ({ tier: 0, rarAction: '', scope: '', allowed: false, reason: 'unknown_tool' }),
+        recordDeny: () => ({ count: 3, thresholdReached: true, windowMs: 300_000, threshold: 3 }),
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'not_a_real_tool', args: {} },
+        deps as any,
+      );
+
+      // A hallucinated tool name is a mistake, not an escalation attempt.
+      expect(result).toEqual({ status: 'denied', reason: 'unknown_tool' });
+      expect(deps.recordDeny).not.toHaveBeenCalled();
+      expect(deps.emitSessionRevoked).not.toHaveBeenCalled();
+      expect(deps.markKilled).not.toHaveBeenCalled();
+    });
+
+    it("a Verify-side access_denied at Token Exchange never counts either", async () => {
+      const { deps } = makeRunDeps({
+        blockedActionKill: true,
+        // Tier 2 is ALLOWED locally; Verify is what refuses it. This is the
+        // read-only-identity deny (scenario 3b's shape) — a correct, expected
+        // outcome that must not cost anyone their session.
+        gateTool: () => makeGateResult({ tier: 2, rarAction: 'record_write', scope: 'records:write' }),
+        exchangeToken: async () => ({ status: 'error' as const, error: 'access_denied' }),
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result).toEqual({ status: 'error', error: 'access_denied' });
+      expect(deps.recordDeny).not.toHaveBeenCalled();
+      expect(deps.emitSessionRevoked).not.toHaveBeenCalled();
+      expect(deps.markKilled).not.toHaveBeenCalled();
+    });
   });
 
   it('unknown tool -> denied(unknown_tool), no exchange call', async () => {

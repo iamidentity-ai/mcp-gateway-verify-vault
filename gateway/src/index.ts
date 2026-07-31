@@ -232,11 +232,19 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
       // status stays 403 (see statusCodeFor): read the ENVELOPE, never the
       // status, is this product's contract, and moving the code would break
       // consumers that already special-case 401 for `inactive_session`.
+      //
+      // denyCount/denyThreshold appear on a tier-4 deny when
+      // BLOCKED_ACTION_KILL is on, so a client can say "attempt 2 of 3 — at 3
+      // this session is revoked" BEFORE the third one lands, instead of the
+      // kill arriving as an unexplained surprise. Same two fields, same
+      // meaning, as on the otp_invalid error case below.
       return {
         ok: false,
         denied: true,
         reason: result.reason,
         ...(result.killed ? { killed: true } : {}),
+        ...(result.denyCount !== undefined ? { denyCount: result.denyCount } : {}),
+        ...(result.denyThreshold !== undefined ? { denyThreshold: result.denyThreshold } : {}),
       };
     case 'session_killed_suspicious':
       return { ok: false, killed: true, reason: 'suspicious' };

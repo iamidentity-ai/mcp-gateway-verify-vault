@@ -9,6 +9,10 @@
  *      note on runPipeline below).
  *   1. introspectUser(userToken) — is the token active? who is it for?
  *   2. gateTool(toolName) — tier map: tier 4 = policy_deny, unknown = deny.
+ *      With BLOCKED_ACTION_KILL=true a tier-4 deny also feeds the per-user
+ *      deny counter, and the third one in the rolling window revokes the
+ *      session (see RunPipelineDeps.blockedActionKill for the scope + the
+ *      "this is not detection" caveat).
  *   3. resolveRar + exchangeToken — RFC 8693 Token Exchange with RFC 9396
  *      RAR (resolveRar is the single source of truth for both the
  *      authorization_details and the Vault creds path — see
@@ -129,7 +133,13 @@ export interface OboDiag {
 export type PipelineResult =
   | { status: 'ok'; data: unknown; diag?: OboDiag }
   | { status: 'pending'; txId: string; pushInfo?: PushInfo }
-  | { status: 'denied'; reason: string; killed?: boolean }
+  /**
+   * denyCount / denyThreshold ride along on a tier-4 (blocked-action) deny
+   * when BLOCKED_ACTION_KILL is on, for the same reason they ride along on
+   * an `otp_invalid` error: so a caller can render "attempt 2 of 3" without
+   * keeping its own counter. They describe THIS gateway's kill threshold.
+   */
+  | { status: 'denied'; reason: string; killed?: boolean; denyCount?: number; denyThreshold?: number }
   | { status: 'session_killed_suspicious' }
   /** attemptsRemaining is set only for error:'otp_invalid' when Verify's
    *  response reported a retries/attemptsRemaining count. denyCount /
@@ -257,6 +267,10 @@ export interface RunPipelineDeps {
   revokeLease?: typeof revokeLease;
   appendAudit?: typeof appendAudit;
   clearDeny?: typeof clearDeny;
+  /** Blocked-action escalation kill — see `blockedActionKill` below. */
+  recordDeny?: typeof recordDeny;
+  emitSessionRevoked?: typeof emitSessionRevoked;
+  markKilled?: typeof markKilled;
   putPending?: typeof putPending;
   /** Injectable txId generator (tests want deterministic ids). */
   genTxId?: () => string;
@@ -283,6 +297,40 @@ export interface RunPipelineDeps {
    * from env at module load, same pattern as dbBacked above.
    */
   hitlMethod?: 'push' | 'transient_email';
+  /**
+   * BLOCKED-ACTION ESCALATION KILL (env `BLOCKED_ACTION_KILL=true`, DEFAULT OFF).
+   *
+   * When on, a **tier-4** deny — an identity asking for an action this
+   * deployment grants to nobody — feeds the SAME per-user deny counter and the
+   * SAME 3-strike threshold an MFA denial feeds, and the third one inside the
+   * rolling window revokes the session (CAEP → SSF → the directories) exactly
+   * as a third wrong one-time code does.
+   *
+   * WHY this is worth having: repeated attempts to use an action outside the
+   * grant is the observable CONSEQUENCE of an agent under someone else's
+   * influence — a poisoned document, a hijacked prompt, a compromised client.
+   * The gateway does not, and cannot, tell you WHY the identity asked; it does
+   * not inspect content and it detects nothing semantic. It reacts to the
+   * behaviour it can actually see. That is the entire claim — do not let a
+   * README, a UI string, or a demo narration inflate it into detection.
+   *
+   * SCOPE, deliberately narrow:
+   *   - ONLY `reason === 'policy_deny'` (tier 4) counts. `unknown_tool` does
+   *     NOT: a model hallucinating a tool name is a mistake, not an
+   *     escalation attempt, and must never cost anyone their session.
+   *   - A Verify-side `access_denied` at Token Exchange does NOT count either.
+   *     That deny is a legitimate, expected outcome of a correctly-scoped
+   *     identity (a read-only agent proving it cannot write is a normal
+   *     demonstration, and a normal application flow), and counting it would
+   *     turn a working authorization boundary into a self-inflicted outage.
+   *   - The counter is shared with the MFA path on purpose: it counts
+   *     DENIALS THIS IDENTITY COLLECTED, whatever produced them.
+   *
+   * DEFAULT OFF because it changes what an existing deployment does on a path
+   * that previously only ever returned 403 — opt in per instance, and only on
+   * an instance whose tier-4 tools are genuinely blocked-for-everyone.
+   */
+  blockedActionKill?: boolean;
 }
 
 const defaultRunPipelineDeps: Required<RunPipelineDeps> = {
@@ -299,11 +347,15 @@ const defaultRunPipelineDeps: Required<RunPipelineDeps> = {
   revokeLease,
   appendAudit,
   clearDeny,
+  recordDeny,
+  emitSessionRevoked,
+  markKilled,
   putPending,
   genTxId: () => randomUUID(),
   now: () => Date.now(),
   dbBacked: process.env['UPSTREAM_DB_BACKED'] !== 'false',
   hitlMethod: process.env['HITL_METHOD'] === 'transient_email' ? 'transient_email' : 'push',
+  blockedActionKill: process.env['BLOCKED_ACTION_KILL'] === 'true',
 };
 
 /**
@@ -409,6 +461,49 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
       tier: gate.tier,
       decision: gate.reason === 'policy_deny' ? 'tier4_deny' : 'unknown_tool_deny',
     });
+
+    // Blocked-action escalation kill (opt-in — see RunPipelineDeps.blockedActionKill).
+    // Only a real tier-4 policy deny counts; `unknown_tool` never does.
+    if (d.blockedActionKill && gate.reason === 'policy_deny') {
+      const denyResult = d.recordDeny(verifyUserId);
+      if (denyResult.thresholdReached) {
+        await d.emitSessionRevoked({
+          verifyUserId,
+          email: userEmail,
+          reason: 'blocked_action_threshold_reached',
+        });
+        d.markKilled(verifyUserId);
+        d.appendAudit({
+          ts: d.now(),
+          userId: verifyUserId,
+          tool: ctx.toolName,
+          tier: gate.tier,
+          decision: 'tier4_deny_threshold_killed',
+        });
+        narrate({
+          outcome: 'killed', tool: ctx.toolName, ...(userEmail || verifyUserId ? { user: userEmail || verifyUserId } : {}),
+          tier: gate.tier, exchange: 'denied:blocked_action_threshold_reached', latencyMs: d.now() - startedAt,
+        });
+        return {
+          status: 'denied',
+          reason: 'blocked_action_threshold_reached',
+          killed: true,
+          denyCount: denyResult.count,
+          denyThreshold: denyResult.threshold,
+        };
+      }
+      narrate({
+        outcome: 'denied', tool: ctx.toolName, ...(userEmail || verifyUserId ? { user: userEmail || verifyUserId } : {}),
+        tier: gate.tier, exchange: 'denied:policy_deny', latencyMs: d.now() - startedAt,
+      });
+      return {
+        status: 'denied',
+        reason: 'policy_deny',
+        denyCount: denyResult.count,
+        denyThreshold: denyResult.threshold,
+      };
+    }
+
     narrate({
       outcome: 'denied', tool: ctx.toolName, ...(userEmail || verifyUserId ? { user: userEmail || verifyUserId } : {}),
       tier: gate.tier, exchange: `denied:${gate.reason ?? 'policy_deny'}`, latencyMs: d.now() - startedAt,

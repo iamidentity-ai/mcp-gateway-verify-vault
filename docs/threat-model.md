@@ -22,7 +22,10 @@ importantly - what the gateway does *not* claim.
   ever contacted.
 - **Escape a report of abuse.** Three denials in five minutes, or one "suspicious" report from the
   phone, emit a CAEP event → transmitter → IdP session-delete across **every federated app**, and the
-  local kill-gate 401s the next call immediately during propagation.
+  local kill-gate 401s the next call immediately during propagation. With `BLOCKED_ACTION_KILL=true`
+  three **tier-4** attempts do the same — a client that has been talked into reaching outside its
+  grant loses the session it was reaching with. This is a response to observed behaviour, **not**
+  detection of what talked it into that; the gateway never reads content.
 - **Weaponize step-up against another user.** `/hitl/complete` is identity-bound; a bearer holder who
   learns a victim's `txId` cannot complete or kill the victim's transaction (`403 forbidden`, before
   any side effect).

@@ -16,6 +16,7 @@ flowchart TD
     Q -->|"denied (normal)"| REC["recordDeny(user)"]
     Q -->|"wrong one-time code<br/>(otp_invalid)"| REC
     Q -->|"denied_suspicious / fraud"| SUS["suspicious - 1 strike is terminal"]
+    B4["tier-4 tool call<br/>(runPipeline, BLOCKED_ACTION_KILL=true)"] --> REC
 
     REC --> THRESH{"3rd strike inside<br/>5-min window?"}
     THRESH -->|"no"| DENY["403 denied<br/>session survives"]
@@ -46,6 +47,23 @@ flowchart TD
 - **Suspicious / fraud** - a "report suspicious" verdict from the phone is a **1-strike,
   immediately terminal** kill. The reasoning: a user who reports the agent as fraudulent should not
   be pestered with more pushes - take the strong action at once.
+- **Repeated blocked-action attempts** (`BLOCKED_ACTION_KILL=true`, default off). A **tier-4**
+  deny - an identity asking for an action this deployment grants to *nobody* - feeds the same
+  counter with the same 3-strike threshold. One attempt is noise. Three in five minutes is an
+  identity reaching outside its grant over and over, which is what a client under someone else's
+  influence looks like from the server side.
+
+  **This is not detection.** The gateway does not read content, does not inspect prompts, and
+  cannot tell you *why* the identity asked. It reacts to the consequence, not the cause - and it
+  does not need the cause, because the blast radius was already bounded by the grant before the
+  first attempt. Say it that way; the weaker claim is the true one and it is also the stronger
+  argument.
+
+  Deliberately narrow: only `policy_deny` counts. `unknown_tool` does **not** - a hallucinated tool
+  name is a mistake, not an escalation attempt. Nor does a Verify-side `access_denied` at Token
+  Exchange: a correctly-scoped read-only identity being refused a write is a normal, expected
+  outcome (it is literally a demo scenario), and counting it would turn a working authorization
+  boundary into a self-inflicted outage.
 - **Approval clears the counter.** Proving the user still holds the MFA factor is a fresh slate -
   the counter resets (`clearDeny`). Note this only clears on **MFA-gated** tiers (2/3): a tier-1
   read succeeding must *not* reset the counter, or an agent could launder its strike count through

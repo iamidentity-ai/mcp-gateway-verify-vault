@@ -100,6 +100,19 @@ From `completePending` (`gateway/src/pipeline.ts`), on the MFA verdict of a gate
   keep pushing).
 - **An approval** → clears the deny counter (a fresh slate; MFA-gated tiers only).
 
+And from `runPipeline`'s tier gate, when the instance sets `BLOCKED_ACTION_KILL=true` (default
+off — see `.env.example`):
+
+- **3 tier-4 (blocked-action) attempts in that same window** → kill. One identity asking three
+  times for something this deployment grants to nobody. `unknown_tool` never counts (a
+  hallucinated tool name is a mistake), and neither does a Verify-side `access_denied` (a
+  correctly-scoped identity being refused is a normal outcome). The strike count rides back on the
+  403 as `denyCount`/`denyThreshold`, so a client can warn *before* the third one lands.
+
+  Say what this is accurately: it reacts to an identity **behaving** like it is outside its grant.
+  It detects nothing about content, intent, or prompt injection, and does not need to — the blast
+  radius is bounded by the grant whether or not anyone ever works out what happened.
+
 The kill-crossing deny returns `{ ok: false, denied: true, reason, killed: true }`. The `killed`
 flag is what tells a client this deny was terminal rather than retryable — read the **envelope**,
 not the HTTP status (which stays `403`).

@@ -167,6 +167,34 @@ describe('pipelineResultToEnvelope', () => {
     });
   });
 
+  it('denied WITH denyCount/denyThreshold — a blocked-action strike tells the client how close the kill is', () => {
+    const envelope = pipelineResultToEnvelope({
+      status: 'denied',
+      reason: 'policy_deny',
+      denyCount: 2,
+      denyThreshold: 3,
+    });
+    expect(envelope).toEqual({ ok: false, denied: true, reason: 'policy_deny', denyCount: 2, denyThreshold: 3 });
+  });
+
+  it('denied — the blocked-action third strike carries killed:true AND the counts', () => {
+    const envelope = pipelineResultToEnvelope({
+      status: 'denied',
+      reason: 'blocked_action_threshold_reached',
+      killed: true,
+      denyCount: 3,
+      denyThreshold: 3,
+    });
+    expect(envelope).toEqual({
+      ok: false,
+      denied: true,
+      reason: 'blocked_action_threshold_reached',
+      killed: true,
+      denyCount: 3,
+      denyThreshold: 3,
+    });
+  });
+
   it('session_killed_suspicious — maps to ok:false, killed:true, reason: "suspicious"', () => {
     const envelope = pipelineResultToEnvelope({ status: 'session_killed_suspicious' });
     expect(envelope).toEqual({ ok: false, killed: true, reason: 'suspicious' });
