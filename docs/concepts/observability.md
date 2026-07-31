@@ -28,6 +28,7 @@ envelope. The success shape:
       "leaseId": "verify-rar/creds/records/…",
       "path": "verify-rar/creds/records"
     },
+    "credRevoked": true,                  // did the post-call lease revoke actually succeed? REPORTED, never assumed.
     "elevated": false
   }
 }
@@ -37,9 +38,13 @@ Every field is *evidence*. `oboJti` is the single value that ties this response 
 Verify token-exchange grant **and** to the Vault audit-log line that minted the credential - you
 can follow one call across three systems. `cred.username` is a credential that **did not exist a
 second ago and will not exist a few minutes from now**; seeing a fresh one per call is the visible
-proof that there is no standing database secret. `elevated` shows whether this call went through
-the [elevated step-up path](human-in-the-loop.md). A UI's agent log and audit-trace ribbon are built
-to read exactly these fields.
+proof that there is no standing database secret. `credRevoked` is the evidence for the second half
+of that sentence - the gateway revokes the lease in a `finally` after every call, and this field
+reports whether Vault actually accepted the revoke. It is deliberately **not** a constant: a
+`false` means the revoke did not land and that credential stays live until its TTL expires, which
+is exactly the kind of thing a badge hardcoded to "revoked" would hide. `elevated` shows whether
+this call went through the [elevated step-up path](human-in-the-loop.md). A UI's agent log and
+audit-trace ribbon are built to read exactly these fields.
 
 Note what is **not** here: the raw OBO bearer token. The OBO is a live credential - it is what mints
 the Vault database cred and authorizes the downstream call - so returning it to a client would hand

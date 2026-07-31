@@ -110,6 +110,17 @@ export interface OboDiag {
   oboTtl?: number;
   oboScope?: string;
   cred?: { username: string; leaseId: string; path: string };
+  /**
+   * Did the gateway's post-call `revokeLease` actually succeed? This is the
+   * evidence for the claim the whole ephemeral-credential design rests on —
+   * "the credential in `cred` does not exist any more." It is REPORTED, never
+   * assumed: `false` means Vault did not accept the revoke and the credential
+   * is still live until its TTL expires, which is a real signal a UI should
+   * show rather than hide. Present only on DB-backed calls that actually
+   * minted (there is nothing to revoke otherwise), and only when the injected
+   * revokeLease reported an outcome — never fabricated as `true`.
+   */
+  credRevoked?: boolean;
   elevated?: boolean;
   /** "dpop" when the inbound request carried a validated DPoP proof. */
   tokenBinding?: 'dpop';
@@ -561,6 +572,11 @@ async function runExchangeAndCall(
   // whole Vault leg and call it on the OBO alone (no X-DB-* headers).
   let cred: MintedCred | undefined;
   let data: unknown;
+  // revokeLease REPORTS whether Vault accepted the revoke (it still never
+  // throws). Left undefined when nothing was minted, or when an injected test
+  // double returns void — the diag below only carries a real boolean, so it
+  // can never claim "revoked" without evidence.
+  let credRevoked: boolean | undefined;
   if (d.dbBacked) {
     // credsPath is guaranteed present in DB-backed mode — the rar-config parse
     // requires it on every non-blocked action when UPSTREAM_DB_BACKED !== 'false'.
@@ -574,7 +590,8 @@ async function runExchangeAndCall(
         dbPass: cred.password,
       });
     } finally {
-      await d.revokeLease(cred.leaseId, obo);
+      const revoked = await d.revokeLease(cred.leaseId, obo);
+      if (typeof revoked === 'boolean') credRevoked = revoked;
     }
   } else {
     data = await d.callUpstreamTool({ name: ctx.toolName, arguments: ctx.args, obo });
@@ -589,6 +606,7 @@ async function runExchangeAndCall(
     oboTtl: exchangeResult.expiresIn,
     oboScope: exchangeResult.scope ?? gate.scope,
     ...(cred ? { cred: { username: cred.username, leaseId: cred.leaseId, path: credsPath! } } : {}),
+    ...(typeof credRevoked === 'boolean' ? { credRevoked } : {}),
     elevated,
     ...(ctx.senderConstrained ? { tokenBinding: 'dpop' as const } : {}),
   };
@@ -887,6 +905,11 @@ export async function completePending(
   // and runs on the OBO alone.
   let cred: MintedCred | undefined;
   let data: unknown;
+  // Same reported-not-assumed revoke outcome as runExchangeAndCall. This site
+  // MUST populate it too: an approved step-up is exactly the call a presenter
+  // points at, and a diag that silently drops a field on the HITL path is the
+  // `_diagnostic: {}` class of bug this repo has already been bitten by.
+  let credRevoked: boolean | undefined;
   if (d.dbBacked) {
     cred = await d.mintCred({ obo, authorizationDetails, credsPath: ctx.credsPath! });
     try {
@@ -898,7 +921,8 @@ export async function completePending(
         dbPass: cred.password,
       });
     } finally {
-      await d.revokeLease(cred.leaseId, obo);
+      const revoked = await d.revokeLease(cred.leaseId, obo);
+      if (typeof revoked === 'boolean') credRevoked = revoked;
     }
   } else {
     data = await d.callUpstreamTool({ name: ctx.toolName, arguments: args, obo });
@@ -913,6 +937,7 @@ export async function completePending(
     oboTtl: assertionResult.expiresIn,
     oboScope: assertionResult.scope ?? ctx.scope,
     ...(cred ? { cred: { username: cred.username, leaseId: cred.leaseId, path: ctx.credsPath! } } : {}),
+    ...(typeof credRevoked === 'boolean' ? { credRevoked } : {}),
     // Elevated iff the parked creds path belongs to an `elevatedFrom` action
     // in config/rar.json — the config, not a path-suffix naming convention,
     // defines "elevated". A NO-DB call has no creds path, so it is never elevated.

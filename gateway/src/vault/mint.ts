@@ -129,12 +129,21 @@ export async function mintCred(args: MintCredArgs, deps: VaultFetchDeps = {}): P
  *
  * Swallows fetch errors and non-OK responses — the lease will still expire
  * on TTL anyway; manual revoke is a cleanup nicety, not a security boundary.
+ * That swallow-don't-throw contract is LOAD-BEARING: pipeline.ts calls this
+ * from a `finally`, so a throw here would mask the real upstream error.
+ *
+ * REPORTS its outcome instead of discarding it: `true` when Vault accepted the
+ * revoke, `false` when it did not (non-OK response or a transport failure).
+ * The pipeline surfaces that as `_diagnostic.credRevoked` so a UI can show
+ * that the ephemeral credential really is gone — and, just as importantly,
+ * show `false` when it is NOT. A caller that ignores the return value gets
+ * exactly the previous behaviour.
  */
 export async function revokeLease(
   leaseId: string,
   vaultToken: string,
   deps: VaultFetchDeps = {},
-): Promise<void> {
+): Promise<boolean> {
   const f = deps.fetchImpl ?? fetch;
   const addr = deps.vaultAddr ?? VAULT_ADDR;
   try {
@@ -151,8 +160,11 @@ export async function revokeLease(
       console.warn(
         `[vault/mint] revokeLease non-OK (${res.status}) for ${leaseId}: ${text.slice(0, 200)}`,
       );
+      return false;
     }
+    return true;
   } catch (err) {
     console.warn('[vault/mint] revokeLease best-effort failed:', (err as Error).message);
+    return false;
   }
 }

@@ -219,21 +219,25 @@ describe('revokeLease', () => {
     });
   });
 
-  it('does NOT throw when fetch rejects (best-effort)', async () => {
+  it('does NOT throw when fetch rejects (best-effort) and REPORTS false', async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error('network down');
     });
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
 
+    // Swallow-don't-throw is the load-bearing contract (pipeline.ts calls this
+    // from a `finally`). Reporting the outcome is what lets `_diagnostic
+    // .credRevoked` be honest instead of decorative — a failed revoke must
+    // surface as false, never as a missing signal a UI can render as "revoked".
     await expect(
       revokeLease('lease-abc', 'tok', { fetchImpl, vaultAddr: 'https://v' }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
 
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });
 
-  it('does NOT throw on a non-OK Vault response (best-effort)', async () => {
+  it('does NOT throw on a non-OK Vault response (best-effort) and REPORTS false', async () => {
     const fetchImpl = vi.fn(
       async () =>
         new Response(JSON.stringify({ errors: ['bad lease id'] }), {
@@ -245,19 +249,21 @@ describe('revokeLease', () => {
 
     await expect(
       revokeLease('lease-bad', 'tok', { fetchImpl, vaultAddr: 'https://v' }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
 
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });
 
-  it('treats 200 OK as success without warning', async () => {
+  it('treats 200 OK as success without warning and REPORTS true', async () => {
     const fetchImpl = vi.fn(
       async () => new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }),
     );
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => { });
 
-    await revokeLease('lease-ok', 'tok', { fetchImpl, vaultAddr: 'https://v' });
+    await expect(
+      revokeLease('lease-ok', 'tok', { fetchImpl, vaultAddr: 'https://v' }),
+    ).resolves.toBe(true);
 
     expect(warnSpy).not.toHaveBeenCalled();
     warnSpy.mockRestore();

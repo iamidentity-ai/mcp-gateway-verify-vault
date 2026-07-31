@@ -41,6 +41,7 @@ into the MCP `CallToolResult` text block (`content[0].text`). The two transports
       "leaseId": "verify-rar/creds/records/…",
       "path": "verify-rar/creds/records"
     },
+    "credRevoked": true,               // did the post-call lease revoke succeed? absent when nothing was minted (NO-DB upstream); `false` means that credential is still live until its TTL
     "elevated": false                  // true iff this went through the elevated step-up path
   }
 }

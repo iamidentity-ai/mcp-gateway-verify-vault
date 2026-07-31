@@ -1422,3 +1422,151 @@ describe('completePending', () => {
     });
   });
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// credRevoked — the ephemeral credential's REVOKE, reported not assumed
+//
+// The gateway always revoked the lease (a `finally` around the upstream call),
+// but revokeLease discarded the outcome, so nothing downstream could show it.
+// A UI badge that always reads "revoked" is decoration; these tests pin the
+// field to the real outcome, on BOTH mint/revoke sites — runExchangeAndCall
+// AND completePending's post-approval leg. The HITL site is the one that
+// historically loses fields silently (the `_diagnostic: {}` bug class).
+// ──────────────────────────────────────────────────────────────────────────
+describe('OboDiag.credRevoked', () => {
+  it('runPipeline: a SUCCESSFUL revoke reports credRevoked:true alongside the cred it revoked', async () => {
+    const { deps } = makeRunDeps({ revokeLease: async () => true });
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } },
+      deps as any,
+    );
+
+    expect(result).toMatchObject({ status: 'ok' });
+    expect((result as { diag?: Record<string, unknown> }).diag).toMatchObject({
+      cred: { username: 'v-records-1', leaseId: 'lease-1', path: 'verify-rar/creds/records' },
+      credRevoked: true,
+    });
+  });
+
+  it('runPipeline: a FAILED revoke reports credRevoked:FALSE and still returns the data (revoke stays best-effort)', async () => {
+    const { deps } = makeRunDeps({ revokeLease: async () => false });
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } },
+      deps as any,
+    );
+
+    // The call must NOT fail because cleanup failed — but the diagnostic must
+    // tell the truth: this credential is still live until its TTL expires.
+    expect(result).toMatchObject({ status: 'ok', data: { ok: true } });
+    expect((result as { diag?: Record<string, unknown> }).diag).toMatchObject({ credRevoked: false });
+  });
+
+  it('runPipeline NO-DB (dbBacked:false): nothing was minted, so there is no credRevoked to report', async () => {
+    const { deps } = makeRunDeps({ dbBacked: false, revokeLease: async () => true });
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } },
+      deps as any,
+    );
+
+    const diag = (result as { diag?: Record<string, unknown> }).diag;
+    expect(diag).not.toHaveProperty('cred');
+    expect(diag).not.toHaveProperty('credRevoked');
+  });
+
+  it('BACK-COMPAT: a revokeLease that reports nothing (void) leaves credRevoked ABSENT — never fabricated as true', async () => {
+    const { deps } = makeRunDeps(); // default double returns undefined
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } },
+      deps as any,
+    );
+
+    expect((result as { diag?: Record<string, unknown> }).diag).toHaveProperty('cred');
+    expect((result as { diag?: Record<string, unknown> }).diag).not.toHaveProperty('credRevoked');
+  });
+});
+
+describe('OboDiag.credRevoked on the HITL (completePending) path', () => {
+  function makeHitlCtx(overrides: Partial<PendingCtx> = {}): PendingCtx {
+    return {
+      verifyUserId: 'user-1',
+      email: 'agent@example.com',
+      challengeToken: 'challenge-xyz',
+      transactionUri: 'https://verify.test/tx/abc',
+      scope: 'records:write',
+      authorizationDetails: [
+        { type: 'urn:example:agent:records', operationDetails: { action: 'record_write', subaction: 'record_write', record_id: 'REC-1' } },
+      ],
+      toolName: 'update_record',
+      credsPath: 'verify-rar/creds/records-write',
+      startedAt: 500,
+      args: {},
+      ...overrides,
+    };
+  }
+
+  function makeHitlDeps(overrides: Record<string, unknown> = {}) {
+    const calls: string[] = [];
+    const base = {
+      peekPending: (_txId: string) => makeHitlCtx(),
+      takePending: (_txId: string) => makeHitlCtx(),
+      gateTool: () => makeGateResult({ tier: 2, rarAction: 'record_write', scope: 'records:write' }),
+      pollOAuthMfaStatus: async () => ({ state: 'approved' as const, assertion: 'mfa-assertion-jwt' }),
+      submitTransientOtp: async () => ({ status: 'approved' as const, assertion: 'otp-assertion-jwt' }),
+      getExchangeClientSecret: async () => 'exchange-secret-1',
+      invalidateExchangeSecret: () => undefined,
+      exchangeMfaAssertionWithRAR: async () => ({
+        status: 'ok' as const,
+        accessToken: 'final-obo',
+        expiresIn: 3600,
+        scope: 'records:write',
+      }),
+      mintCred: async () => ({ username: 'v-write-1', password: 'p4ss', leaseId: 'lease-2' }),
+      callUpstreamTool: async () => ({ ok: true }),
+      revokeLease: async () => undefined,
+      appendAudit: (_rec: unknown) => undefined,
+      clearDeny: (_id: string) => undefined,
+      recordDeny: (_id: string) => ({ count: 1, thresholdReached: false, windowMs: 300_000, threshold: 3 }),
+      emitSessionRevoked: async () => ({ ok: true, status: 200 }),
+      markKilled: (_id: string) => undefined,
+      isSessionKilled: (_id: string) => false,
+      now: () => 2_000,
+    };
+    const deps = wrapWithCallTracking({ ...base, ...overrides }, calls);
+    return { deps, calls };
+  }
+
+  it('approved step-up: a SUCCESSFUL revoke reports credRevoked:true (the approved write must not lose the field)', async () => {
+    const { deps } = makeHitlDeps({ revokeLease: async () => true });
+
+    const result = await completePending('tx-1', 'user-1', deps as any);
+
+    expect(result).toMatchObject({ status: 'ok' });
+    expect((result as { diag?: Record<string, unknown> }).diag).toMatchObject({
+      cred: { username: 'v-write-1', leaseId: 'lease-2', path: 'verify-rar/creds/records-write' },
+      credRevoked: true,
+    });
+  });
+
+  it('approved step-up: a FAILED revoke reports credRevoked:FALSE and still returns the data', async () => {
+    const { deps } = makeHitlDeps({ revokeLease: async () => false });
+
+    const result = await completePending('tx-1', 'user-1', deps as any);
+
+    expect(result).toMatchObject({ status: 'ok', data: { ok: true } });
+    expect((result as { diag?: Record<string, unknown> }).diag).toMatchObject({ credRevoked: false });
+  });
+
+  it('approved step-up, NO-DB (dbBacked:false): no mint, so no credRevoked', async () => {
+    const { deps } = makeHitlDeps({ dbBacked: false, revokeLease: async () => true });
+
+    const result = await completePending('tx-1', 'user-1', deps as any);
+
+    const diag = (result as { diag?: Record<string, unknown> }).diag;
+    expect(diag).not.toHaveProperty('cred');
+    expect(diag).not.toHaveProperty('credRevoked');
+  });
+});
