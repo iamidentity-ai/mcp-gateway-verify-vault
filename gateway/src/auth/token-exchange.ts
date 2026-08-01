@@ -92,7 +92,69 @@ const EXCHANGE_CLIENT_ID = process.env.GATEWAY_EXCHANGE_CLIENT_ID || '';
 const AGENT_CLIENT_ID = process.env.GATEWAY_AGENT_CLIENT_ID || '';
 // The exchange/agent client secrets — and, in vault mode, their Vault plugin
 // role names — are owned by the secrets seam (auth/secrets.ts), not here.
-const AUTH_METHOD = process.env.AUTH_METHOD || 'spiffe';
+
+/**
+ * Which identity the gateway presents as the RFC 8693 ACTOR.
+ *   spiffe — a Vault-native JWT-SVID, `sub` = the workload's SPIFFE ID
+ *   verify — a client_credentials token, `sub` = GATEWAY_AGENT_CLIENT_ID
+ */
+export type AuthMethod = 'spiffe' | 'verify';
+
+const AUTH_METHODS: readonly string[] = ['spiffe', 'verify'];
+
+/**
+ * Parse AUTH_METHOD, and NEVER silently fall back.
+ *
+ * This exists because of a live outage. `AUTH_METHOD` is supplied through a
+ * systemd `EnvironmentFile=`, and systemd only treats `#` as a comment at
+ * the START of a line — a trailing one is part of the value. An env file
+ * carrying
+ *
+ *     AUTH_METHOD=spiffe                      # fallback per Task 7: verify
+ *
+ * therefore sets the value to that ENTIRE string. The old code was
+ * `AUTH_METHOD === 'spiffe'`, so the mismatch quietly selected the
+ * verify-mode fallback and the gateway presented a client_credentials actor
+ * (`sub` = the agent's client id) instead of its SPIFFE SVID. IBM Verify
+ * authorizes delegation by matching the actor's `sub` against the subject
+ * token's `may_act.sub` by exact string equality (RFC 8693 §4.4), so every
+ * exchange died with `CSIAQ5201E The actor or client is not authorized to
+ * act on behalf of the subject` — surfaced to the caller as a bare
+ * `invalid_request`, with nothing in any log naming the swapped identity.
+ *
+ * Two properties close that permanently:
+ *   1. an inline comment / stray whitespace is normalised away, so cosmetic
+ *      env-file noise cannot change WHICH IDENTITY the gateway presents —
+ *      but it is announced, naming the file to fix;
+ *   2. a value that is neither mode THROWS at startup. Silently degrading to
+ *      a different actor identity is never the safe default: it is a
+ *      credential swap, and it must fail loudly instead of failing subtly.
+ */
+export function parseAuthMethod(raw: string | undefined): AuthMethod {
+  if (raw === undefined || raw.trim() === '') return 'spiffe';
+
+  // systemd EnvironmentFile does not strip a trailing `# ...` comment.
+  const normalised = raw.replace(/\s+#.*$/, '').trim();
+
+  if (normalised !== raw) {
+    console.warn(
+      `[token-exchange] AUTH_METHOD contained trailing text and was normalised to "${normalised}" ` +
+        `(raw value: ${JSON.stringify(raw)}). systemd EnvironmentFile= keeps inline "#" comments as part ` +
+        `of the value — remove the comment from the env file. Left unhandled this silently swaps the ` +
+        `RFC 8693 actor identity and every exchange fails CSIAQ5201E.`,
+    );
+  }
+
+  if (!AUTH_METHODS.includes(normalised)) {
+    throw new Error(
+      `AUTH_METHOD must be one of ${AUTH_METHODS.join(' | ')} — got ${JSON.stringify(raw)}. ` +
+        `Refusing to start rather than silently presenting a different actor identity to IBM Verify.`,
+    );
+  }
+  return normalised as AuthMethod;
+}
+
+const AUTH_METHOD: AuthMethod = parseAuthMethod(process.env.AUTH_METHOD);
 
 // Audience the SPIFFE actor SVID is minted for — the Verify tenant itself
 // (host derived from VERIFY_TENANT_URL).
@@ -155,6 +217,114 @@ export type TokenExchangeResult =
 
 function isStaleSecretError(status: number, body: string): boolean {
   return status === 401 || body.includes('invalid_client') || body.includes('CSIAQ0155E');
+}
+
+// ── Exchange-failure diagnostics ─────────────────────────────
+
+/**
+ * The claims worth naming when an exchange is rejected. Deliberately a
+ * CLOSED list, not "everything except a deny-list": a subject token can
+ * carry arbitrary tenant-defined claims, and a diagnostic that prints them
+ * all is one custom claim away from putting something sensitive in a log
+ * file. Nothing here is a credential — `sub`/`iss`/`aud`/`client_id` are
+ * identifiers, `may_act` is a delegation policy statement, and the rest are
+ * timestamps and a correlation id.
+ */
+const DIAG_CLAIMS = ['sub', 'iss', 'aud', 'client_id', 'may_act', 'act', 'iat', 'exp', 'jti', 'token_type'] as const;
+
+/** Decode the named claims out of a JWT. Never throws; never returns token material. */
+export function safeClaimDigest(token: string | undefined): Record<string, unknown> | { unparseable: true } {
+  const parts = (token ?? '').split('.');
+  if (parts.length !== 3) return { unparseable: true };
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8')) as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const claim of DIAG_CLAIMS) {
+      if (payload[claim] !== undefined) out[claim] = payload[claim];
+    }
+    return out;
+  } catch {
+    return { unparseable: true };
+  }
+}
+
+/**
+ * Name the delegation mismatch outright when the digests show one.
+ *
+ * RFC 8693 §4.4: the exchange is authorized by matching the ACTOR token's
+ * `sub` against the SUBJECT token's `may_act.sub` by exact string equality.
+ * Those two values are the single fact the whole delegation rests on, and
+ * they live in two different places (the actor identity this gateway is
+ * configured to present, and the claim the tenant baked into the subject
+ * token at login), so they CAN drift apart. When they have, say so — a
+ * reader should not have to know the RFC to see it.
+ */
+export function describeDelegationMismatch(
+  subject: Record<string, unknown> | { unparseable: true },
+  actor: Record<string, unknown> | { unparseable: true },
+): { mayActMismatch?: true; hint?: string } {
+  const mayAct = (subject as Record<string, unknown>)['may_act'];
+  const expected =
+    mayAct && typeof mayAct === 'object' ? (mayAct as Record<string, unknown>)['sub'] : undefined;
+  const presented = (actor as Record<string, unknown>)['sub'];
+  if (typeof expected !== 'string' || typeof presented !== 'string') return {};
+  if (expected === presented) return {};
+  return {
+    mayActMismatch: true,
+    hint:
+      `the subject token authorizes ONLY "${expected}" to act for it, but this gateway presented ` +
+      `"${presented}". Check AUTH_METHOD (spiffe vs verify selects which actor identity is sent) ` +
+      `and the may_act claim the issuing app mints.`,
+  };
+}
+
+/**
+ * Log ONE line naming exactly why IBM Verify rejected an exchange.
+ *
+ * Why this exists: a bare `error=invalid_request` is indistinguishable
+ * between a may_act mismatch, an unregistered RAR type, an unentitled
+ * subject and a malformed scope — four different fixes with one symptom.
+ * Verify puts the discriminating CSIAQ code in `error_description`, and
+ * until this line existed the gateway parsed that field, stored it on the
+ * result, and then never printed it anywhere. Debugging a live failure
+ * meant editing the source on the host.
+ *
+ * It prints the CSIAQ text verbatim plus the identity facts that decide the
+ * outcome (the subject's `sub`/`may_act`, the actor's `sub`), because those
+ * three values ARE the delegation check — RFC 8693 §4.4 authorizes the
+ * exchange by matching the actor's `sub` against the subject's `may_act.sub`
+ * by exact string equality, so seeing them side by side turns the most
+ * common failure into a one-glance diagnosis instead of a tenant audit.
+ *
+ * NO token material is logged — only the closed claim list above.
+ */
+function logExchangeFailure(args: {
+  leg: string;
+  status: number;
+  body: string;
+  subjectToken?: string;
+  actorToken?: string;
+  scope?: string;
+  authorizationDetails?: AuthorizationDetail[];
+}): void {
+  let parsed: any = {};
+  try { parsed = JSON.parse(args.body); } catch { parsed = {}; }
+  const subject = safeClaimDigest(args.subjectToken);
+  const actor = safeClaimDigest(args.actorToken);
+  const detail = {
+    leg: args.leg,
+    httpStatus: args.status,
+    error: parsed.error ?? '(none)',
+    // Verbatim: this carries the CSIAQ code that names the actual gate.
+    error_description: parsed.error_description ?? args.body.slice(0, 512),
+    scope: args.scope,
+    rarTypes: (args.authorizationDetails ?? []).map((d) => d.type),
+    subject,
+    actor,
+    exchangeClientId: EXCHANGE_CLIENT_ID,
+    ...describeDelegationMismatch(subject, actor),
+  };
+  console.error(`[token-exchange] REJECTED by Verify — ${JSON.stringify(detail)}`);
 }
 
 // ── Actor token ──────────────────────────────────────────────
@@ -438,6 +608,14 @@ export async function exchangeMfaAssertionWithRAR(
   if (!res.ok) {
     let errorData: any = {};
     try { errorData = JSON.parse(text); } catch { errorData = { error_description: text }; }
+    logExchangeFailure({
+      leg: 'jwt-bearer-second-leg',
+      status: res.status,
+      body: text,
+      subjectToken: assertion,
+      scope,
+      authorizationDetails,
+    });
     return {
       status: 'error',
       error: errorData.error || 'jwt_bearer_failed',
@@ -662,6 +840,15 @@ export async function exchangeToken(request: TokenExchangeRequest): Promise<Toke
   if (!res.ok) {
     let errorData: any = {};
     try { errorData = JSON.parse(body); } catch { errorData = { error_description: body }; }
+    logExchangeFailure({
+      leg: 'token-exchange',
+      status: res.status,
+      body,
+      subjectToken,
+      actorToken: actor.token,
+      scope,
+      authorizationDetails,
+    });
     return {
       status: 'error',
       error: errorData.error || 'token_exchange_failed',

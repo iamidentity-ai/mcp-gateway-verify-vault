@@ -125,6 +125,43 @@ rather than an HTTP response - but it stays off by default, because per-call log
 debugging posture and the caller identity on the line is PII you should not start emitting by
 accident.
 
+## When Verify rejects the exchange - `[token-exchange] REJECTED by Verify`
+
+A narrate line records the exchange **verdict**, not the reason: `exchange=error:invalid_request`
+and nothing else. That is not enough to act on. IBM Verify returns four completely different
+problems under that one OAuth error code, each with a different fix:
+
+| `error_description` | What is actually wrong |
+|---|---|
+| `CSIAQ5201E The actor or client is not authorized to act on behalf of the subject` | The actor's `sub` does not equal the subject token's `may_act.sub` - the gateway is presenting the *wrong identity* (check `AUTH_METHOD`) |
+| `CSIAQ0197E Signature verification of the JSON Web Token (JWT) failed` | Verify cannot validate the actor token - for a SPIFFE actor, the published JWKS no longer contains the signing key |
+| `CSIAQ0158E` | The app that minted the subject token is not in the exchange app's `clientGroups.tokenExchange` |
+| `CSIAQ0279E` / `CSIAQ0278E` | Entitlement or policy - the subject is not permitted on the app |
+
+So every rejection now logs **one line naming the reason**, unconditionally:
+
+```
+[token-exchange] REJECTED by Verify — {"leg":"token-exchange","httpStatus":400,
+  "error":"invalid_request",
+  "error_description":"CSIAQ5201E The actor or client is not authorized to act on behalf of the subject.",
+  "scope":"databricks:read","rarTypes":["urn:openshell:agent:databricks","vault:path_access"],
+  "subject":{"sub":"user","may_act":{"sub":"spiffe://demo/parent"},"iat":…},
+  "actor":{"sub":"323f90b0-…"},
+  "mayActMismatch":true,
+  "hint":"the subject token authorizes ONLY \"spiffe://demo/parent\" to act for it, but this
+          gateway presented \"323f90b0-…\". Check AUTH_METHOD…"}
+```
+
+`mayActMismatch` and `hint` appear only when the two values genuinely disagree. They exist because
+that comparison - RFC 8693 §4.4, exact string equality between the actor's `sub` and the subject's
+`may_act.sub` - is the single fact the whole delegation rests on, and the two halves are configured
+in different places, so they *can* drift apart. A reader should not need the RFC to see it.
+
+**This line is not gated behind `GATEWAY_NARRATE`.** An exchange failure is rare, and when it
+happens it is the only thing anyone wants to know. It carries no token material: only a **closed**
+list of claims (`sub`, `iss`, `aud`, `client_id`, `may_act`, `act`, `iat`, `exp`, `jti`,
+`token_type`) is decoded, so a tenant-defined custom claim can never end up in a log file.
+
 ## The principle
 
 Build the security so it can be *seen*. Not because opacity is insecure, but because unseeable

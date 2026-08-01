@@ -51,6 +51,9 @@ vi.mock('./secrets.js', () => ({
 const { getExchangeClientSecret, invalidateExchangeSecret } = secretsMocks;
 
 import {
+  parseAuthMethod,
+  describeDelegationMismatch,
+  safeClaimDigest,
   exchangeToken,
   triggerOAuthMfaPush,
   pollOAuthMfaStatus,
@@ -694,5 +697,117 @@ describe('bindingFetch (TOKEN_BINDING_MODE)', () => {
     expect(headers['DPoP']).toMatch(/^eyJ/);
     // The form body must be untouched by the wrapper
     expect(String(init.body)).toContain('grant_type=');
+  });
+});
+
+// ── (f) REGRESSION: the actor identity the exchange presents ─────────────
+//
+// The bug these guard against took the whole demo down and read as an
+// unexplained `invalid_request` on every call, tier 1 included.
+//
+// `AUTH_METHOD` arrives through a systemd `EnvironmentFile=`, and systemd
+// only strips `#` comments at the START of a line. An env file line reading
+// `AUTH_METHOD=spiffe   # fallback: verify` therefore sets the value to that
+// whole string. The old `AUTH_METHOD === 'spiffe'` check missed, the gateway
+// silently took the verify-mode fallback, and it presented a
+// client_credentials actor (`sub` = the agent's client id) instead of its
+// SPIFFE SVID (`sub` = spiffe://…). IBM Verify matches the actor's `sub`
+// against the subject token's `may_act.sub` by exact string equality
+// (RFC 8693 §4.4), so every exchange failed CSIAQ5201E.
+//
+// The point of these tests is to pin the SUCCESSFUL shape: in spiffe mode the
+// actor token IS the SVID, presented under the configured SPIFFE token type.
+describe('parseAuthMethod — an env-file typo can never silently swap the actor identity (case f)', () => {
+  it('accepts the two real modes', () => {
+    expect(parseAuthMethod('spiffe')).toBe('spiffe');
+    expect(parseAuthMethod('verify')).toBe('verify');
+  });
+
+  it('defaults to spiffe when unset or blank', () => {
+    expect(parseAuthMethod(undefined)).toBe('spiffe');
+    expect(parseAuthMethod('')).toBe('spiffe');
+    expect(parseAuthMethod('   ')).toBe('spiffe');
+  });
+
+  it('THE REGRESSION: a systemd inline comment still resolves to spiffe, not the verify fallback', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      // Byte-for-byte the line that was live on the demo host.
+      expect(parseAuthMethod('spiffe                      # fallback per Task 7 Step 4: verify')).toBe('spiffe');
+      // ...and it says so, naming the cause rather than fixing it in silence.
+      const warned = warn.mock.calls.map((c) => String(c[0])).join('\n');
+      expect(warned).toContain('AUTH_METHOD');
+      expect(warned).toContain('EnvironmentFile');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('trailing whitespace is normalised too', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(parseAuthMethod('verify   ')).toBe('verify');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('THROWS on a value that is neither mode — never degrades to a different actor identity', () => {
+    expect(() => parseAuthMethod('spiffee')).toThrow(/AUTH_METHOD must be one of/);
+    expect(() => parseAuthMethod('SPIFFE')).toThrow(/AUTH_METHOD must be one of/);
+    expect(() => parseAuthMethod('none')).toThrow(/AUTH_METHOD must be one of/);
+  });
+});
+
+describe('describeDelegationMismatch — names the may_act/actor drift outright (case f)', () => {
+  it('flags the exact CSIAQ5201E shape: SPIFFE may_act vs a client_credentials actor', () => {
+    const out = describeDelegationMismatch(
+      { sub: 'user', may_act: { sub: 'spiffe://openshell-demo/parent' } },
+      { sub: '323f90b0-0b5c-47f1-89fd-df45f4dceef9' },
+    );
+    expect(out.mayActMismatch).toBe(true);
+    expect(out.hint).toContain('spiffe://openshell-demo/parent');
+    expect(out.hint).toContain('323f90b0-0b5c-47f1-89fd-df45f4dceef9');
+    expect(out.hint).toContain('AUTH_METHOD');
+  });
+
+  it('stays silent when the actor is exactly who may_act authorises (the WORKING shape)', () => {
+    expect(
+      describeDelegationMismatch(
+        { sub: 'user', may_act: { sub: 'spiffe://openshell-demo/parent' } },
+        { sub: 'spiffe://openshell-demo/parent' },
+      ),
+    ).toEqual({});
+  });
+
+  it('stays silent when either side is unreadable — never guesses a mismatch', () => {
+    expect(describeDelegationMismatch({ unparseable: true }, { sub: 'a' })).toEqual({});
+    expect(describeDelegationMismatch({ sub: 'u' }, { unparseable: true })).toEqual({});
+    expect(describeDelegationMismatch({ sub: 'u' }, { sub: 'a' })).toEqual({});
+  });
+});
+
+describe('safeClaimDigest — diagnostics never leak token material (case f)', () => {
+  it('returns only the closed claim list, dropping anything else the token carries', () => {
+    const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    const token = `${b64({ alg: 'RS256' })}.${b64({
+      sub: 'user-1',
+      may_act: { sub: 'spiffe://x/y' },
+      iat: 1,
+      exp: 2,
+      // Must NOT survive into a log line:
+      ssn: '000-00-0000',
+      custom_tenant_claim: 'sensitive',
+    })}.sig`;
+    const digest = safeClaimDigest(token) as Record<string, unknown>;
+    expect(digest['sub']).toBe('user-1');
+    expect(digest['may_act']).toEqual({ sub: 'spiffe://x/y' });
+    expect('ssn' in digest).toBe(false);
+    expect('custom_tenant_claim' in digest).toBe(false);
+  });
+
+  it('marks an opaque token unparseable rather than throwing', () => {
+    expect(safeClaimDigest('opaque')).toEqual({ unparseable: true });
+    expect(safeClaimDigest(undefined)).toEqual({ unparseable: true });
   });
 });
