@@ -7,7 +7,20 @@
  * independent users; __resetForTests wipes all state.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { markKilled, isSessionKilled, unmarkKilled, __resetForTests } from './killed-sessions.js';
+import {
+  markKilled,
+  isSessionKilled,
+  unmarkKilled,
+  readSubjectIssuedAt,
+  __resetForTests,
+} from './killed-sessions.js';
+
+/** Build a JWT-shaped string carrying just the claims a test needs. Never signed —
+ *  readSubjectIssuedAt deliberately does no signature check (see its doc comment). */
+function jwtWithClaims(claims: Record<string, unknown>): string {
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  return `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64(claims)}.sig`;
+}
 
 describe('killed-sessions', () => {
   const ORIGINAL_TTL = process.env.SSF_KILLED_SESSION_TTL_MS;
@@ -78,5 +91,74 @@ describe('killed-sessions', () => {
     markKilled('user-H');
     __resetForTests();
     expect(isSessionKilled('user-H')).toBe(false);
+  });
+
+  // ── Re-authentication clears the gate ──────────────────────────────────
+  //
+  // REGRESSION GUARD. A kill used to be a dead end: the human signed back
+  // in at the IdP and every call still returned session_killed until the
+  // TTL lapsed or an operator restarted the service. These pin the rule
+  // that replaced it — only a subject token ISSUED AFTER the kill gets
+  // through, which is unforgeable because the caller cannot mint one
+  // without authenticating again.
+
+  it('a subject token issued AFTER the kill clears the gate — a genuine re-authentication', () => {
+    vi.setSystemTime(new Date('2026-08-01T12:00:00Z'));
+    markKilled('user-reauth');
+    expect(isSessionKilled('user-reauth')).toBe(true);
+
+    const iatAfter = Math.floor(Date.parse('2026-08-01T12:00:30Z') / 1000);
+    expect(isSessionKilled('user-reauth', iatAfter)).toBe(false);
+  });
+
+  it('the clear is sticky — once re-authenticated the user stays un-gated', () => {
+    vi.setSystemTime(new Date('2026-08-01T12:00:00Z'));
+    markKilled('user-sticky');
+    const iatAfter = Math.floor(Date.parse('2026-08-01T12:00:30Z') / 1000);
+    expect(isSessionKilled('user-sticky', iatAfter)).toBe(false);
+    // A later call with no iat at all must NOT resurrect the kill.
+    expect(isSessionKilled('user-sticky')).toBe(false);
+  });
+
+  it('a token issued BEFORE the kill does NOT clear it — replaying the old session stays dead', () => {
+    vi.setSystemTime(new Date('2026-08-01T12:00:00Z'));
+    const iatBefore = Math.floor(Date.parse('2026-08-01T11:59:00Z') / 1000);
+    markKilled('user-replay');
+    expect(isSessionKilled('user-replay', iatBefore)).toBe(true);
+  });
+
+  it('a token issued in the SAME second as the kill does NOT clear it (tie loses)', () => {
+    vi.setSystemTime(new Date('2026-08-01T12:00:00Z'));
+    markKilled('user-tie');
+    const iatSameSecond = Math.floor(Date.parse('2026-08-01T12:00:00Z') / 1000);
+    expect(isSessionKilled('user-tie', iatSameSecond)).toBe(true);
+  });
+
+  it('fails CLOSED on an unusable iat — undefined, NaN and Infinity all stay gated', () => {
+    vi.setSystemTime(new Date('2026-08-01T12:00:00Z'));
+    markKilled('user-closed');
+    expect(isSessionKilled('user-closed', undefined)).toBe(true);
+    expect(isSessionKilled('user-closed', Number.NaN)).toBe(true);
+    expect(isSessionKilled('user-closed', Number.POSITIVE_INFINITY)).toBe(true);
+  });
+
+  describe('readSubjectIssuedAt', () => {
+    it('reads a numeric iat out of a JWT-shaped token', () => {
+      expect(readSubjectIssuedAt(jwtWithClaims({ sub: 'u', iat: 1785589249 }))).toBe(1785589249);
+    });
+
+    it('returns undefined for an opaque (non-JWT) token, so the gate stays closed', () => {
+      expect(readSubjectIssuedAt('an-opaque-reference-token')).toBeUndefined();
+    });
+
+    it('returns undefined for a missing or non-numeric iat', () => {
+      expect(readSubjectIssuedAt(jwtWithClaims({ sub: 'u' }))).toBeUndefined();
+      expect(readSubjectIssuedAt(jwtWithClaims({ sub: 'u', iat: 'yesterday' }))).toBeUndefined();
+    });
+
+    it('returns undefined for undefined / malformed input rather than throwing', () => {
+      expect(readSubjectIssuedAt(undefined)).toBeUndefined();
+      expect(readSubjectIssuedAt('a.b.c')).toBeUndefined();
+    });
   });
 });

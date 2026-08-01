@@ -55,7 +55,7 @@ import { rarConfig, isElevatedCredsPath } from './rar/rar-config.js';
 import { mintCred, revokeLease, type MintedCred } from './vault/mint.js';
 import { callUpstreamTool } from './proxy/upstream.js';
 import { recordDeny, clearDeny } from './ssf/deny-counter.js';
-import { markKilled, isSessionKilled } from './ssf/killed-sessions.js';
+import { markKilled, isSessionKilled, readSubjectIssuedAt } from './ssf/killed-sessions.js';
 import { emitSessionRevoked } from './ssf/antenna.js';
 import { putPending, takePending, peekPending, type PendingCtx } from './hitl/pending.js';
 import { appendAudit } from './audit/chain.js';
@@ -252,6 +252,10 @@ function decodeJwtJti(token: string): string | undefined {
 export interface RunPipelineDeps {
   introspectUser?: typeof introspectUser;
   isSessionKilled?: typeof isSessionKilled;
+  /** Reads the subject token's `iat` so a post-kill re-authentication clears
+   *  the local kill-gate. Injectable purely so tests can drive the gate
+   *  without minting JWTs. */
+  readSubjectIssuedAt?: typeof readSubjectIssuedAt;
   gateTool?: typeof gateTool;
   /** Single source of truth for BOTH authorization_details and the Vault
    *  creds path — see rar/build-rar.ts's resolveRar doc comment for why
@@ -336,6 +340,7 @@ export interface RunPipelineDeps {
 const defaultRunPipelineDeps: Required<RunPipelineDeps> = {
   introspectUser,
   isSessionKilled,
+  readSubjectIssuedAt,
   gateTool,
   resolveRar,
   exchangeToken,
@@ -443,12 +448,33 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
 
   // Step 0: local kill-gate, BEFORE any gate/exchange work. Covers the
   // 30-75s Antenna -> Verify session-revoke propagation window.
-  if (d.isSessionKilled(verifyUserId)) {
+  //
+  // The token's `iat` is passed so a genuine re-authentication clears the
+  // gate: only a subject token ISSUED AFTER the kill gets through, and one
+  // can only exist if the human authenticated again at the IdP. This runs
+  // after introspection deliberately — Verify has already vouched for this
+  // exact token, so its `iat` is not something a caller can assert. See
+  // ssf/killed-sessions.ts for why this is not a timer and not an un-kill API.
+  const wasKilled = d.isSessionKilled(verifyUserId);
+  if (d.isSessionKilled(verifyUserId, d.readSubjectIssuedAt(ctx.userToken))) {
     narrate({
       outcome: 'error', tool: ctx.toolName, ...(userEmail || verifyUserId ? { user: userEmail || verifyUserId } : {}),
       exchange: 'error:session_killed', latencyMs: d.now() - startedAt,
     });
     return { status: 'error', error: 'session_killed' };
+  }
+  if (wasKilled) {
+    // The gate was in force a line ago and this token's `iat` just cleared
+    // it — a real re-authentication. Reset the strike counter too, or the
+    // very next deny lands on a counter that is already at the threshold
+    // and kills the brand-new session instantly. A re-authenticated human
+    // starts from zero strikes, which is the whole point of letting them
+    // back in.
+    d.clearDeny(verifyUserId);
+    console.warn(
+      `[${SERVICE_NAME}] kill-gate cleared for user=${verifyUserId} — subject token issued after the kill ` +
+        `(re-authenticated at the identity provider); deny counter reset`,
+    );
   }
 
   // Step 2: tier gate — the single choke point before Verify is ever hit.

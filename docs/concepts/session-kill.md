@@ -95,6 +95,20 @@ Two more things happen in parallel with the CAEP emit, and both are about not-be
   still 200 the just-revoked token. During that window the local gate 401s the *very next call*
   from that user immediately (pipeline step 0), so the gateway does not keep serving a session it
   just asked to have killed. Without this gate, the kill would have a several-second hole.
+
+  **The gate releases on a genuine re-authentication, and on nothing else.** A call gets through
+  only if the subject token it presents was **issued after** the kill (`iat` strictly greater than
+  the kill instant). Such a token cannot exist unless the human completed a fresh authorization at
+  the identity provider, and `iat` is a claim on a Verify-signed token that introspection has
+  already confirmed is active - so it is not something a caller can assert, forge or replay. The
+  strike counter resets at the same moment, or the rebuilt session would die on its first deny.
+
+  This is deliberately **not** a timer and **not** an un-kill endpoint. Left as a bare "is this
+  user id in the map" check, the gate produced a genuine dead end in a live demo: the presenter
+  signed back in, authenticated successfully, and every call still returned `session_killed` until
+  someone SSH'd in and restarted the service. Fails closed - an opaque (non-JWT) subject token has
+  no readable `iat`, so such a deployment keeps the original TTL-only behaviour rather than
+  silently bypassing a kill.
 - **The central events dashboard push** (fire-and-forget). A real tenant-wide kill is otherwise
   *invisible*: the transmitter 201s, the Verify session dies, and nothing shows on a dashboard. So
   the gateway - the single kill choke point - also pushes an `agent:session_revoked` event to the

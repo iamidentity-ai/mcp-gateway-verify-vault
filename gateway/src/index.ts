@@ -44,7 +44,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import { runPipeline, completePending, type PipelineResult } from './pipeline.js';
 import { introspectUser } from './auth/introspect.js';
-import { isSessionKilled } from './ssf/killed-sessions.js';
+import { isSessionKilled, readSubjectIssuedAt } from './ssf/killed-sessions.js';
 import { getAuditForUser } from './audit/chain.js';
 import { resolveBindingMode } from './auth/binding-mode.js';
 import { verifyDpopProof } from './auth/dpop-verify.js';
@@ -416,7 +416,14 @@ app.get('/me/session-status', async (req: Request, res: Response) => {
     if (!introspection.active) {
       return res.status(401).json({ active: false, reason: 'session_revoked' });
     }
-    if (introspection.verifyUserId && isSessionKilled(introspection.verifyUserId)) {
+    // Same iat-aware gate the pipeline uses. Polling this endpoint with a
+    // token minted AFTER the kill reports `active` again — without it a
+    // user who has genuinely re-authenticated keeps seeing "Session ended"
+    // and re-signing in forever (the login loop this gate caused live).
+    if (
+      introspection.verifyUserId &&
+      isSessionKilled(introspection.verifyUserId, readSubjectIssuedAt(bearer))
+    ) {
       return res.status(401).json({ active: false, reason: 'session_killed' });
     }
     return res.json({ active: true, email: introspection.email, sub: introspection.verifyUserId });

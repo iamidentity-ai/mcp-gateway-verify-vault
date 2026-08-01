@@ -45,6 +45,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runPipeline, completePending } from './pipeline.js';
 import {
+  markKilled as realMarkKilled,
+  isSessionKilled as realIsSessionKilled,
+  readSubjectIssuedAt as realReadSubjectIssuedAt,
+  __resetForTests as resetKilledSessions,
+} from './ssf/killed-sessions.js';
+import {
   putPending as realPutPending,
   peekPending as realPeekPending,
   takePending as realTakePending,
@@ -1951,5 +1957,103 @@ describe('GATEWAY_NARRATE', () => {
     // a projector-readable log must not show two lines for it.
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('stepup=');
+  });
+});
+
+// ── REGRESSION: a killed session must not become a login loop ────────────
+//
+// Live failure this pins: after a session kill, the human signed back in at
+// the identity provider, Azure authenticated them fine, and EVERY call still
+// returned `session_killed`. The UI showed "Session ended", they clicked
+// "Sign in again", and it looped. The local kill-gate is per-process and
+// in-memory, and nothing short of a service restart cleared it.
+//
+// The rule that replaced it, exercised here against the REAL
+// ssf/killed-sessions module (not a stub) so the wiring is covered too: a
+// call is let through only when the subject token was ISSUED AFTER the kill.
+// That token cannot exist without a fresh authorization at the IdP, so the
+// control is not weakened — but a genuine re-login is no longer a dead end.
+describe('runPipeline — kill-gate clears on a genuine re-authentication', () => {
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const tokenIssuedAt = (iatSec: number) =>
+    `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ sub: 'user-1', iat: iatSec })}.sig`;
+
+  /** Deps wired to the REAL kill-gate + iat reader. */
+  function realGateDeps(overrides: Record<string, unknown> = {}) {
+    const { deps, calls } = makeRunDeps({
+      isSessionKilled: realIsSessionKilled,
+      readSubjectIssuedAt: realReadSubjectIssuedAt,
+      ...overrides,
+    });
+    return { deps, calls };
+  }
+
+  it('a token minted BEFORE the kill stays blocked; one minted AFTER it gets through', async () => {
+    resetKilledSessions();
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-08-01T12:00:00Z'));
+      const killSec = Math.floor(Date.parse('2026-08-01T12:00:00Z') / 1000);
+      realMarkKilled('user-1');
+
+      // The session the kill ended — still dead.
+      const stale = await runPipeline(
+        { userToken: tokenIssuedAt(killSec - 60), toolName: 'get_record', args: {} },
+        realGateDeps().deps as any,
+      );
+      expect(stale).toEqual({ status: 'error', error: 'session_killed' });
+
+      // Signed back in at the IdP: a brand-new subject token.
+      const { deps } = realGateDeps();
+      const fresh = await runPipeline(
+        { userToken: tokenIssuedAt(killSec + 30), toolName: 'get_record', args: {} },
+        deps as any,
+      );
+      expect(fresh.status).toBe('ok');
+      expect(deps.exchangeToken).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      resetKilledSessions();
+    }
+  });
+
+  it('the re-authentication also resets the strike counter, so the new session does not die on its first deny', async () => {
+    resetKilledSessions();
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-08-01T12:00:00Z'));
+      const killSec = Math.floor(Date.parse('2026-08-01T12:00:00Z') / 1000);
+      realMarkKilled('user-1');
+
+      const { deps } = realGateDeps();
+      await runPipeline(
+        { userToken: tokenIssuedAt(killSec + 30), toolName: 'get_record', args: {} },
+        deps as any,
+      );
+      // Without this the counter is still sitting on the threshold and the
+      // very next blocked action re-kills the fresh session immediately.
+      expect(deps.clearDeny).toHaveBeenCalledWith('user-1');
+    } finally {
+      vi.useRealTimers();
+      resetKilledSessions();
+    }
+  });
+
+  it('an OPAQUE subject token can never clear a kill — no iat means the gate holds', async () => {
+    resetKilledSessions();
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-08-01T12:00:00Z'));
+      realMarkKilled('user-1');
+
+      const result = await runPipeline(
+        { userToken: 'an-opaque-reference-token', toolName: 'get_record', args: {} },
+        realGateDeps().deps as any,
+      );
+      expect(result).toEqual({ status: 'error', error: 'session_killed' });
+    } finally {
+      vi.useRealTimers();
+      resetKilledSessions();
+    }
   });
 });
