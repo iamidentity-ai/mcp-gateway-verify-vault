@@ -274,8 +274,13 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
 }
 
 // ── Shared dispatcher both transports call ────────────────────────────────
-async function dispatchTool(toolName: string, args: Record<string, unknown>, bearer: string): Promise<PipelineResult> {
-  return runPipeline({ userToken: bearer, toolName, args, senderConstrained: resolveBindingMode() === 'full' });
+async function dispatchTool(
+  toolName: string,
+  args: Record<string, unknown>,
+  bearer: string,
+  subjectEmail?: string,
+): Promise<PipelineResult> {
+  return runPipeline({ userToken: bearer, toolName, args, senderConstrained: resolveBindingMode() === 'full', subjectEmail });
 }
 
 // ── Transport 1: POST /tool (simple REST, curl-friendly) ─────────────────
@@ -289,8 +294,14 @@ app.post('/tool', async (req: Request, res: Response) => {
   const args = (body['arguments'] ?? body['args'] ?? {}) as Record<string, unknown>;
   if (!name) return res.status(400).json({ error: 'missing_name' });
 
+  // Server-to-server only — set by a trusted UI backend from the ORIGINAL
+  // IdP subject token it already decoded at sign-in, never by the browser
+  // or the model. See PipelineCtx.subjectEmail's doc in pipeline.ts.
+  const subjectEmailHeader = req.header('x-user-email');
+  const subjectEmail = subjectEmailHeader && subjectEmailHeader.includes('@') ? subjectEmailHeader : undefined;
+
   try {
-    const result = await dispatchTool(name, args, bearer);
+    const result = await dispatchTool(name, args, bearer, subjectEmail);
     res.status(statusCodeFor(result)).json(pipelineResultToEnvelope(result));
   } catch (err) {
     const e = err as Error;
