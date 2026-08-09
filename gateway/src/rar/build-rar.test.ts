@@ -52,6 +52,19 @@ describe('buildRAR', () => {
     expect((leasesPath as any).action).toBe('update');
   });
 
+  it('each vault:path_access element also carries the 2.0.4 GA fields (dual shape)', () => {
+    // Vault Enterprise 2.0.4's evaluator reads path/capabilities and ignores
+    // path_constraint/action; the alpha build does the reverse. Both field
+    // sets must therefore be present, and must agree with each other.
+    const rar = buildRAR({ rarAction: 'record_read' });
+    for (const leg of rar.slice(1) as any[]) {
+      expect(leg.path).toBe(leg.path_constraint);
+      expect(leg.capabilities).toEqual([leg.action]);
+    }
+    expect((rar[1] as any).path).toBe('verify-rar/creds/records');
+    expect((rar[2] as any).path).toBe('sys/leases/revoke');
+  });
+
   it('an elevated read collapses to record_read_elevated and the -elevated creds path', () => {
     const rar = buildRAR({ rarAction: 'record_read', elevated: true });
     expect((rar[0] as any).operationDetails.action).toBe('record_read_elevated');
