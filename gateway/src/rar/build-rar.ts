@@ -57,6 +57,21 @@ import { rarConfig, type RarConfig } from './rar-config.js';
  * The business element's `type` is config.rarType (a string, not a literal —
  * the vocabulary is customer-editable), and the domain id key inside
  * operationDetails is config.idField.
+ *
+ * The vault:path_access element carries BOTH schema generations of Vault
+ * Enterprise's OAuth-RS RAR evaluator ("dual shape"):
+ *
+ *   - `path_constraint` + `action` (singular): read by 2.0.0-verify-alpha+ent,
+ *     the shape the internal Vault 2.0 RAR profile documents.
+ *   - `path` + `capabilities` (array): read by 2.0.4+ent, whose evaluator
+ *     (vault.RARDetail / Core.mapRARToACL) compiles entries into an ACL and
+ *     ignores the alpha-era fields entirely — sending only those yields
+ *     RAR_NO_MATCH on every request.
+ *
+ * Each build reads its own fields and ignores the other's (verified by live
+ * mint on 2.0.4 with both field sets present, 2026-08-09), so one emitted
+ * shape serves both. Collapse to the GA-only fields once no alpha-build
+ * Vault remains in any deployment this gateway fronts.
  */
 export type AuthorizationDetail =
   | {
@@ -67,6 +82,8 @@ export type AuthorizationDetail =
     type: 'vault:path_access';
     path_constraint: string;
     action: string;
+    path: string;
+    capabilities: string[];
   };
 
 // ── RAR action / path resolution ────────────────────────────────
@@ -156,17 +173,25 @@ export function buildRAR(
 
   return [
     business,
-    {
-      type: 'vault:path_access',
-      path_constraint: credsPath,
-      action: 'update',
-    },
-    {
-      type: 'vault:path_access',
-      path_constraint: 'sys/leases/revoke',
-      action: 'update',
-    },
+    pathAccessLeg(credsPath),
+    pathAccessLeg('sys/leases/revoke'),
   ];
+}
+
+/**
+ * One vault:path_access element in the dual shape (see the
+ * AuthorizationDetail type doc): alpha-era `path_constraint`/`action`
+ * alongside GA `path`/`capabilities`, always granting `update` — both the
+ * creds mint and the lease revoke are Vault update operations.
+ */
+function pathAccessLeg(path: string): AuthorizationDetail {
+  return {
+    type: 'vault:path_access',
+    path_constraint: path,
+    action: 'update',
+    path,
+    capabilities: ['update'],
+  };
 }
 
 /**
