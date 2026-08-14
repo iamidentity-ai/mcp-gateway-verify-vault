@@ -57,8 +57,16 @@ that gap. `rar/build-rar.ts` builds a **three-element** array:
       "record_id": "REC-1001"                       // the domain id, nested under config.idField
     }
   },
-  { "type": "vault:path_access", "path_constraint": "verify-rar/creds/records", "action": "update" },
-  { "type": "vault:path_access", "path_constraint": "sys/leases/revoke",        "action": "update" }
+  {
+    "type": "vault:path_access",
+    "path_constraint": "verify-rar/creds/records", "action": "update",   // read by 2.0.0-verify-alpha builds
+    "path": "verify-rar/creds/records", "capabilities": ["update"]       // read by Vault Enterprise 2.0.4
+  },
+  {
+    "type": "vault:path_access",
+    "path_constraint": "sys/leases/revoke", "action": "update",
+    "path": "sys/leases/revoke", "capabilities": ["update"]
+  }
 ]
 ```
 
@@ -68,6 +76,15 @@ load-bearing shape: Verify's CELX access-policy navigation reads
 and the policy silently never matches. Elements 2 and 3 are **`vault:path_access`** grants that
 give the OBO explicit Vault path-level authority - the credentials path it will mint from, and
 `sys/leases/revoke` so the gateway can hand the lease back.
+
+Each `vault:path_access` element deliberately carries **both schema generations** of Vault
+Enterprise's OAuth-RS RAR evaluator ("dual shape"): `path_constraint`/`action` is what
+2.0.0-verify-alpha builds read, `path`/`capabilities` is what Vault Enterprise 2.0.4 reads - the
+alpha-era field names occur zero times in the 2.0.4 binary, so a leg carrying only the old shape
+is refused with `RAR_NO_MATCH` on every mint. Each build reads its own fields and ignores the
+other's; the two sets always agree (built by one helper, pinned by test). See
+[Vault build compatibility](../../README.md#vault-build-compatibility) in the README for the
+verification status per build.
 
 The vocabulary - `rarType`, `idField`, the actions, the creds paths - is **entirely
 [`config/rar.json`](../../gateway/config/rar.json)**, never hardcoded. That is what lets you point

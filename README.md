@@ -291,6 +291,32 @@ wiring before involving a database at all, start with the
   component. The `env`-secrets quickstart still needs Vault for the ephemeral DB creds; only
   the client-secret storage is optional there.
 
+### Vault build compatibility
+
+Vault Enterprise builds changed the field names their OAuth-RS evaluator reads inside each
+`vault:path_access` authorization_details entry: 2.0.0-verify-alpha builds read
+`path_constraint`/`action`, while **Vault Enterprise 2.0.4** reads `path`/`capabilities` and
+contains zero occurrences of the alpha-era names - a leg carrying only the old shape is refused
+with `RAR_NO_MATCH` on every mint. The gateway therefore emits **both field sets in every leg**
+("dual shape", `gateway/src/rar/build-rar.ts`); the two sets always agree and each build ignores
+the fields it does not know.
+
+Verification status, per build:
+
+- **Vault Enterprise 2.0.4** (`hashicorp/vault-enterprise:2.0.4-ent`): proven live (2026-08-09) -
+  dual-shape legs mint, wrong-path and wrong-capability legs still refuse, and an entry carrying
+  both field sets mints because 2.0.4 ignores the alpha fields.
+- **2.0.0-verify-alpha builds**: the change is purely additive (the alpha fields are still
+  emitted, unchanged), so no regression is expected, but a dual-shape mint has not yet been run
+  live against an alpha build. Treat that direction as unverified until it has.
+
+Two deployment notes: Verify must re-issue the added fields into the OBO. This repo's bootstrap
+leaves authorization_details types unrestricted on the TE app (`restrictAuthDetailTypes: false`,
+`bootstrap/verify.ts`), so dual-shape legs pass through with no tenant change; a tenant that has
+locked down `authDetailTypes` schemas must allow `path`/`capabilities` on the `vault:path_access`
+type once. And once no alpha-build Vault remains behind any deployment of this gateway, the
+alpha-era fields can be dropped - the emission helper is the single place to collapse.
+
 ---
 
 ## Secure your own MCP
