@@ -42,7 +42,7 @@
  * single dep in an individual test still gets tracked automatically (no
  * risk of a test's override silently falling out of the order trace).
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runPipeline, completePending } from './pipeline.js';
 import {
   markKilled as realMarkKilled,
@@ -1639,28 +1639,34 @@ describe('completePending', () => {
 
       const result = await completePending('tx-1', 'user-1', deps as any, '000000');
 
-      expect(result).toEqual({
+      // toMatchObject (not toEqual): the re-park also mints a FRESH
+      // requestState (Task 4 fix — see the dedicated describe block below
+      // for full coverage of ITS semantics); this test stays focused on
+      // attemptsRemaining passthrough and just proves the field exists.
+      expect(result).toMatchObject({
         status: 'error',
         error: 'otp_invalid',
         attemptsRemaining: 2,
         denyCount: 1,
         denyThreshold: 3,
       });
+      expect(typeof (result as { requestState?: unknown }).requestState).toBe('string');
       expect(deps.exchangeMfaAssertionWithRAR).not.toHaveBeenCalled();
       expect(deps.mintCred).not.toHaveBeenCalled();
       expect(deps.appendAudit).toHaveBeenCalledTimes(1);
       expect((deps.appendAudit as any).mock.calls[0][0]).toMatchObject({ decision: 'otp_invalid' });
     });
 
-    it('wrong otp with no attemptsRemaining reported -> error("otp_invalid") with no attemptsRemaining key', async () => {
+    it('wrong otp with no attemptsRemaining reported -> error("otp_invalid") with no attemptsRemaining key (but a fresh requestState IS present)', async () => {
       const { deps } = makeOtpDeps({
         submitTransientOtp: async () => ({ status: 'otp_invalid' as const }),
       });
 
       const result = await completePending('tx-1', 'user-1', deps as any, '000000');
 
-      expect(result).toEqual({ status: 'error', error: 'otp_invalid', denyCount: 1, denyThreshold: 3 });
+      expect(result).toMatchObject({ status: 'error', error: 'otp_invalid', denyCount: 1, denyThreshold: 3 });
       expect(result).not.toHaveProperty('attemptsRemaining');
+      expect(typeof (result as { requestState?: unknown }).requestState).toBe('string');
     });
 
     // ── the transient_email kill chain (2026-07-31) ──────────────────────
@@ -1761,6 +1767,134 @@ describe('completePending', () => {
       expect(result).toEqual({ status: 'error', error: 'forbidden' });
       expect(deps.submitTransientOtp).not.toHaveBeenCalled();
       expect(deps.takePending).not.toHaveBeenCalled();
+    });
+
+    // ── SEP-2322 requestState refresh across an otp_invalid re-park ────────
+    // (Important review fix — controller ruling 2026-08-16)
+    //
+    // The re-park above (d.putPending(txId, ctx) on a wrong code) refreshes
+    // the STORE entry's own TTL, but a requestState minted at the ORIGINAL
+    // park has its `exp` fixed at that original mint — it does not get
+    // retroactively extended. Without also minting a fresh one on the
+    // re-park, a spec-compliant client that always echoes the most recently
+    // received blob would be rejected on a retry the store itself still
+    // considers live. A small explicit HITL_PENDING_TTL_MS (130) plus a
+    // deps-injected `now()` per call (no fake timers) keeps the exp
+    // arithmetic exact and legible: park at t0=0 (exp 130), wrong code at
+    // t=100 (re-park refreshes exp to 230), correct code at t=120 (still
+    // under the original exp) or t=140 (past the original exp, but under
+    // the refreshed one).
+    describe('requestState refresh across an otp_invalid re-park', () => {
+      const ORIGINAL_TTL = process.env['HITL_PENDING_TTL_MS'];
+
+      beforeEach(() => {
+        process.env['HITL_PENDING_TTL_MS'] = '130';
+      });
+
+      afterEach(() => {
+        if (ORIGINAL_TTL === undefined) delete process.env['HITL_PENDING_TTL_MS'];
+        else process.env['HITL_PENDING_TTL_MS'] = ORIGINAL_TTL;
+      });
+
+      it('re-park then complete echoing the ORIGINAL blob while still within its original exp -> ok', async () => {
+        // What runPipeline would have minted at the original park (t0=0).
+        const originalRequestState = mintRequestState({
+          txId: 'tx-1',
+          sub: 'user-1',
+          exp: 0 + 130,
+          digest: requestDigest('update_record', {}),
+        });
+
+        // Wrong code at t=100 -> re-park (stub store; only the exp math matters here).
+        const { deps: wrongDeps } = makeOtpDeps({
+          now: () => 100,
+          submitTransientOtp: async () => ({ status: 'otp_invalid' as const, attemptsRemaining: 2 }),
+        });
+        const wrongAttempt = await completePending('tx-1', 'user-1', wrongDeps as any, '000000');
+        expect(wrongAttempt.status).toBe('error');
+
+        // Correct code at t=120 — still before the ORIGINAL exp of 130 —
+        // echoing the ORIGINAL blob.
+        const { deps: correctDeps } = makeOtpDeps({ now: () => 120 });
+        const result = await completePending('tx-1', 'user-1', correctDeps as any, '123456', originalRequestState);
+
+        expect(result).toMatchObject({ status: 'ok', data: { ok: true } });
+      });
+
+      it('re-park then complete echoing the REFRESHED blob at a time past the original exp but within the refreshed TTL -> ok', async () => {
+        // Wrong code at t=100 -> re-park; the otp_invalid result carries a
+        // FRESH requestState (exp = 100 + 130 = 230).
+        const { deps: wrongDeps } = makeOtpDeps({
+          now: () => 100,
+          submitTransientOtp: async () => ({ status: 'otp_invalid' as const, attemptsRemaining: 2 }),
+        });
+        const wrongAttempt = await completePending('tx-1', 'user-1', wrongDeps as any, '000000');
+        expect(wrongAttempt.status).toBe('error');
+        const refreshedRequestState = (wrongAttempt as { requestState?: string }).requestState;
+        expect(typeof refreshedRequestState).toBe('string');
+
+        // Correct code at t=140 — PAST the original exp (130), but well
+        // within the refreshed one (230) — echoing the REFRESHED blob.
+        const { deps: correctDeps } = makeOtpDeps({ now: () => 140 });
+        const result = await completePending('tx-1', 'user-1', correctDeps as any, '123456', refreshedRequestState);
+
+        expect(result).toMatchObject({ status: 'ok', data: { ok: true } });
+      });
+
+      it('re-park then complete echoing the ORIGINAL blob past its original exp -> invalid_request_state, and the pending entry SURVIVES (a txId-only follow-up still works)', async () => {
+        // Uses the REAL pending store (not the stateless stub) so "the
+        // entry survives" is an actual, provable claim — same pattern as
+        // Task 4's tamper test.
+        resetPendingStore();
+
+        const ctx = makeOtpCtx();
+        realPutPending('tx-otp-refresh', ctx);
+
+        const originalRequestState = mintRequestState({
+          txId: 'tx-otp-refresh',
+          sub: ctx.verifyUserId,
+          exp: 0 + 130,
+          digest: requestDigest(ctx.toolName, ctx.args),
+        });
+
+        // Wrong code at t=100 -> re-park on the REAL store.
+        const { deps: wrongDeps } = makeOtpDeps({
+          peekPending: realPeekPending,
+          takePending: realTakePending,
+          putPending: realPutPending,
+          now: () => 100,
+          submitTransientOtp: async () => ({ status: 'otp_invalid' as const, attemptsRemaining: 2 }),
+        });
+        const wrongAttempt = await completePending('tx-otp-refresh', 'user-1', wrongDeps as any, '000000');
+        expect(wrongAttempt.status).toBe('error');
+
+        // Correct code at t=140 (past the ORIGINAL exp of 130) echoing the
+        // now-STALE original blob.
+        const { deps: staleAttemptDeps } = makeCompleteDeps({
+          peekPending: realPeekPending,
+          takePending: realTakePending,
+          submitTransientOtp: async () => ({ status: 'approved' as const, assertion: 'otp-assertion-jwt' }),
+          now: () => 140,
+        });
+        const staleAttempt = await completePending(
+          'tx-otp-refresh',
+          'user-1',
+          staleAttemptDeps as any,
+          '123456',
+          originalRequestState,
+        );
+
+        expect(staleAttempt).toEqual({ status: 'error', error: 'invalid_request_state' });
+        expect(staleAttemptDeps.takePending).not.toHaveBeenCalled();
+        expect(staleAttemptDeps.submitTransientOtp).not.toHaveBeenCalled();
+
+        // The entry survived: a follow-up complete with just the txId (plus
+        // a correct otp — email_otp still requires one) succeeds.
+        const followUp = await completePending('tx-otp-refresh', 'user-1', staleAttemptDeps as any, '123456');
+        expect(followUp.status).toBe('ok');
+
+        resetPendingStore();
+      });
     });
   });
 });
