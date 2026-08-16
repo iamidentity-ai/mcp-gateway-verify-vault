@@ -49,6 +49,7 @@ import { getAuditForUser } from './audit/chain.js';
 import { resolveBindingMode } from './auth/binding-mode.js';
 import { verifyDpopProof } from './auth/dpop-verify.js';
 import { validateMcpHeaders } from './mcp/header-validation.js';
+import { isDiscoverRequest, buildDiscoverResult } from './mcp/discover.js';
 import { tools as configuredToolPolicies, type ToolArgType, type ToolPolicy } from './policy/tiers.js';
 
 const PORT = Number(process.env['PORT'] ?? 3014);
@@ -660,8 +661,13 @@ async function completeHitlForBearer(txId: string, bearer: string, otp?: string)
   return completePending(txId, callerVerifyUserId, {}, otp);
 }
 
+/** The MCP server identity — shared by buildMcpServer's McpServer constructor
+ *  (initialize) and the server/discover pre-handler so the two can never
+ *  disagree about who this server says it is. */
+const GATEWAY_SERVER_INFO = { name: SERVICE, version: '0.1.0' };
+
 function buildMcpServer(bearer: string, subjectEmail?: string): McpServer {
-  const server = new McpServer({ name: SERVICE, version: '0.1.0' });
+  const server = new McpServer(GATEWAY_SERVER_INFO);
 
   const call = async (name: string, args: Record<string, unknown>) => {
     const result =
@@ -696,6 +702,15 @@ app.post('/mcp', async (req: Request, res: Response) => {
   if (!verdict.ok) {
     const id = req.body && typeof req.body === 'object' && 'id' in req.body ? (req.body as { id: unknown }).id : null;
     res.status(400).json({ jsonrpc: '2.0', id, error: { code: -32020, message: verdict.message } });
+    return;
+  }
+
+  // 2026-07-28 clients probe with server/discover before falling back to
+  // legacy initialize negotiation. Answer it honestly here, before the SDK
+  // (which only speaks up to 2025-11-25 and would otherwise -32601 it) ever
+  // sees the request.
+  if (isDiscoverRequest(req.body)) {
+    res.status(200).json({ jsonrpc: '2.0', id: req.body.id, result: buildDiscoverResult(GATEWAY_SERVER_INFO) });
     return;
   }
 

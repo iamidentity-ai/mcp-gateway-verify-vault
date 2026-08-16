@@ -214,6 +214,47 @@ describe('POST /mcp — tools/list structural tripwire (SEP-2243 injection surfa
   });
 });
 
+describe('POST /mcp — server/discover pre-handler', () => {
+  it('answers an authenticated server/discover request with a complete result, before the SDK ever sees it', async () => {
+    const res = await fetch(`http://127.0.0.1:${process.env['PORT']}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: 'Bearer test-bearer-token',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'd1', method: 'server/discover', params: {} }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      jsonrpc: string;
+      id: unknown;
+      result: { resultType: string; supportedVersions: unknown[] };
+    };
+    expect(body.jsonrpc).toBe('2.0');
+    expect(body.id).toBe('d1');
+    expect(body.result.resultType).toBe('complete');
+    expect(Array.isArray(body.result.supportedVersions)).toBe(true);
+  });
+
+  // Regression: server/discover is the ONLY method this route intercepts —
+  // every other unrecognized method must still reach the SDK transport and
+  // get its own -32601 behavior unchanged, not a discover-shaped result.
+  it('leaves an unrelated unknown method to the SDK, unchanged (-32601 Method not found)', async () => {
+    const res = await fetch(`http://127.0.0.1:${process.env['PORT']}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: 'Bearer test-bearer-token',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'totally/unknown', params: {} }),
+    });
+    const text = await res.text();
+    expect(text).toContain('-32601');
+  });
+});
+
 describe('resolveTestVerdictOverride', () => {
   it('ignores a body verdict when GATEWAY_ALLOW_TEST_VERDICT is unset', () => {
     const result = resolveTestVerdictOverride({ txId: 'tx-1', verdict: 'denied_suspicious' }, {});
