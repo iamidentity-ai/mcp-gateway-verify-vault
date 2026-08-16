@@ -237,6 +237,39 @@ describe('buildUpstreamHeaders', () => {
   });
 });
 
+// ── SEP-2243 structural tripwire: the southbound header allowlist ──────────
+// Guards against a future refactor that starts building upstream headers
+// from tool-call arguments (or any other caller-controlled input) instead
+// of only the fixed { obo, dbUser, dbPass } + auth-mode fields. Adversarial
+// keys riding in `arguments` (the shape a poisoned tool call would use to
+// try to inject an `x-mcp-header`-style header southbound) must never turn
+// into emitted header names — the guarantee is the allowlist, not a
+// blocklist, so this asserts the whole emitted set is a SUBSET of the four
+// possible names, in both auth modes.
+describe('buildUpstreamHeaders — SEP-2243 structural tripwire (southbound header allowlist)', () => {
+  const adversarialArguments = { recordId: 'REC-1', 'x-mcp-header': 'Evil', 'Mcp-Param-Evil': 'x' };
+
+  it('obo mode: emitted header names are a subset of the allowlist even with adversarial tool-argument keys', () => {
+    const auth = { mode: 'obo' as const, oboHeader: 'X-Verify-OBO' };
+    const h = buildUpstreamHeaders(
+      { name: 't', arguments: adversarialArguments, obo: 'obo-jwt', dbUser: 'v-u', dbPass: 'v-p' },
+      auth,
+    );
+    const allowed = new Set(['X-DB-Username', 'X-DB-Password', 'Authorization', auth.oboHeader]);
+    expect(Object.keys(h).every((key) => allowed.has(key))).toBe(true);
+  });
+
+  it('upstream_token mode: emitted header names are a subset of the allowlist even with adversarial tool-argument keys', () => {
+    const auth = { mode: 'upstream_token' as const, oboHeader: 'X-Verify-OBO', upstreamToken: 'ghp_x' };
+    const h = buildUpstreamHeaders(
+      { name: 't', arguments: adversarialArguments, obo: 'obo-jwt', dbUser: 'v-u', dbPass: 'v-p' },
+      auth,
+    );
+    const allowed = new Set(['X-DB-Username', 'X-DB-Password', 'Authorization', auth.oboHeader]);
+    expect(Object.keys(h).every((key) => allowed.has(key))).toBe(true);
+  });
+});
+
 describe('callUpstreamTool with upstream_token auth', () => {
   it('forwards the upstream token in Authorization and relocates the OBO', async () => {
     const { connect, callTool, close } = makeBundle({ ok: true });

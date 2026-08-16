@@ -48,6 +48,7 @@ import { isSessionKilled, readSubjectIssuedAt } from './ssf/killed-sessions.js';
 import { getAuditForUser } from './audit/chain.js';
 import { resolveBindingMode } from './auth/binding-mode.js';
 import { verifyDpopProof } from './auth/dpop-verify.js';
+import { validateMcpHeaders } from './mcp/header-validation.js';
 import { tools as configuredToolPolicies, type ToolArgType, type ToolPolicy } from './policy/tiers.js';
 
 const PORT = Number(process.env['PORT'] ?? 3014);
@@ -683,6 +684,20 @@ app.post('/mcp', async (req: Request, res: Response) => {
   const bearer = requireBearer(req, res);
   if (!bearer) return;
   if (!(await requireDpopBound(req, res, bearer))) return;
+
+  // SEP-2243 Mcp-Method/Mcp-Name validation, Phase 0 validate-if-present:
+  // a legacy 2025-11-25 client sends neither header and this is a no-op; a
+  // header that lies about the request underneath it gets the spec's
+  // required 400 + JSON-RPC -32020, before the transport ever sees it.
+  const verdict = validateMcpHeaders(
+    { mcpMethod: req.header('mcp-method'), mcpName: req.header('mcp-name') },
+    req.body,
+  );
+  if (!verdict.ok) {
+    const id = req.body && typeof req.body === 'object' && 'id' in req.body ? (req.body as { id: unknown }).id : null;
+    res.status(400).json({ jsonrpc: '2.0', id, error: { code: -32020, message: verdict.message } });
+    return;
+  }
 
   const subjectEmail = subjectEmailFromHeader(req);
   const server = buildMcpServer(bearer, subjectEmail);

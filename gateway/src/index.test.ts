@@ -149,6 +149,71 @@ describe('POST /mcp — x-user-email threading (mirrors /tool\'s trusted-header 
   });
 });
 
+describe('POST /mcp — SEP-2243 Mcp-Method/Mcp-Name header validation', () => {
+  // Same real tools/call POST as the x-user-email describe block above,
+  // but returning the raw fetch Response so status + body can be asserted.
+  async function postGetRecordRaw(headers: Record<string, string>): Promise<Response> {
+    return fetch(`http://127.0.0.1:${process.env['PORT']}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: 'Bearer test-bearer-token',
+        ...headers,
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'tools/call',
+        params: { name: 'get_record', arguments: { recordId: 'REC-1' } },
+      }),
+    });
+  }
+
+  it('rejects a tools/call with a wrong Mcp-Name header: HTTP 400, JSON-RPC -32020, request never reaches dispatch', async () => {
+    pipelineMocks.runPipeline.mockClear();
+    const res = await postGetRecordRaw({ 'mcp-method': 'tools/call', 'mcp-name': 'delete_record' });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { jsonrpc: string; id: unknown; error: { code: number; message: string } };
+    expect(body.jsonrpc).toBe('2.0');
+    expect(body.id).toBe(7);
+    expect(body.error.code).toBe(-32020);
+    expect(body.error.message).toContain('Mcp-Name');
+    expect(pipelineMocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it('accepts a tools/call with matching Mcp-Method + Mcp-Name headers, same as an unheadered request', async () => {
+    pipelineMocks.runPipeline.mockClear();
+    const res = await postGetRecordRaw({ 'mcp-method': 'tools/call', 'mcp-name': 'get_record' });
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(pipelineMocks.runPipeline).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('POST /mcp — tools/list structural tripwire (SEP-2243 injection surface)', () => {
+  // Guards against a future refactor that starts building tool specs (or
+  // any part of the tools/list response) from upstream-supplied schemas,
+  // which would let an upstream MCP hand back a fake `x-mcp-header`-shaped
+  // key inside a response this gateway serves to callers. Today nothing
+  // derives tools/list from anything upstream-controlled, so this should
+  // always be empty — the point is catching the day that stops being true.
+  it('the serialized tools/list response contains no x-mcp-header key anywhere', async () => {
+    const res = await fetch(`http://127.0.0.1:${process.env['PORT']}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: 'Bearer test-bearer-token',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/list', params: {} }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text.toLowerCase()).not.toContain('x-mcp-header');
+  });
+});
+
 describe('resolveTestVerdictOverride', () => {
   it('ignores a body verdict when GATEWAY_ALLOW_TEST_VERDICT is unset', () => {
     const result = resolveTestVerdictOverride({ txId: 'tx-1', verdict: 'denied_suspicious' }, {});
