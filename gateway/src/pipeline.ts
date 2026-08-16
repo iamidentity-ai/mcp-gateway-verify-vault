@@ -169,13 +169,23 @@ export type PipelineResult =
    *  denyThreshold ride along on the same case so a caller can show
    *  "strike 2 of 3" without maintaining its own counter — they describe
    *  THIS gateway's own kill threshold, not Verify's per-code retry budget
-   *  (which is what attemptsRemaining reports; the two are independent). */
+   *  (which is what attemptsRemaining reports; the two are independent).
+   *
+   *  requestState is set ONLY on the otp_invalid re-park case (see
+   *  completePending's email_otp branch): re-parking under the same txId
+   *  refreshes the pending entry's TTL, so the ORIGINAL requestState minted
+   *  at park time — whose `exp` is fixed at that original mint — would
+   *  outlive its own claim without a matching refresh. A freshly minted
+   *  requestState (same txId/sub/digest, new exp) rides along here so a
+   *  SEP-2322-compliant client that always echoes the most recently
+   *  received blob is never worse off than one that never echoes at all. */
   | {
       status: 'error';
       error: string;
       attemptsRemaining?: number;
       denyCount?: number;
       denyThreshold?: number;
+      requestState?: string;
     };
 
 // ── GATEWAY_NARRATE: one readable line per call ───────────────
@@ -663,14 +673,24 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
  */
 
 /**
- * Mint the SEP-2322 requestState for a transaction about to be parked.
- * Shared by both HITL methods' park sites below so `sub` and `digest` can
- * never drift between them: `sub` is the SAME verifyUserId the pending ctx
- * stores (and that completePending's owner check at the top of that
- * function compares the caller against), and `digest` is computed over the
- * SAME toolName/args the pending ctx stores for the eventual re-run. `exp`
- * tracks hitl/pending.ts's own TTL so a requestState and the pending entry
- * it describes expire together.
+ * Mint the SEP-2322 requestState for a transaction about to be parked (or
+ * RE-parked — see completePending's otp_invalid retry branch, which calls
+ * this again on every re-put). Shared by every mint site so `sub` and
+ * `digest` can never drift between them: `sub` is the SAME verifyUserId the
+ * pending ctx stores (and that completePending's owner check at the top of
+ * that function compares the caller against), and `digest` is computed over
+ * the SAME toolName/args the pending ctx stores for the eventual re-run.
+ *
+ * `exp` is `now + ttlMs()` — it matches the pending entry's TTL AS OF THIS
+ * MINT, not for the entry's lifetime. A re-park (putPending called again
+ * under the same txId) refreshes the STORE's expiry to a new `now +
+ * ttlMs()`; a blob minted before that re-park keeps its ORIGINAL (now
+ * stale-relative-to-the-refreshed-entry) exp — it does NOT get retroactively
+ * extended, and letting it verify past its own exp would be a lie about
+ * what was actually signed. The re-park call site mints and returns a FRESH
+ * blob for exactly this reason: the entry and its most-recently-issued
+ * requestState always expire together; a stale (pre-re-park) blob does not,
+ * by design — see the wiring rules in completePending's own doc comment.
  */
 function mintPendingRequestState(
   txId: string,
@@ -1230,6 +1250,18 @@ export async function completePending(
       // enforces itself and reports back as `otp_expired`.
       d.putPending(txId, ctx);
 
+      // The requestState minted at the ORIGINAL park has an `exp` fixed to
+      // that original mint (see mintPendingRequestState's doc comment) — it
+      // does NOT get retroactively extended by the re-put above. Mint and
+      // return a FRESH one (same txId/sub/digest inputs, off the SAME ctx
+      // the store now holds, new exp = this re-park's now + ttlMs()) so a
+      // client that always echoes the most-recently-received requestState
+      // is never worse off than one that never echoes at all — a client
+      // still holding the stale original blob past its exp is rejected by
+      // design (invalid_request_state), but can retry with just the txId,
+      // or with THIS fresh one.
+      const requestState = mintPendingRequestState(txId, ctx.verifyUserId, ctx.toolName, ctx.args, d.now());
+
       narrateFinish('error', 'error:otp_invalid');
       return {
         status: 'error',
@@ -1237,6 +1269,7 @@ export async function completePending(
         ...(otpResult.attemptsRemaining !== undefined ? { attemptsRemaining: otpResult.attemptsRemaining } : {}),
         denyCount: denyResult.count,
         denyThreshold: denyResult.threshold,
+        requestState,
       };
     }
     if (otpResult.status === 'otp_expired') {

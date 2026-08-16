@@ -72,9 +72,15 @@ export interface PendingCtx {
 
 const DEFAULT_TTL_MS = 130 * 1000;
 
-/** Exported so pipeline.ts's park sites can mint a SEP-2322 requestState
- *  (hitl/request-state.ts) whose `exp` matches this store's own TTL — the
- *  two are meant to expire together. */
+/** Exported so pipeline.ts's mint sites (park AND re-park — see
+ *  completePending's otp_invalid retry branch) can compute a SEP-2322
+ *  requestState (hitl/request-state.ts) `exp` matching THIS store's TTL as
+ *  of that mint. A single mint's `exp` tracks the entry's TTL at mint time,
+ *  not for the entry's whole lifetime: putPending (called again on a
+ *  re-park) refreshes the STORE entry's own expiry independently, so an
+ *  earlier requestState does not get retroactively extended — the re-park
+ *  call site mints a fresh one instead, and a stale blob presented past its
+ *  own exp is rejected by design (see completePending). */
 export function ttlMs(): number {
   const raw = process.env.HITL_PENDING_TTL_MS;
   if (!raw) return DEFAULT_TTL_MS;

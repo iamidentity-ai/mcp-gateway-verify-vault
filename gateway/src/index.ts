@@ -280,6 +280,12 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
             // per-code retry count above). Present only on otp_invalid.
             ...(result.denyCount !== undefined ? { denyCount: result.denyCount } : {}),
             ...(result.denyThreshold !== undefined ? { denyThreshold: result.denyThreshold } : {}),
+            // A FRESH SEP-2322 requestState, present only on the otp_invalid
+            // re-park case (completePending's email_otp branch) — the
+            // re-park refreshed the pending entry's TTL, so the original
+            // requestState's exp is stale; this is the replacement a
+            // compliant client should echo on its next attempt instead.
+            ...(result.requestState !== undefined ? { requestState: result.requestState } : {}),
           };
   }
 }
