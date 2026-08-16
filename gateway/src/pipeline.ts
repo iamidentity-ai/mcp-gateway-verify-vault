@@ -57,7 +57,8 @@ import { callUpstreamTool } from './proxy/upstream.js';
 import { recordDeny, clearDeny } from './ssf/deny-counter.js';
 import { markKilled, isSessionKilled, readSubjectIssuedAt } from './ssf/killed-sessions.js';
 import { emitSessionRevoked } from './ssf/antenna.js';
-import { putPending, takePending, peekPending, type PendingCtx } from './hitl/pending.js';
+import { putPending, takePending, peekPending, ttlMs, type PendingCtx } from './hitl/pending.js';
+import { mintRequestState, verifyRequestState, requestDigest } from './hitl/request-state.js';
 import { appendAudit } from './audit/chain.js';
 
 /** Service name recorded as the actor in audit actChains. */
@@ -147,7 +148,14 @@ export interface OboDiag {
 
 export type PipelineResult =
   | { status: 'ok'; data: unknown; diag?: OboDiag }
-  | { status: 'pending'; txId: string; pushInfo?: PushInfo }
+  /**
+   * `requestState` — the HMAC-protected SEP-2322 (MRTR) blob minted at park
+   * time (hitl/request-state.ts). Both transports' pending envelopes carry
+   * it alongside `txId`; a completer MAY echo it back to `completePending`
+   * for verify-before-consume integrity binding — see that function's own
+   * doc comment. Required (not optional) because every park site mints one.
+   */
+  | { status: 'pending'; txId: string; requestState: string; pushInfo?: PushInfo }
   /**
    * denyCount / denyThreshold ride along on a tier-4 (blocked-action) deny
    * when BLOCKED_ACTION_KILL is on, for the same reason they ride along on
@@ -653,6 +661,27 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
  * credsPath — deriving credsPath separately from the raw gate.rarAction would
  * miss the elevation collapse buildRAR applies (see build-rar.ts).
  */
+
+/**
+ * Mint the SEP-2322 requestState for a transaction about to be parked.
+ * Shared by both HITL methods' park sites below so `sub` and `digest` can
+ * never drift between them: `sub` is the SAME verifyUserId the pending ctx
+ * stores (and that completePending's owner check at the top of that
+ * function compares the caller against), and `digest` is computed over the
+ * SAME toolName/args the pending ctx stores for the eventual re-run. `exp`
+ * tracks hitl/pending.ts's own TTL so a requestState and the pending entry
+ * it describes expire together.
+ */
+function mintPendingRequestState(
+  txId: string,
+  verifyUserId: string,
+  toolName: string,
+  args: Record<string, unknown>,
+  now: number,
+): string {
+  return mintRequestState({ txId, sub: verifyUserId, exp: now + ttlMs(), digest: requestDigest(toolName, args) });
+}
+
 async function runExchangeAndCall(
   params: {
     ctx: PipelineCtx;
@@ -768,6 +797,7 @@ async function runExchangeAndCall(
         result: {
           status: 'pending',
           txId,
+          requestState: mintPendingRequestState(txId, verifyUserId, ctx.toolName, ctx.args, d.now()),
           pushInfo: { method: 'email_otp', maskedDestination: maskEmail(userEmail) },
         },
         authorizationDetails,
@@ -808,7 +838,12 @@ async function runExchangeAndCall(
 
     facts.outcome = 'pending';
     return {
-      result: { status: 'pending', txId, pushInfo: { method: 'push', ...pushContext, transactionUri } },
+      result: {
+        status: 'pending',
+        txId,
+        requestState: mintPendingRequestState(txId, verifyUserId, ctx.toolName, ctx.args, d.now()),
+        pushInfo: { method: 'push', ...pushContext, transactionUri },
+      },
       authorizationDetails,
       facts,
     };
@@ -1022,12 +1057,25 @@ function isStaleSecretResult(result: { error: string; errorDescription?: string 
  * BEFORE takePending, so a caller who simply omitted the field doesn't burn
  * the one-shot pending entry. It is ignored for 'push' transactions (the
  * push path has no code to submit).
+ *
+ * `requestState` is OPTIONAL — SEP-2322 (MRTR) integrity binding, Phase 0
+ * validate-if-present (see hitl/request-state.ts's own doc comment). Absent:
+ * behavior is unchanged from before this parameter existed — the identity
+ * check above and the single-use pending store already enforce who may
+ * resume a transaction. Present: it is verified against the entry's own
+ * owner and a digest recomputed from the entry's own stored toolName/args
+ * (never from anything the caller sends) — off the same non-destructive
+ * `peeked` read the identity check uses, BEFORE takePending, so a bad
+ * requestState never burns the legitimate owner's one-shot completion
+ * attempt. A failure returns the SAME shape as the owner-mismatch path
+ * above, with `error: 'invalid_request_state'`.
  */
 export async function completePending(
   txId: string,
   callerVerifyUserId: string | undefined,
   deps: CompletePendingDeps = {},
   otp?: string,
+  requestState?: string,
 ): Promise<PipelineResult> {
   const d: Required<CompletePendingDeps> = { ...defaultCompletePendingDeps, ...deps };
   const startedAt = d.now();
@@ -1041,6 +1089,26 @@ export async function completePending(
   if (!callerVerifyUserId || callerVerifyUserId !== peeked.verifyUserId) {
     narrate({ outcome: 'error', tool: peeked.toolName, stepUp: 'resumed', tx: txId, exchange: 'error:forbidden' });
     return { status: 'error', error: 'forbidden' };
+  }
+
+  // SEP-2322 requestState — validate-if-present (see completePending's own
+  // doc comment above). Runs off the same non-destructive `peeked` read as
+  // the identity check just above, strictly BEFORE takePending: a bad
+  // requestState must not consume the pending entry, so a completer that
+  // retries with just txId can still succeed. The digest is recomputed from
+  // the ENTRY's own stored toolName/args — never from anything the caller
+  // presents — so a completer cannot mint its own digest to match a
+  // tampered claim.
+  if (requestState !== undefined) {
+    const verdict = verifyRequestState(
+      requestState,
+      { txId, sub: peeked.verifyUserId, digest: requestDigest(peeked.toolName, peeked.args) },
+      d.now(),
+    );
+    if (!verdict.ok) {
+      narrate({ outcome: 'error', tool: peeked.toolName, stepUp: 'resumed', tx: txId, exchange: 'error:invalid_request_state' });
+      return { status: 'error', error: 'invalid_request_state' };
+    }
   }
 
   // Local kill-gate — same shield runPipeline applies at step 0. Without this,

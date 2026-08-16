@@ -72,7 +72,10 @@ export interface PendingCtx {
 
 const DEFAULT_TTL_MS = 130 * 1000;
 
-function ttlMs(): number {
+/** Exported so pipeline.ts's park sites can mint a SEP-2322 requestState
+ *  (hitl/request-state.ts) whose `exp` matches this store's own TTL — the
+ *  two are meant to expire together. */
+export function ttlMs(): number {
   const raw = process.env.HITL_PENDING_TTL_MS;
   if (!raw) return DEFAULT_TTL_MS;
   const n = Number.parseInt(raw, 10);
