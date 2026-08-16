@@ -76,7 +76,7 @@ export interface PipelineCtx {
   /**
    * Transient-OTP delivery address, sourced by the CALLER from the original
    * IdP subject token's own `email`/`preferred_username` claim (decoded
-   * server-side at sign-in — see the Big Blue Returns refund demo's
+   * server-side at sign-in — see a sibling reference implementation's
    * `token-exchange.ts::selectTransientOtpChannel`, which decodes
    * `req.subjectToken` directly for this exact reason). Takes priority over
    * `introspection.email` below: Verify's `/oauth2/userinfo` reflects the
