@@ -129,7 +129,11 @@ export function statusCodeFor(result: PipelineResult): number {
       // invalid_client/CSIAQ0155E is handled by the stale-secret retry
       // before this ever returns; invalid_scope/invalid_grant surface as
       // their own literal strings, distinct from 'access_denied'.
-      if (result.error === 'forbidden' || result.error === 'access_denied') return 403;
+      // 'invalid_request_state' is completePending's SEP-2322 verify-before-
+      // consume rejection (hitl/request-state.ts) — the SAME shape and the
+      // SAME status as the owner-mismatch 'forbidden' case above; see that
+      // function's doc comment for why they're treated alike.
+      if (result.error === 'forbidden' || result.error === 'access_denied' || result.error === 'invalid_request_state') return 403;
       if (result.error === 'inactive_session' || result.error === 'session_killed') return 401;
       // transient_email HITL mode (HITL_METHOD=transient_email): caller-
       // correctable input errors, not server failures.
@@ -222,7 +226,12 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
       // is never exposed to clients (it is a replayable credential).
       return { ok: true, data: unwrapToolData(result.data), _diagnostic: result.diag ?? {} };
     case 'pending':
-      return { ok: false, pending: true, txId: result.txId, pushInfo: result.pushInfo };
+      // requestState (SEP-2322/MRTR pre-adoption — hitl/request-state.ts) is
+      // an HMAC-protected blob, safe to hand to the client: it carries no
+      // secret, only a signed txId/sub/digest/exp a completer may echo back
+      // to /hitl/complete or the complete_hitl MCP tool for integrity
+      // binding. Both transports get it — it rides in this shared mapper.
+      return { ok: false, pending: true, txId: result.txId, requestState: result.requestState, pushInfo: result.pushInfo };
     case 'denied':
       // `killed` rides along when this deny is the one that crossed the
       // deny-counter threshold and fired the session kill. Without it the
@@ -366,6 +375,11 @@ export function resolveTestVerdictOverride(
 // (completePending 400s with otp_required if it's missing) — ignored for a
 // push-parked tx. Passed straight through; completePending is what actually
 // validates it against Verify's transient-verification endpoint.
+//
+// `requestState` is OPTIONAL — the SEP-2322 blob from the original pending
+// envelope (see pipelineResultToEnvelope's 'pending' case), echoed back for
+// completePending's validate-if-present integrity check. Omitting it keeps
+// today's behavior exactly (see completePending's own doc comment).
 app.post('/hitl/complete', async (req: Request, res: Response) => {
   const bearer = requireBearer(req, res);
   if (!bearer) return;
@@ -375,6 +389,7 @@ app.post('/hitl/complete', async (req: Request, res: Response) => {
   const txId = body['txId'] as string | undefined;
   if (!txId) return res.status(400).json({ error: 'missing_txId' });
   const otp = body['otp'] as string | undefined;
+  const requestState = body['requestState'] as string | undefined;
 
   const introspection = await introspectUser(bearer);
   const callerVerifyUserId = introspection.active ? introspection.verifyUserId : undefined;
@@ -396,8 +411,9 @@ app.post('/hitl/complete', async (req: Request, res: Response) => {
           },
         },
         otp,
+        requestState,
       )
-      : await completePending(txId, callerVerifyUserId, {}, otp);
+      : await completePending(txId, callerVerifyUserId, {}, otp, requestState);
     // Return the SAME `{ ok, data, _diagnostic }` envelope as /tool and /mcp —
     // a consumer resuming a step-up must not get a different shape than the
     // one that parked it (statusCodeFor still drives the HTTP status off the
@@ -557,8 +573,17 @@ const COMPLETE_HITL_SPEC: McpToolSpec = {
   config: {
     title: 'Complete a pending human-in-the-loop approval',
     description:
-      'Resumes a tool call that came back with pending:true and a txId (the human needs to approve a push or email code first — check pushInfo.method). Call this with that txId once the human says they approved it. If pushInfo.method was "email_otp", pass the 6-digit code the human read from their email as `otp` (REQUIRED in that case — omitting it returns otp_required). This call blocks until Verify\'s verification transaction reaches a terminal state (approved/denied/timeout) and then returns the SAME { ok, data, _diagnostic } envelope the original call would have returned had it not needed a step-up.',
-    inputSchema: { txId: z.string(), otp: z.string().optional() },
+      'Resumes a tool call that came back with pending:true and a txId (the human needs to approve a push or email code first — check pushInfo.method). Call this with that txId once the human says they approved it. If pushInfo.method was "email_otp", pass the 6-digit code the human read from their email as `otp` (REQUIRED in that case — omitting it returns otp_required). If the pending response also carried a `requestState`, pass it back too — it is optional, but if provided it must match the original request or the call is rejected. This call blocks until Verify\'s verification transaction reaches a terminal state (approved/denied/timeout) and then returns the SAME { ok, data, _diagnostic } envelope the original call would have returned had it not needed a step-up.',
+    inputSchema: {
+      txId: z.string(),
+      otp: z.string().optional(),
+      requestState: z
+        .string()
+        .optional()
+        .describe(
+          'The requestState blob from the original pending envelope, if the client captured it — echoed back for SEP-2322 integrity binding. Optional: omitting it preserves prior behavior.',
+        ),
+    },
   },
 };
 
@@ -655,10 +680,15 @@ export const mcpToolNames = (): string[] => MCP_TOOL_SPECS.map((s) => s.name);
  * escape hatch the REST route has for integration tests — an MCP client
  * always drives the real poll against Verify.
  */
-async function completeHitlForBearer(txId: string, bearer: string, otp?: string): Promise<PipelineResult> {
+async function completeHitlForBearer(
+  txId: string,
+  bearer: string,
+  otp?: string,
+  requestState?: string,
+): Promise<PipelineResult> {
   const introspection = await introspectUser(bearer);
   const callerVerifyUserId = introspection.active ? introspection.verifyUserId : undefined;
-  return completePending(txId, callerVerifyUserId, {}, otp);
+  return completePending(txId, callerVerifyUserId, {}, otp, requestState);
 }
 
 /** The MCP server identity — shared by buildMcpServer's McpServer constructor
@@ -672,7 +702,12 @@ function buildMcpServer(bearer: string, subjectEmail?: string): McpServer {
   const call = async (name: string, args: Record<string, unknown>) => {
     const result =
       name === COMPLETE_HITL_TOOL_NAME
-        ? await completeHitlForBearer(args['txId'] as string, bearer, args['otp'] as string | undefined)
+        ? await completeHitlForBearer(
+            args['txId'] as string,
+            bearer,
+            args['otp'] as string | undefined,
+            args['requestState'] as string | undefined,
+          )
         : await dispatchTool(name, args, bearer, subjectEmail);
     return { content: [{ type: 'text' as const, text: JSON.stringify(pipelineResultToEnvelope(result)) }] };
   };

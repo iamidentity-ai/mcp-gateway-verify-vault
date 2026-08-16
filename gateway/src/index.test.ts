@@ -33,18 +33,34 @@
  * the /mcp transport built.
  */
 import { describe, it, expect, vi } from 'vitest';
-import type { PipelineCtx } from './pipeline.js';
+import type { PipelineCtx, PipelineResult } from './pipeline.js';
 
 // vi.mock is hoisted above imports; vi.hoisted lets us share the mock fn
 // between the factory and the test bodies without TDZ errors — same pattern
 // as auth/token-exchange.test.ts.
+//
+// Typed explicitly as `Promise<PipelineResult>` (not inferred from the
+// literal `{status:'ok', ...}` return below) so mockResolvedValueOnce can
+// hand back other PipelineResult variants (e.g. 'pending', for the
+// requestState route-level tests below) without a type error.
 const pipelineMocks = vi.hoisted(() => ({
-  runPipeline: vi.fn(async (_ctx: PipelineCtx) => ({ status: 'ok' as const, data: { ok: true } })),
-  completePending: vi.fn(),
+  runPipeline: vi.fn(async (_ctx: PipelineCtx): Promise<PipelineResult> => ({ status: 'ok' as const, data: { ok: true } })),
+  completePending: vi.fn<(...args: unknown[]) => Promise<PipelineResult>>(),
 }));
 vi.mock('./pipeline.js', () => ({
   runPipeline: pipelineMocks.runPipeline,
   completePending: pipelineMocks.completePending,
+}));
+
+// Mocked ONLY so the new POST /hitl/complete route-level tests below (which
+// make a real HTTP round trip, same as the /mcp tests) never make a live
+// Verify introspection call — no test in this file exercised a route that
+// calls introspectUser before now.
+const introspectMocks = vi.hoisted(() => ({
+  introspectUser: vi.fn(async (_bearer: string) => ({ active: true, verifyUserId: 'user-1', email: 'agent@example.com' })),
+}));
+vi.mock('./auth/introspect.js', () => ({
+  introspectUser: introspectMocks.introspectUser,
 }));
 
 process.env['PORT'] = process.env['PORT'] ?? '39714';
@@ -146,6 +162,72 @@ describe('POST /mcp — x-user-email threading (mirrors /tool\'s trusted-header 
     await postGetRecord({ 'x-user-email': 'not-an-email' });
     expect(pipelineMocks.runPipeline).toHaveBeenCalledTimes(1);
     expect(pipelineMocks.runPipeline.mock.calls[0][0].subjectEmail).toBeUndefined();
+  });
+});
+
+// ── SEP-2322 requestState (Task 4) — route-level coverage ──────────────────
+//
+// pipelineResultToEnvelope's own unit tests (above) already prove the
+// mapping in isolation; these prove it survives an actual HTTP round trip on
+// BOTH sides of the requestState contract — /tool's 202 body actually
+// contains it, and /hitl/complete actually forwards a caller-supplied one
+// through to completePending (which is mocked here, same as every other
+// route-level test in this file — completePending's own verification logic
+// is covered by pipeline.test.ts's deps-injected suite).
+describe('POST /tool — pending envelope carries requestState (route-level)', () => {
+  it('202 body includes the requestState string from a pending PipelineResult', async () => {
+    pipelineMocks.runPipeline.mockResolvedValueOnce({
+      status: 'pending' as const,
+      txId: 'tx-route-1',
+      requestState: 'v1.route-payload.route-sig',
+      pushInfo: { method: 'push' as const, title: 'Approve', message: 'Confirm on your phone', transactionUri: 'urn:tx:route-1' },
+    });
+
+    const res = await fetch(`http://127.0.0.1:${process.env['PORT']}/tool`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-bearer-token' },
+      body: JSON.stringify({ name: 'update_record', arguments: { recordId: 'REC-1' } }),
+    });
+
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body).toMatchObject({ ok: false, pending: true, txId: 'tx-route-1', requestState: 'v1.route-payload.route-sig' });
+  });
+});
+
+describe('POST /hitl/complete — requestState passthrough (route-level)', () => {
+  it('forwards body.requestState through to completePending, alongside txId/otp', async () => {
+    pipelineMocks.completePending.mockClear();
+    pipelineMocks.completePending.mockResolvedValueOnce({ status: 'ok' as const, data: { ok: true } });
+
+    const res = await fetch(`http://127.0.0.1:${process.env['PORT']}/hitl/complete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-bearer-token' },
+      body: JSON.stringify({ txId: 'tx-complete-1', requestState: 'v1.complete-payload.complete-sig' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(pipelineMocks.completePending).toHaveBeenCalledWith(
+      'tx-complete-1',
+      'user-1',
+      {},
+      undefined,
+      'v1.complete-payload.complete-sig',
+    );
+  });
+
+  it('omitting requestState from the body forwards undefined (backward compatible — a txId-only completer is unaffected)', async () => {
+    pipelineMocks.completePending.mockClear();
+    pipelineMocks.completePending.mockResolvedValueOnce({ status: 'ok' as const, data: { ok: true } });
+
+    const res = await fetch(`http://127.0.0.1:${process.env['PORT']}/hitl/complete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-bearer-token' },
+      body: JSON.stringify({ txId: 'tx-complete-2' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(pipelineMocks.completePending).toHaveBeenCalledWith('tx-complete-2', 'user-1', {}, undefined, undefined);
   });
 });
 
@@ -309,10 +391,10 @@ describe('pipelineResultToEnvelope', () => {
     expect(envelope).toEqual({ ok: true, data: mcpEnvelope, _diagnostic: {} });
   });
 
-  it('pending — maps txId + pushInfo, ok:false, pending:true', () => {
+  it('pending — maps txId + requestState + pushInfo, ok:false, pending:true', () => {
     const pushInfo = { title: 'Approve update', message: 'Confirm on your phone', transactionUri: 'urn:tx:1' };
-    const envelope = pipelineResultToEnvelope({ status: 'pending', txId: 'tx-123', pushInfo });
-    expect(envelope).toEqual({ ok: false, pending: true, txId: 'tx-123', pushInfo });
+    const envelope = pipelineResultToEnvelope({ status: 'pending', txId: 'tx-123', requestState: 'v1.abc.def', pushInfo });
+    expect(envelope).toEqual({ ok: false, pending: true, txId: 'tx-123', requestState: 'v1.abc.def', pushInfo });
   });
 
   it('denied — maps reason, ok:false, denied:true', () => {
@@ -420,12 +502,14 @@ describe('pipelineResultToEnvelope', () => {
     const envelope = pipelineResultToEnvelope({
       status: 'pending',
       txId: 'tx-456',
+      requestState: 'v1.ghi.jkl',
       pushInfo: { method: 'email_otp', maskedDestination: 's•••@example.com' },
     });
     expect(envelope).toEqual({
       ok: false,
       pending: true,
       txId: 'tx-456',
+      requestState: 'v1.ghi.jkl',
       pushInfo: { method: 'email_otp', maskedDestination: 's•••@example.com' },
     });
   });
@@ -434,7 +518,7 @@ describe('pipelineResultToEnvelope', () => {
 describe('statusCodeFor', () => {
   it.each([
     ['ok', { status: 'ok', data: {} }, 200],
-    ['pending', { status: 'pending', txId: 'tx-1' }, 202],
+    ['pending', { status: 'pending', txId: 'tx-1', requestState: 'v1.abc.def' }, 202],
     ['denied (tier-4 local gate)', { status: 'denied', reason: 'policy_deny' }, 403],
     ['session_killed_suspicious', { status: 'session_killed_suspicious' }, 401],
     ['error: inactive_session', { status: 'error', error: 'inactive_session' }, 401],
@@ -444,6 +528,10 @@ describe('statusCodeFor', () => {
     // to 403 like the tier-4 'denied' status, not the generic 500 every
     // other exchange error still gets below.
     ['error: access_denied', { status: 'error', error: 'access_denied' }, 403],
+    // NEW (SEP-2322 requestState, Task 4): completePending's verify-before-
+    // consume rejection maps to the SAME 403 as the owner-mismatch
+    // 'forbidden' case it shares a result shape with.
+    ['error: invalid_request_state', { status: 'error', error: 'invalid_request_state' }, 403],
     // Unchanged — any OTHER exchange-error string (bad scope, stale
     // config, a network blip surfaced as token_exchange_failed, ...) still
     // falls through to 500. access_denied must not have widened this.

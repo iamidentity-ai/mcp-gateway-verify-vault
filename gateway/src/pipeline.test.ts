@@ -57,6 +57,7 @@ import {
   __resetForTests as resetPendingStore,
   type PendingCtx,
 } from './hitl/pending.js';
+import { mintRequestState, verifyRequestState, requestDigest } from './hitl/request-state.js';
 
 function makeGateResult(
   overrides: Partial<{
@@ -675,6 +676,36 @@ describe('runPipeline', () => {
     expectOrder(calls, ['gateTool', 'exchangeToken', 'triggerOAuthMfaPush', 'putPending']);
   });
 
+  // ── SEP-2322 requestState (Task 4) ──────────────────────────────────────
+  it('tier 2 mfa_challenge (push) -> the pending result carries a requestState that verifies against the SAME txId/owner/args the pending ctx was parked with', async () => {
+    const { deps } = makeRunDeps({
+      gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),
+      exchangeToken: async () => ({ status: 'mfa_challenge' as const, challengeToken: 'challenge-xyz' }),
+    });
+
+    const args = { recordId: 'REC-1', field: 'status', value: 'active' };
+    const result = await runPipeline({ userToken: 'user-token', toolName: 'update_record', args }, deps as any);
+
+    expect(result.status).toBe('pending');
+    if (result.status !== 'pending') throw new Error('expected pending');
+    expect(typeof result.requestState).toBe('string');
+
+    // `now: () => 1_000` in makeRunDeps' base deps — verify strictly before
+    // that exp with a nowMs that is still inside the TTL window.
+    const verdict = verifyRequestState(
+      result.requestState,
+      { txId: result.txId, sub: 'user-1', digest: requestDigest('update_record', args) },
+      1_000,
+    );
+    expect(verdict).toEqual({ ok: true });
+
+    // Binds to THIS transaction only: a different txId, owner, or digest
+    // must not verify against it.
+    expect(
+      verifyRequestState(result.requestState, { txId: 'some-other-tx', sub: 'user-1', digest: requestDigest('update_record', args) }, 1_000),
+    ).toEqual({ ok: false, reason: 'mismatch' });
+  });
+
   it('exchangeToken error -> {status:"error"}, no mint/upstream, audited as "exchange_error"', async () => {
     // list_records is NOT a discovery tool (see the DB-backed tests below) —
     // it takes the normal single-exchange, suppressAudit:false path, unlike
@@ -1136,6 +1167,115 @@ describe('completePending', () => {
     expect(deps.pollOAuthMfaStatus).not.toHaveBeenCalled();
     expect(deps.emitSessionRevoked).not.toHaveBeenCalled();
     expect(deps.markKilled).not.toHaveBeenCalled();
+  });
+
+  // ── SEP-2322 requestState (Task 4) — validate-if-present ────────────────
+  describe('requestState (SEP-2322 validate-if-present)', () => {
+    it('no requestState -> unchanged behavior (matches the pre-existing happy path exactly)', async () => {
+      const { deps } = makeCompleteDeps();
+
+      const result = await completePending('tx-1', 'user-1', deps as any, undefined, undefined);
+
+      expect(result).toMatchObject({ status: 'ok', data: { ok: true } });
+    });
+
+    it("valid requestState (matches the pending entry's own owner/tool/args) -> succeeds exactly like the no-requestState path", async () => {
+      const { deps } = makeCompleteDeps();
+      // makeCtx() defaults: verifyUserId 'user-1', toolName 'update_record', args {}.
+      const rs = mintRequestState({
+        txId: 'tx-1',
+        sub: 'user-1',
+        exp: 1_000_000,
+        digest: requestDigest('update_record', {}),
+      });
+
+      const result = await completePending('tx-1', 'user-1', deps as any, undefined, rs);
+
+      expect(result).toMatchObject({ status: 'ok', data: { ok: true } });
+    });
+
+    it("a requestState whose digest doesn't match the pending entry's real toolName/args -> invalid_request_state, nothing acted on", async () => {
+      const { deps } = makeCompleteDeps();
+      const rs = mintRequestState({
+        txId: 'tx-1',
+        sub: 'user-1',
+        exp: 1_000_000,
+        // The entry's real toolName is 'update_record' (makeCtx default) —
+        // this digest is over a different tool, so it can never match.
+        digest: requestDigest('some_other_tool', {}),
+      });
+
+      const result = await completePending('tx-1', 'user-1', deps as any, undefined, rs);
+
+      expect(result).toEqual({ status: 'error', error: 'invalid_request_state' });
+      expect(deps.pollOAuthMfaStatus).not.toHaveBeenCalled();
+      expect(deps.takePending).not.toHaveBeenCalled();
+      expect(deps.mintCred).not.toHaveBeenCalled();
+      expect(deps.callUpstreamTool).not.toHaveBeenCalled();
+    });
+
+    it('an EXPIRED requestState -> invalid_request_state', async () => {
+      const { deps } = makeCompleteDeps(); // now: () => 2_000 in makeCompleteDeps' base
+      const rs = mintRequestState({
+        txId: 'tx-1',
+        sub: 'user-1',
+        exp: 1_500, // already expired relative to the injected now:2_000
+        digest: requestDigest('update_record', {}),
+      });
+
+      const result = await completePending('tx-1', 'user-1', deps as any, undefined, rs);
+
+      expect(result).toEqual({ status: 'error', error: 'invalid_request_state' });
+    });
+
+    // Uses the REAL pending store (not the stateless stub deps above) so
+    // "the pending entry survives" is an actual, provable claim — mirrors
+    // the "REAL PendingCtx store" round-trip test above.
+    it('tampered requestState -> invalid_request_state, the pending entry SURVIVES (verify-before-consume): a follow-up complete with just the txId still works', async () => {
+      resetPendingStore();
+
+      const { deps: runDeps } = makeRunDeps({
+        gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),
+        exchangeToken: async () => ({ status: 'mfa_challenge' as const, challengeToken: 'challenge-xyz' }),
+        genTxId: () => 'tx-request-state-tamper',
+        putPending: realPutPending,
+      });
+
+      const parkResult = await runPipeline(
+        { userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1', field: 'status', value: 'active' } },
+        runDeps as any,
+      );
+      expect(parkResult.status).toBe('pending');
+      if (parkResult.status !== 'pending') throw new Error('expected pending');
+
+      // Flip the trailing character of the signature segment: same length,
+      // still a plausible base64url string, but no longer the HMAC of
+      // anything this process would actually have produced.
+      const tampered = parkResult.requestState.slice(0, -1) + (parkResult.requestState.endsWith('A') ? 'B' : 'A');
+
+      const { deps: completeDeps } = makeCompleteDeps({
+        peekPending: realPeekPending,
+        takePending: realTakePending,
+      });
+
+      const tamperedAttempt = await completePending(
+        'tx-request-state-tamper',
+        'user-1',
+        completeDeps as any,
+        undefined,
+        tampered,
+      );
+      expect(tamperedAttempt).toEqual({ status: 'error', error: 'invalid_request_state' });
+      expect(completeDeps.takePending).not.toHaveBeenCalled();
+      expect(completeDeps.pollOAuthMfaStatus).not.toHaveBeenCalled();
+
+      // The entry survived: a follow-up complete with just the txId (no
+      // requestState at all) still succeeds.
+      const followUp = await completePending('tx-request-state-tamper', 'user-1', completeDeps as any);
+      expect(followUp.status).toBe('ok');
+
+      resetPendingStore();
+    });
   });
 
   it('approved -> exchangeMfaAssertionWithRAR -> mint -> upstream -> revoke -> clearDeny -> ok (matching caller — unchanged happy path)', async () => {
