@@ -283,6 +283,20 @@ async function dispatchTool(
   return runPipeline({ userToken: bearer, toolName, args, senderConstrained: resolveBindingMode() === 'full', subjectEmail });
 }
 
+/**
+ * Server-to-server only — set by a trusted UI backend from the ORIGINAL IdP
+ * subject token it already decoded at sign-in, never by the browser or the
+ * model. See PipelineCtx.subjectEmail's doc in pipeline.ts. Shared by BOTH
+ * transports (/tool and /mcp) so a caller-supplied subject email drives
+ * transient-OTP delivery identically regardless of which one carried the
+ * call — see buildMcpServer's use for /mcp, which previously had no path
+ * for this header at all.
+ */
+function subjectEmailFromHeader(req: Request): string | undefined {
+  const v = req.header('x-user-email');
+  return v && v.includes('@') ? v : undefined;
+}
+
 // ── Transport 1: POST /tool (simple REST, curl-friendly) ─────────────────
 app.post('/tool', async (req: Request, res: Response) => {
   const bearer = requireBearer(req, res);
@@ -294,11 +308,7 @@ app.post('/tool', async (req: Request, res: Response) => {
   const args = (body['arguments'] ?? body['args'] ?? {}) as Record<string, unknown>;
   if (!name) return res.status(400).json({ error: 'missing_name' });
 
-  // Server-to-server only — set by a trusted UI backend from the ORIGINAL
-  // IdP subject token it already decoded at sign-in, never by the browser
-  // or the model. See PipelineCtx.subjectEmail's doc in pipeline.ts.
-  const subjectEmailHeader = req.header('x-user-email');
-  const subjectEmail = subjectEmailHeader && subjectEmailHeader.includes('@') ? subjectEmailHeader : undefined;
+  const subjectEmail = subjectEmailFromHeader(req);
 
   try {
     const result = await dispatchTool(name, args, bearer, subjectEmail);
@@ -649,14 +659,14 @@ async function completeHitlForBearer(txId: string, bearer: string, otp?: string)
   return completePending(txId, callerVerifyUserId, {}, otp);
 }
 
-function buildMcpServer(bearer: string): McpServer {
+function buildMcpServer(bearer: string, subjectEmail?: string): McpServer {
   const server = new McpServer({ name: SERVICE, version: '0.1.0' });
 
   const call = async (name: string, args: Record<string, unknown>) => {
     const result =
       name === COMPLETE_HITL_TOOL_NAME
         ? await completeHitlForBearer(args['txId'] as string, bearer, args['otp'] as string | undefined)
-        : await dispatchTool(name, args, bearer);
+        : await dispatchTool(name, args, bearer, subjectEmail);
     return { content: [{ type: 'text' as const, text: JSON.stringify(pipelineResultToEnvelope(result)) }] };
   };
 
@@ -674,7 +684,8 @@ app.post('/mcp', async (req: Request, res: Response) => {
   if (!bearer) return;
   if (!(await requireDpopBound(req, res, bearer))) return;
 
-  const server = buildMcpServer(bearer);
+  const subjectEmail = subjectEmailFromHeader(req);
+  const server = buildMcpServer(bearer, subjectEmail);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on('close', () => {
     transport.close();
