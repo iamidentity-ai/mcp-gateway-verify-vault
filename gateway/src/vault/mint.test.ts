@@ -31,11 +31,15 @@ const AUTHZ_DETAILS: AuthorizationDetail[] = [
     type: 'vault:path_access',
     path_constraint: 'verify-rar/creds/records',
     action: 'update',
+    path: 'verify-rar/creds/records',
+    capabilities: ['update'],
   },
   {
     type: 'vault:path_access',
     path_constraint: 'sys/leases/revoke',
     action: 'update',
+    path: 'sys/leases/revoke',
+    capabilities: ['update'],
   },
 ];
 
