@@ -23,8 +23,29 @@
  * the real "happy path breaks" bug). See pipeline.test.ts for
  * completePending's own (deps-injected) coverage of the identity-binding
  * fix and the leg-2 retry.
+ *
+ * Also covers a real POST /mcp round trip (JSON-RPC tools/call over the
+ * Streamable HTTP transport, stateless mode — see index.ts's buildMcpServer
+ * doc comment) to prove x-user-email actually threads through the SAME
+ * subjectEmailFromHeader + PipelineCtx.subjectEmail path /tool uses. pipeline.js's
+ * runPipeline is the one seam mocked for this, so the round trip never makes
+ * a live Verify/Vault call and the test can inspect exactly what PipelineCtx
+ * the /mcp transport built.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import type { PipelineCtx } from './pipeline.js';
+
+// vi.mock is hoisted above imports; vi.hoisted lets us share the mock fn
+// between the factory and the test bodies without TDZ errors — same pattern
+// as auth/token-exchange.test.ts.
+const pipelineMocks = vi.hoisted(() => ({
+  runPipeline: vi.fn(async (_ctx: PipelineCtx) => ({ status: 'ok' as const, data: { ok: true } })),
+  completePending: vi.fn(),
+}));
+vi.mock('./pipeline.js', () => ({
+  runPipeline: pipelineMocks.runPipeline,
+  completePending: pipelineMocks.completePending,
+}));
 
 process.env['PORT'] = process.env['PORT'] ?? '39714';
 
@@ -85,6 +106,46 @@ describe('buildToolSpecs — per-tool schema choice + complete_hitl dedupe', () 
       get_record: { tier: 1, rarAction: 'record_read', scope: 'records:read' },
     });
     expect(specs.filter((s) => s.name === 'complete_hitl')).toHaveLength(1);
+  });
+});
+
+describe('POST /mcp — x-user-email threading (mirrors /tool\'s trusted-header model)', () => {
+  // A single real JSON-RPC tools/call POST, exactly what an MCP client sends.
+  // get_record is in the shipped config/tools.json and takes no HITL detour,
+  // so the call reaches dispatchTool -> the mocked runPipeline every time.
+  async function postGetRecord(headers: Record<string, string>): Promise<void> {
+    const res = await fetch(`http://127.0.0.1:${process.env['PORT']}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: 'Bearer test-bearer-token',
+        ...headers,
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'get_record', arguments: { recordId: 'REC-1' } },
+      }),
+    });
+    // Drain the SSE body so the request/response cycle is complete before
+    // asserting on the mock — the transport streams the tool result back.
+    await res.text();
+  }
+
+  it('threads x-user-email from POST /mcp through to dispatch', async () => {
+    pipelineMocks.runPipeline.mockClear();
+    await postGetRecord({ 'x-user-email': 'person@example.com' });
+    expect(pipelineMocks.runPipeline).toHaveBeenCalledTimes(1);
+    expect(pipelineMocks.runPipeline.mock.calls[0][0].subjectEmail).toBe('person@example.com');
+  });
+
+  it('ignores an x-user-email header without an @ on POST /mcp', async () => {
+    pipelineMocks.runPipeline.mockClear();
+    await postGetRecord({ 'x-user-email': 'not-an-email' });
+    expect(pipelineMocks.runPipeline).toHaveBeenCalledTimes(1);
+    expect(pipelineMocks.runPipeline.mock.calls[0][0].subjectEmail).toBeUndefined();
   });
 });
 
