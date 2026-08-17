@@ -23,12 +23,29 @@ importantly - what the gateway does *not* claim.
 - **Escape a report of abuse.** Three denials in five minutes, or one "suspicious" report from the
   phone, emit a CAEP event → transmitter → IdP session-delete across **every federated app**, and the
   local kill-gate 401s the next call immediately during propagation. With `BLOCKED_ACTION_KILL=true`
-  three **tier-4** attempts do the same — a client that has been talked into reaching outside its
+  three **tier-4** attempts do the same - a client that has been talked into reaching outside its
   grant loses the session it was reaching with. This is a response to observed behaviour, **not**
   detection of what talked it into that; the gateway never reads content.
+- **Inject a header downstream via tool-call arguments (SEP-2243 `x-mcp-header` / `Mcp-Param-*`).**
+  The gateway is structurally immune, not policy-immune. Southbound headers to the upstream MCP are
+  built from a fixed `{obo, dbUser, dbPass}` + auth-mode allowlist (`buildUpstreamHeaders` in
+  `proxy/upstream.ts`), never from tool-call arguments or any inbound request header - a poisoned
+  `arguments` object carrying `x-mcp-header`/`Mcp-Param-*`-shaped keys cannot turn into an emitted
+  header name, and the allowlist is pinned by a dedicated adversarial-input test suite
+  (`upstream.test.ts`). Tool schemas advertised to the client are locally authored
+  (`config/tools.json` / the reference `KNOWN_TOOL_SPECS`), never lifted from the upstream MCP's own
+  `tools/list`, so the upstream side of the proxy has no channel to smuggle a header-shaped field
+  into the schema either.
 - **Weaponize step-up against another user.** `/hitl/complete` is identity-bound; a bearer holder who
   learns a victim's `txId` cannot complete or kill the victim's transaction (`403 forbidden`, before
-  any side effect).
+  any side effect). A presented `requestState` (SEP-2322 pre-adoption) raises that bar further: it is
+  an HMAC-signed claim binding the transaction's owner, an expiry, and a digest of the originating
+  tool call, verified before the pending entry is consumed. Where the identity check alone stops a
+  *different user* from resuming someone else's `txId`, a `requestState` additionally proves the
+  completion is for the *same request* that was parked, not merely presented by the right owner, and
+  it self-expires. It is optional - the identity check and the single-use pending store are already
+  sufficient on their own - and a rejected `requestState` does not consume the entry, so the caller
+  can still retry with `txId` alone.
 - **Strip the RAR at approval.** The second (`jwt_bearer`) leg **re-sends** `authorization_details`, so
   an approved OBO always carries the RAR Vault matches against - a credential is never minted unbound
   from the approved transaction.

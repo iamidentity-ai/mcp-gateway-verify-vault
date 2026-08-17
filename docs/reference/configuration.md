@@ -82,7 +82,8 @@ for the kill to actually happen; the dashboard is observability only.
 | `MFA_POLL_INTERVAL_MS` | `3000` | Step-up poll cadence. |
 | `MFA_POLL_TIMEOUT_MS` | `120000` | Overall step-up poll timeout. |
 | `HITL_PENDING_TTL_MS` | `130000` | TTL for a parked `mfa_challenge` transaction. |
-| `SSF_KILLED_SESSION_TTL_MS` | `300000` | Local kill-gate TTL (covers the 30–75s transmitter→Verify revoke-propagation window). |
+| `SSF_KILLED_SESSION_TTL_MS` | `300000` | Local kill-gate TTL (covers the 30-75s transmitter→Verify revoke-propagation window). |
+| `HITL_STATE_SECRET` | *(unset)* | HMAC key for the SEP-2322 `requestState` blob (see [human-in-the-loop](../concepts/human-in-the-loop.md#requeststate-integrity-sep-2322)), optional. Unset means a random 32-byte key generated once per process - correct for this single-instance design, since a restart already clears the in-memory pending store, so an outstanding `requestState` has nothing left to verify against anyway. Set it only if you need a `requestState` minted by one process to verify on another (a future multi-instance deployment); the practical default is to leave it unset. |
 
 ## Dev/test only
 
