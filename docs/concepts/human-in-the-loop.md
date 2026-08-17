@@ -88,6 +88,37 @@ caller sees `pending` rather than a hard error - but there is then no `transacti
 from. `/hitl/complete` recognizes that state and returns a clean `no_poll_url` / `otp_init_failed`
 error instead of crashing on an empty poll URL.
 
+### requestState integrity (SEP-2322)
+
+Every pending envelope - on both `/tool`/`/mcp` and both HITL methods - carries a `requestState`
+blob alongside `txId`. It is the gateway's pre-adoption of SEP-2322's (MRTR) integrity binding: an
+HMAC-signed claim set binding the **principal** (`sub`, the parked transaction's owner), an
+**expiry** (`exp`), and a **digest of the originating request** (a hash of the tool name and its
+canonicalized arguments). `/hitl/complete` and the `complete_hitl` MCP tool both accept it back as
+an optional `requestState` field, verified **before** the pending entry is consumed - off the
+entry's own stored owner and a digest recomputed from its own stored tool name/arguments, never
+from anything the caller presents, so a completer cannot mint a claim to match a tampered value.
+
+**It layers on top of the identity check above, not in place of it.** Single-use consumption
+(`takePending`) and the owner check (this section's own opening subsection) already decide *who*
+may resume a transaction; `requestState`, when presented, additionally proves the completer is
+resuming the *same* request that was parked, with a claim that expires. Omitting it is unaffected
+behavior - today's owner check plus the one-shot store are still sufficient on their own. A bad
+`requestState` (wrong signature, expired, or a mismatched `txId`/`sub`/digest) is rejected with
+`error: "invalid_request_state"` and **does not consume** the pending entry, so a completer that
+retries with just `txId` still succeeds. A wrong OTP on a `transient_email`-mode transaction
+re-parks the same `txId` and mints a **fresh** `requestState` on that `otp_invalid` result, because
+the re-park refreshes the entry's TTL but the original blob's `exp` does not follow it - a
+compliant client should always echo the most-recently-received `requestState`.
+
+**Forward-map to full SEP-2322 adoption.** When the installed MCP SDK adopts protocol 2026-07-28,
+the pending envelope this section describes becomes an in-protocol MRTR `input_required` result
+carrying this same `requestState`, and `complete_hitl` becomes that result's retry leg - a push
+step-up maps to a bare `requestState` round-trip, and `transient_email` OTP maps to a form-mode
+`ElicitRequest`. The gateway's shape was chosen now, ahead of that SDK support, specifically to
+make the eventual migration mechanical rather than a redesign. See the
+[2026-07-28 adoption-status page](../reference/mcp-2026-07-28.md) for the full mapping.
+
 ## 2. Classification discovery is gateway-derived
 
 Here is the trap step-up usually falls into: if the *caller* tells you "this is a restricted record,
