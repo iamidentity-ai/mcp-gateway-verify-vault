@@ -48,6 +48,7 @@ export function isDiscoverRequest(
 ): body is { jsonrpc: '2.0'; id: string | number; method: 'server/discover'; params?: unknown } {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) return false;
   const obj = body as Record<string, unknown>;
+  if (obj['jsonrpc'] !== '2.0') return false;
   if (obj['method'] !== 'server/discover') return false;
   const id = obj['id'];
   return typeof id === 'string' || typeof id === 'number';

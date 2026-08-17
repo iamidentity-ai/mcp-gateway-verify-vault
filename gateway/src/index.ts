@@ -385,7 +385,12 @@ export function resolveTestVerdictOverride(
 // `requestState` is OPTIONAL — the SEP-2322 blob from the original pending
 // envelope (see pipelineResultToEnvelope's 'pending' case), echoed back for
 // completePending's validate-if-present integrity check. Omitting it keeps
-// today's behavior exactly (see completePending's own doc comment).
+// today's behavior exactly (see completePending's own doc comment). Read off
+// the parsed body with no cast (`body['requestState']` is already `unknown`)
+// and passed straight through unchanged: completePending is the boundary
+// that decides what counts as absent (undefined or a JSON `null`) versus
+// malformed (any other non-string value gets a 403 invalid_request_state,
+// never a crash) — this route does not pre-judge the shape.
 app.post('/hitl/complete', async (req: Request, res: Response) => {
   const bearer = requireBearer(req, res);
   if (!bearer) return;
@@ -395,7 +400,7 @@ app.post('/hitl/complete', async (req: Request, res: Response) => {
   const txId = body['txId'] as string | undefined;
   if (!txId) return res.status(400).json({ error: 'missing_txId' });
   const otp = body['otp'] as string | undefined;
-  const requestState = body['requestState'] as string | undefined;
+  const requestState = body['requestState'];
 
   const introspection = await introspectUser(bearer);
   const callerVerifyUserId = introspection.active ? introspection.verifyUserId : undefined;

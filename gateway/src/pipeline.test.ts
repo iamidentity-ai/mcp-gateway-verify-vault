@@ -1276,6 +1276,34 @@ describe('completePending', () => {
 
       resetPendingStore();
     });
+
+    // A JSON request body can carry `null` for an omitted optional field
+    // (some codegen clients always emit it) rather than dropping the key
+    // entirely. completePending must treat the two identically.
+    it('requestState: null -> unchanged behavior, exactly like requestState: undefined (JSON null counts as absent)', async () => {
+      const { deps } = makeCompleteDeps();
+
+      const result = await completePending('tx-1', 'user-1', deps as any, undefined, null);
+
+      expect(result).toMatchObject({ status: 'ok', data: { ok: true } });
+    });
+
+    // Any OTHER non-string value is not silently ignored — it reaches
+    // verifyRequestState and is rejected exactly like a garbled string
+    // blob, never a thrown TypeError and never a value the gate lets past.
+    it.each([
+      ['a number', 123],
+      ['a boolean', true],
+      ['a plain object', { v: 1 }],
+    ])('requestState: %s -> invalid_request_state, nothing acted on (not treated as absent)', async (_label, badRequestState) => {
+      const { deps } = makeCompleteDeps();
+
+      const result = await completePending('tx-1', 'user-1', deps as any, undefined, badRequestState);
+
+      expect(result).toEqual({ status: 'error', error: 'invalid_request_state' });
+      expect(deps.pollOAuthMfaStatus).not.toHaveBeenCalled();
+      expect(deps.takePending).not.toHaveBeenCalled();
+    });
   });
 
   it('approved -> exchangeMfaAssertionWithRAR -> mint -> upstream -> revoke -> clearDeny -> ok (matching caller — unchanged happy path)', async () => {

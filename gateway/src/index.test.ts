@@ -229,6 +229,112 @@ describe('POST /hitl/complete — requestState passthrough (route-level)', () =>
     expect(res.status).toBe(200);
     expect(pipelineMocks.completePending).toHaveBeenCalledWith('tx-complete-2', 'user-1', {}, undefined, undefined);
   });
+
+  // A JSON `null` must not crash the route — index.ts used to blind-cast the
+  // body field to `string | undefined`, which let `null` (and any other
+  // non-string JSON value) reach verifyRequestState's `.split('.')` and
+  // throw, turning into a generic 500 instead of the documented behavior.
+  // `null` specifically is ruled equivalent to an omitted key, the same
+  // treatment `otp` already gets — this pins that the route forwards it
+  // through as-is (`JSON.parse` turns the literal `null` into JS `null`,
+  // not `undefined`) and relies on completePending's `!= null` gate, not on
+  // this route rewriting it to `undefined` itself.
+  it('requestState: null in the body behaves exactly like an omitted key (forwarded through as null, not crashed)', async () => {
+    pipelineMocks.completePending.mockClear();
+    pipelineMocks.completePending.mockResolvedValueOnce({ status: 'ok' as const, data: { ok: true } });
+
+    const res = await fetch(`http://127.0.0.1:${process.env['PORT']}/hitl/complete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-bearer-token' },
+      body: JSON.stringify({ txId: 'tx-complete-3', requestState: null }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(pipelineMocks.completePending).toHaveBeenCalledWith('tx-complete-3', 'user-1', {}, undefined, null);
+  });
+
+  // Any OTHER non-string requestState is malformed input, not absent input —
+  // it must reach completePending (mocked here to return the real rejection
+  // shape) and come back as the documented 403, never a 500.
+  it('requestState: 123 (a non-string, non-null value) reaches completePending and surfaces its 403 invalid_request_state, not a crash', async () => {
+    pipelineMocks.completePending.mockClear();
+    pipelineMocks.completePending.mockResolvedValueOnce({ status: 'error' as const, error: 'invalid_request_state' });
+
+    const res = await fetch(`http://127.0.0.1:${process.env['PORT']}/hitl/complete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer test-bearer-token' },
+      body: JSON.stringify({ txId: 'tx-complete-4', requestState: 123 }),
+    });
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body).toEqual({ ok: false, error: 'invalid_request_state' });
+    expect(pipelineMocks.completePending).toHaveBeenCalledWith('tx-complete-4', 'user-1', {}, undefined, 123);
+  });
+});
+
+describe('POST /mcp — complete_hitl tool + pending envelope (MCP-transport coverage)', () => {
+  // The route-level /hitl/complete tests above cover the REST transport;
+  // nothing in this file yet drives the /mcp transport's own complete_hitl
+  // tool or checks that a pending PipelineResult survives the MCP
+  // CallToolResult unwrap. Both share this helper: post a real tools/call,
+  // then unwrap the SDK's stateless Streamable HTTP response. The transport
+  // answers over SSE (`event: message\ndata: <json>\n\n`) rather than a bare
+  // JSON body, so the single `data:` line this one-shot request produces is
+  // parsed as the JSON-RPC envelope.
+  async function postMcpToolCall(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<{ status: number; rpc: { jsonrpc: string; id: unknown; result?: { content: { type: string; text: string }[] }; error?: { code: number; message: string } } }> {
+    const res = await fetch(`http://127.0.0.1:${process.env['PORT']}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: 'Bearer test-bearer-token',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+    });
+    const raw = await res.text();
+    const dataLine = raw.split('\n').find((line) => line.startsWith('data: '));
+    if (!dataLine) throw new Error(`no SSE "data:" line in /mcp response: ${JSON.stringify(raw)}`);
+    return { status: res.status, rpc: JSON.parse(dataLine.slice('data: '.length)) };
+  }
+
+  it('complete_hitl(txId, otp, requestState) threads all three to completePending in the exact positional order (pins both the zod schema carrying requestState and the otp/requestState argument order)', async () => {
+    pipelineMocks.completePending.mockClear();
+    pipelineMocks.completePending.mockResolvedValueOnce({ status: 'ok' as const, data: { ok: true } });
+
+    const { status, rpc } = await postMcpToolCall('complete_hitl', {
+      txId: 'tx-1',
+      otp: '123456',
+      requestState: 'v1.a.b',
+    });
+
+    expect(status).toBe(200);
+    expect(rpc.error).toBeUndefined();
+    // introspectMocks.introspectUser (mocked module-wide, above) always
+    // resolves verifyUserId 'user-1' for this bearer.
+    expect(pipelineMocks.completePending).toHaveBeenCalledWith('tx-1', 'user-1', {}, '123456', 'v1.a.b');
+  });
+
+  it('a pending PipelineResult survives the CallToolResult text-JSON unwrap: pending:true, txId, AND requestState all reach the caller', async () => {
+    pipelineMocks.runPipeline.mockClear();
+    pipelineMocks.runPipeline.mockResolvedValueOnce({
+      status: 'pending' as const,
+      txId: 'tx-mcp-pending-1',
+      requestState: 'v1.x.y',
+      pushInfo: { method: 'push' as const, title: 'Approve', message: 'Confirm on your phone', transactionUri: 'urn:tx:mcp-pending-1' },
+    });
+
+    const { status, rpc } = await postMcpToolCall('get_record', { recordId: 'REC-1' });
+
+    expect(status).toBe(200);
+    const text = rpc.result?.content[0]?.text;
+    expect(typeof text).toBe('string');
+    const envelope = JSON.parse(text as string) as { pending?: boolean; txId?: string; requestState?: string };
+    expect(envelope).toMatchObject({ pending: true, txId: 'tx-mcp-pending-1', requestState: 'v1.x.y' });
+  });
 });
 
 describe('POST /mcp — SEP-2243 Mcp-Method/Mcp-Name header validation', () => {

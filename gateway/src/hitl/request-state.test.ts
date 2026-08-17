@@ -8,6 +8,8 @@
  *   - expired exp -> expired
  *   - wrong txId / sub / digest in the verifier's `expect` -> mismatch
  *   - structurally garbage blobs -> malformed
+ *   - non-string blobs (number/boolean/object/array/null/undefined) ->
+ *     malformed, never a throw
  *   - requestDigest is key-order independent (canonical JSON)
  *   - HITL_STATE_SECRET env is honored: a blob minted under one secret fails
  *     once the env secret changes, and a fresh mint under the new secret
@@ -115,6 +117,36 @@ describe('garbage blob -> malformed', () => {
     ['empty signature segment', 'v1.abc.'],
     ['empty string', ''],
   ])('%s -> malformed', (_label, blob) => {
+    const verdict = verifyRequestState(blob, { txId: 'tx-1', sub: 'user-1', digest: 'x' });
+    expect(verdict).toEqual({ ok: false, reason: 'malformed' });
+  });
+});
+
+describe('non-string blob -> malformed, never a throw', () => {
+  // The REST /hitl/complete route (index.ts) forwards `body['requestState']`
+  // through unchanged — a JSON body places no type constraint on that field,
+  // so a caller can send any JSON value there. verifyRequestState is the
+  // boundary that must handle every one of them without throwing.
+  it.each([
+    ['a number', 123],
+    ['a boolean', true],
+    ['a plain object', { not: 'a blob' }],
+    ['an array', ['v1', 'abc', 'def']],
+  ])('%s -> malformed', (_label, blob) => {
+    expect(() => verifyRequestState(blob, { txId: 'tx-1', sub: 'user-1', digest: 'x' })).not.toThrow();
+    const verdict = verifyRequestState(blob, { txId: 'tx-1', sub: 'user-1', digest: 'x' });
+    expect(verdict).toEqual({ ok: false, reason: 'malformed' });
+  });
+
+  // null/undefined are NOT this function's absent-vs-malformed decision —
+  // that gate lives one layer up, in completePending (see pipeline.ts's
+  // `requestState != null` check and pipeline.test.ts's coverage of it).
+  // verifyRequestState itself is never called at all for either value in
+  // production, but as a total function it still must not throw if it were.
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+  ])('%s -> malformed (this function itself has no absent case)', (_label, blob) => {
     const verdict = verifyRequestState(blob, { txId: 'tx-1', sub: 'user-1', digest: 'x' });
     expect(verdict).toEqual({ ok: false, reason: 'malformed' });
   });
