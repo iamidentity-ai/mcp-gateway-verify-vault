@@ -2,8 +2,9 @@
 
 The gateway is **agent-agnostic by construction**. Nothing in the pipeline knows or cares what
 reasoning loop sits north of it. This guide gives you copy-paste adapters for the common callers -
-raw `fetch`, the MCP SDK client, a LangChain tool wrapper, and a Claude custom-tool loop - all
-showing the one thing every caller must get right: the **`202 pending` → `/hitl/complete`** handoff.
+raw `fetch`, the MCP SDK client, a LangChain tool wrapper, a Claude custom-tool loop, a Strands
+agent, and an OpenAI Agents SDK agent - all showing the one thing every caller must get right: the
+**`202 pending` → `/hitl/complete`** handoff.
 
 ## The whole contract, restated
 
@@ -27,6 +28,20 @@ A caller that ignores `pending` does **not** break security - the record is with
 just can't complete step-up actions. See [the consumer contract](../concepts/human-in-the-loop.md#the-consumer-contract-202-pending-is-resok).
 
 What the agent **never** receives: DB credentials, Vault tokens, or the OBO's signing authority.
+
+---
+
+## Five-minute checklist
+
+1. Get a user bearer - any access token from an OIDC login on your Verify tenant.
+2. Confirm reachability:
+   ```bash
+   curl -sS -X POST localhost:3014/tool -H "Authorization: Bearer <bearer>" -H 'Content-Type: application/json' \
+     -d '{"name":"get_record","arguments":{"recordId":"REC-1001"}}'
+   ```
+3. Wire **one** tool with the adapter matching your stack: [1](#adapter-1---raw-fetch-the-reference) fetch · [2](#adapter-2---the-mcp-sdk-client-mcp) MCP SDK · [3](#adapter-3---a-langchain-tool-wrapper) LangChain · [4](#adapter-4---a-claude-custom-tool-loop) Claude · [5](#adapter-5---strands-python) Strands · [6](#adapter-6---openai-agents-sdk-python) OpenAI Agents SDK.
+4. Handle `pending` per [the envelope table](#the-whole-contract-restated) above - read the envelope, not the HTTP status.
+5. Stuck? See [troubleshooting](../reference/troubleshooting.md) - a real error ladder, not FAQ guesses.
 
 ---
 
@@ -209,9 +224,155 @@ your loop - never sourced from `block.input`. A `pending`/`denied` envelope goes
 
 ---
 
+## Adapter 5 - Strands (Python)
+
+[Strands](https://strandsagents.com/) is AWS's Python agent SDK. Point its `MCPClient` at the
+gateway's `/mcp` face over Streamable HTTP, put the user's bearer on the transport headers, and hand
+the discovered tools to an `Agent`.
+
+```python
+import json
+import os
+
+import requests
+from mcp.client.streamable_http import streamablehttp_client
+from strands import Agent
+from strands.tools.mcp import MCPClient
+
+GATEWAY = os.environ.get("GATEWAY_URL", "http://127.0.0.1:3014")
+
+
+# Strands' MCPClient.call_tool_sync/call_tool_async return an MCPToolResult - a
+# TypedDict (it extends Strands' own ToolResult TypedDict, not a real class), so
+# it's a plain dict at runtime. getattr(result, "content", []) silently returns
+# the default instead of raising; the inner content blocks are TypedDicts too, so
+# `.text` attribute access fails silently the same way. This has broken real
+# integrations twice - always go through accessors that check both shapes.
+def _content_blocks(r) -> list:
+    if isinstance(r, dict):
+        return r.get("content") or []
+    return getattr(r, "content", None) or []
+
+
+def _block_text(b) -> str:
+    if isinstance(b, dict):
+        return b.get("text") or ""
+    return getattr(b, "text", "") or ""
+
+
+def call_gateway_tool(mcp_client: MCPClient, name: str, arguments: dict, bearer: str) -> dict:
+    """Call a gateway tool over MCP, then resolve a `pending` step-up over REST
+    with the SAME bearer - /hitl/complete stays REST regardless of which
+    transport started the call."""
+    result = mcp_client.call_tool_sync(tool_use_id=name, name=name, arguments=arguments)
+    blocks = _content_blocks(result)
+    envelope = json.loads(_block_text(blocks[0])) if blocks else {}
+
+    if not envelope.get("ok") and envelope.get("pending"):
+        push = envelope.get("pushInfo") or {}
+        print(f"Approve on your phone: {push.get('message', 'step-up required')}")
+        resp = requests.post(
+            f"{GATEWAY}/hitl/complete",
+            headers={"Authorization": f"Bearer {bearer}"},
+            json={"txId": envelope["txId"]},
+        )
+        return resp.json()
+    return envelope
+
+
+bearer = os.environ["USER_BEARER"]
+mcp_client = MCPClient(lambda: streamablehttp_client(
+    url=f"{GATEWAY}/mcp",
+    headers={"Authorization": f"Bearer {bearer}"},
+))
+
+with mcp_client:
+    tools = mcp_client.list_tools_sync()
+    agent = Agent(tools=tools)
+    agent("Look up record REC-1001")  # autonomous loop, tool picked by the model
+
+    # Direct call when your code - not the model - needs the envelope, e.g. to
+    # resolve step-up deterministically instead of leaving it to the agent loop.
+    envelope = call_gateway_tool(mcp_client, "get_record", {"recordId": "REC-9001"}, bearer)
+```
+
+The trap is easy to miss because it never raises: `getattr(result, "content", [])` on a dict quietly
+returns `[]`, and code that "handles" an empty result drops every real tool response without an error
+anywhere in the stack. Use the accessors above, or index the dict directly once you know its shape.
+
+---
+
+## Adapter 6 - OpenAI Agents SDK (Python)
+
+The [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) speaks MCP natively via
+`MCPServerStreamableHttp`. Its `params` dict takes the URL and headers directly - same
+bearer-on-headers shape as every other adapter, used as an async context manager.
+
+```python
+import asyncio
+import json
+import os
+
+import httpx
+from agents import Agent, Runner
+from agents.mcp import MCPServerStreamableHttp
+
+GATEWAY = os.environ.get("GATEWAY_URL", "http://127.0.0.1:3014")
+
+
+async def call_gateway_tool(server: MCPServerStreamableHttp, name: str, arguments: dict, bearer: str) -> dict:
+    """Call a gateway tool over MCP, then resolve a `pending` step-up over REST
+    with the SAME bearer - /hitl/complete stays REST regardless of transport."""
+    result = await server.call_tool(name, arguments)
+    envelope = json.loads(result.content[0].text)
+
+    if not envelope.get("ok") and envelope.get("pending"):
+        push = envelope.get("pushInfo") or {}
+        print(f"Approve on your phone: {push.get('message', 'step-up required')}")
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{GATEWAY}/hitl/complete",
+                headers={"Authorization": f"Bearer {bearer}"},
+                json={"txId": envelope["txId"]},
+            )
+        return resp.json()
+    return envelope
+
+
+async def main():
+    bearer = os.environ["USER_BEARER"]
+    async with MCPServerStreamableHttp(
+        name="records gateway",
+        params={"url": f"{GATEWAY}/mcp", "headers": {"Authorization": f"Bearer {bearer}"}},
+    ) as server:
+        agent = Agent(
+            name="Records Assistant",
+            instructions="Use the tools to answer questions about customer records.",
+            mcp_servers=[server],
+        )
+        result = await Runner.run(agent, "Look up record REC-1001")
+        print(result.final_output)
+
+        # Direct call when your code needs the envelope deterministically.
+        envelope = await call_gateway_tool(server, "get_record", {"recordId": "REC-9001"}, bearer)
+        print(envelope)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Unlike Strands, `server.call_tool()` here returns the MCP SDK's own `CallToolResult` - a real object,
+not a TypedDict - so `result.content[0].text` is safe attribute access. The pending handoff is
+identical either way: parse the envelope out of the text block, branch on `pending`, resolve over
+REST with the same bearer.
+
+---
+
 ## Why this works with anything
 
-The four adapters differ only in *how the loop is driven*; the gateway call and the `pending` handoff
+The six adapters differ only in *how the loop is driven*; the gateway call and the `pending` handoff
 are identical in all of them. That is the point of a thin PEP on the path: the security contract is
-the same two lines and one rule for `curl`, an MCP client, LangChain, or Claude - swap the reasoning
-loop freely. See [architecture](../concepts/architecture.md) for what happens south of the call.
+the same two lines and one rule for `curl`, an MCP client, LangChain, Claude, Strands, or the OpenAI
+Agents SDK - swap the reasoning loop freely. See [architecture](../concepts/architecture.md) for what
+happens south of the call.
