@@ -15,6 +15,11 @@ server it protects is never modified and never learns any of this happened.
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Standards](https://img.shields.io/badge/RFC-8693%20%C2%B7%209396%20%C2%B7%207523%20%C2%B7%209449-6f42c1)](docs/concepts/token-exchange-and-rar.md)
 
+> **Updated for the MCP 2026-07-28 specification (August 2026).** SEP-2243 `Mcp-Method`/`Mcp-Name`
+> header validation, `server/discover` support, HMAC-integrity `requestState` on human-approval
+> flows (SEP-2322), and a trusted `X-User-Email` hint on both transports. Wire protocol stays
+> 2025-11-25 until the SDK catches up: see [adoption status](docs/reference/mcp-2026-07-28.md).
+
 ---
 
 ## The problem it solves
