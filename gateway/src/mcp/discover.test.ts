@@ -4,11 +4,12 @@
  * instead of getting the SDK's `-32601 Method not found`.
  *
  * Coverage: isDiscoverRequest's request-shape gate (string/numeric id,
- * notification-no-id falls through, wrong method, arrays, non-objects), and
- * buildDiscoverResult's normative result shape (resultType, a non-empty
- * supportedVersions that excludes '2026-07-28', capabilities, echoed
- * serverInfo under the io.modelcontextprotocol/serverInfo _meta key,
- * instructions, ttlMs, cacheScope).
+ * notification-no-id falls through, wrong method, arrays, non-objects,
+ * missing/wrong jsonrpc version), and buildDiscoverResult's normative result
+ * shape (resultType, a non-empty supportedVersions that excludes
+ * '2026-07-28', capabilities, echoed serverInfo under the
+ * io.modelcontextprotocol/serverInfo _meta key, instructions, ttlMs,
+ * cacheScope).
  */
 import { describe, it, expect } from 'vitest';
 import { isDiscoverRequest, buildDiscoverResult } from './discover.js';
@@ -44,6 +45,14 @@ describe('isDiscoverRequest', () => {
   it('rejects an id that is neither a string nor a number', () => {
     expect(isDiscoverRequest({ jsonrpc: '2.0', id: null, method: 'server/discover' })).toBe(false);
     expect(isDiscoverRequest({ jsonrpc: '2.0', id: {}, method: 'server/discover' })).toBe(false);
+  });
+
+  it('rejects a body with no jsonrpc field at all, even with a correct method and id', () => {
+    expect(isDiscoverRequest({ id: 1, method: 'server/discover' })).toBe(false);
+  });
+
+  it('rejects a body whose jsonrpc field is not exactly "2.0"', () => {
+    expect(isDiscoverRequest({ jsonrpc: '1.0', id: 1, method: 'server/discover' })).toBe(false);
   });
 });
 

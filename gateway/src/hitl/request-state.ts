@@ -123,12 +123,20 @@ export function mintRequestState(claims: Omit<RequestStateClaims, 'v'>): string 
  * — a tampered claims payload fails here even before it's parsed, since the
  * signature covers the raw base64url string), then expiry, then the actual
  * claim comparison (mismatch).
+ *
+ * `blob` is `unknown`, not `string` — this function is the boundary a
+ * caller-supplied requestState of any shape ultimately reaches (a JSON body
+ * places no type constraint on the field), and it must be total: a number,
+ * boolean, object, or array comes back as `{ ok: false, reason: 'malformed' }`
+ * exactly like a garbled string, never a thrown TypeError.
  */
 export function verifyRequestState(
-  blob: string,
+  blob: unknown,
   expect: { txId: string; sub: string; digest: string },
   nowMs: number = Date.now(),
 ): VerifyRequestStateResult {
+  if (typeof blob !== 'string') return { ok: false, reason: 'malformed' };
+
   const parts = blob.split('.');
   if (parts.length !== 3 || parts[0] !== 'v1') return { ok: false, reason: 'malformed' };
   const payload = parts[1];

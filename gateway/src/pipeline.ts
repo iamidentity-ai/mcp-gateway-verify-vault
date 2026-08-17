@@ -1078,24 +1078,31 @@ function isStaleSecretResult(result: { error: string; errorDescription?: string 
  * the one-shot pending entry. It is ignored for 'push' transactions (the
  * push path has no code to submit).
  *
- * `requestState` is OPTIONAL — SEP-2322 (MRTR) integrity binding, Phase 0
- * validate-if-present (see hitl/request-state.ts's own doc comment). Absent:
+ * `requestState` is OPTIONAL and typed `unknown` — a JSON request body places
+ * no type constraint on the field, so this boundary must handle whatever a
+ * caller sends, not just a well-formed string. Absent (`undefined`) OR a
+ * JSON `null` (a codegen client that emits explicit nulls for omitted
+ * optional fields, or the same falsy-tolerant handling `otp` already gets):
  * behavior is unchanged from before this parameter existed — the identity
  * check above and the single-use pending store already enforce who may
- * resume a transaction. Present: it is verified against the entry's own
- * owner and a digest recomputed from the entry's own stored toolName/args
- * (never from anything the caller sends) — off the same non-destructive
- * `peeked` read the identity check uses, BEFORE takePending, so a bad
- * requestState never burns the legitimate owner's one-shot completion
- * attempt. A failure returns the SAME shape as the owner-mismatch path
- * above, with `error: 'invalid_request_state'`.
+ * resume a transaction. Present as any other, non-null value: it is handed
+ * to `verifyRequestState`, which treats anything other than a well-formed
+ * string as malformed — a number, boolean, object, or array reaches
+ * verification and is rejected exactly like a garbled string blob, never
+ * silently ignored and never thrown. A verified string is checked against
+ * the entry's own owner and a digest recomputed from the entry's own stored
+ * toolName/args (never from anything the caller sends) — off the same
+ * non-destructive `peeked` read the identity check uses, BEFORE takePending,
+ * so a bad requestState never burns the legitimate owner's one-shot
+ * completion attempt. A failure returns the SAME shape as the owner-mismatch
+ * path above, with `error: 'invalid_request_state'`.
  */
 export async function completePending(
   txId: string,
   callerVerifyUserId: string | undefined,
   deps: CompletePendingDeps = {},
   otp?: string,
-  requestState?: string,
+  requestState?: unknown,
 ): Promise<PipelineResult> {
   const d: Required<CompletePendingDeps> = { ...defaultCompletePendingDeps, ...deps };
   const startedAt = d.now();
@@ -1119,7 +1126,13 @@ export async function completePending(
   // the ENTRY's own stored toolName/args — never from anything the caller
   // presents — so a completer cannot mint its own digest to match a
   // tampered claim.
-  if (requestState !== undefined) {
+  //
+  // `!= null` (loose) is deliberate, not a lint slip: it treats a JSON
+  // `null` the same as an omitted key (both skip verification), while any
+  // OTHER non-string value still reaches verifyRequestState below and comes
+  // back malformed — see this function's own doc comment for the full
+  // absent-vs-malformed contract.
+  if (requestState != null) {
     const verdict = verifyRequestState(
       requestState,
       { txId, sub: peeked.verifyUserId, digest: requestDigest(peeked.toolName, peeked.args) },
