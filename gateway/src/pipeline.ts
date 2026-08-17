@@ -84,9 +84,11 @@ export interface PipelineCtx {
    * JIT-provisioned shadow user's persisted attribute, which is a snapshot
    * frozen at first provisioning (or a manual SCIM patch) and does NOT
    * refresh on later logins even when the current subject token's own claim
-   * changed — see feedback_verify_transient_otp_no_directory_dependency.
-   * Optional and backward-compatible: omitted, this behaves exactly as
-   * before (introspection-derived fallback only).
+   * changed. The OTP destination must therefore come from the CURRENT
+   * subject token's own claims, never from a directory record or JIT-user
+   * snapshot that can silently go stale. Optional and backward-compatible:
+   * omitted, this behaves exactly as before (introspection-derived fallback
+   * only).
    */
   subjectEmail?: string;
 }

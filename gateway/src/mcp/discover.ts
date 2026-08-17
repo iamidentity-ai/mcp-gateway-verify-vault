@@ -41,7 +41,7 @@ export interface DiscoverResult {
 /**
  * True only for a well-formed `server/discover` JSON-RPC REQUEST — a
  * notification (no `id`) is not a request under JSON-RPC 2.0 and must fall
- * through to the SDK unchanged, per the controller ruling for this task.
+ * through to the SDK unchanged.
  */
 export function isDiscoverRequest(
   body: unknown,

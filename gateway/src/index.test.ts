@@ -165,7 +165,7 @@ describe('POST /mcp — x-user-email threading (mirrors /tool\'s trusted-header 
   });
 });
 
-// ── SEP-2322 requestState (Task 4) — route-level coverage ──────────────────
+// ── SEP-2322 requestState — route-level coverage ────────────────────────────
 //
 // pipelineResultToEnvelope's own unit tests (above) already prove the
 // mapping in isolation; these prove it survives an actual HTTP round trip on
@@ -634,9 +634,9 @@ describe('statusCodeFor', () => {
     // to 403 like the tier-4 'denied' status, not the generic 500 every
     // other exchange error still gets below.
     ['error: access_denied', { status: 'error', error: 'access_denied' }, 403],
-    // NEW (SEP-2322 requestState, Task 4): completePending's verify-before-
-    // consume rejection maps to the SAME 403 as the owner-mismatch
-    // 'forbidden' case it shares a result shape with.
+    // SEP-2322 requestState: completePending's verify-before-consume
+    // rejection maps to the SAME 403 as the owner-mismatch 'forbidden' case
+    // it shares a result shape with.
     ['error: invalid_request_state', { status: 'error', error: 'invalid_request_state' }, 403],
     // Unchanged — any OTHER exchange-error string (bad scope, stale
     // config, a network blip surfaced as token_exchange_failed, ...) still
