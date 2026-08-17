@@ -676,7 +676,7 @@ describe('runPipeline', () => {
     expectOrder(calls, ['gateTool', 'exchangeToken', 'triggerOAuthMfaPush', 'putPending']);
   });
 
-  // ── SEP-2322 requestState (Task 4) ──────────────────────────────────────
+  // ── SEP-2322 requestState (mint at park time) ───────────────────────────
   it('tier 2 mfa_challenge (push) -> the pending result carries a requestState that verifies against the SAME txId/owner/args the pending ctx was parked with', async () => {
     const { deps } = makeRunDeps({
       gateTool: () => ({ tier: 2, rarAction: 'record_write', scope: 'records:write', allowed: true }),
@@ -1169,7 +1169,7 @@ describe('completePending', () => {
     expect(deps.markKilled).not.toHaveBeenCalled();
   });
 
-  // ── SEP-2322 requestState (Task 4) — validate-if-present ────────────────
+  // ── SEP-2322 requestState — validate-if-present ─────────────────────────
   describe('requestState (SEP-2322 validate-if-present)', () => {
     it('no requestState -> unchanged behavior (matches the pre-existing happy path exactly)', async () => {
       const { deps } = makeCompleteDeps();
@@ -1668,8 +1668,8 @@ describe('completePending', () => {
       const result = await completePending('tx-1', 'user-1', deps as any, '000000');
 
       // toMatchObject (not toEqual): the re-park also mints a FRESH
-      // requestState (Task 4 fix — see the dedicated describe block below
-      // for full coverage of ITS semantics); this test stays focused on
+      // requestState (see the dedicated describe block below for full
+      // coverage of ITS semantics); this test stays focused on
       // attemptsRemaining passthrough and just proves the field exists.
       expect(result).toMatchObject({
         status: 'error',
@@ -1798,7 +1798,6 @@ describe('completePending', () => {
     });
 
     // ── SEP-2322 requestState refresh across an otp_invalid re-park ────────
-    // (Important review fix — controller ruling 2026-08-16)
     //
     // The re-park above (d.putPending(txId, ctx) on a wrong code) refreshes
     // the STORE entry's own TTL, but a requestState minted at the ORIGINAL
@@ -1872,7 +1871,7 @@ describe('completePending', () => {
       it('re-park then complete echoing the ORIGINAL blob past its original exp -> invalid_request_state, and the pending entry SURVIVES (a txId-only follow-up still works)', async () => {
         // Uses the REAL pending store (not the stateless stub) so "the
         // entry survives" is an actual, provable claim — same pattern as
-        // Task 4's tamper test.
+        // the tampered-blob test above.
         resetPendingStore();
 
         const ctx = makeOtpCtx();

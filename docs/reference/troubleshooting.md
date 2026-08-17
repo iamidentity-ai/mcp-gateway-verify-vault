@@ -53,6 +53,17 @@ This is mandatory, not optional - see [token exchange & RAR](../concepts/token-e
 resume with the **same user's bearer** that got the `202 pending`. This is a security guarantee, not a
 bug: it stops a bearer holder who learned a victim's `txId` from forcing a session-kill on the victim.
 
+### `/hitl/complete` returns `403 invalid_request_state`
+
+**Cause:** the caller sent a `requestState` (SEP-2322) that failed verification - it doesn't match the
+pending transaction's own owner/tool/arguments digest, has expired, is badly signed, or is malformed.
+A JSON `null` is treated as an omitted key, not a failure; this error only fires for a `requestState`
+that was actually present and didn't check out. **Fix:** echo back the **most recent** `requestState`
+you received for this transaction (an `otp_invalid` re-park mints a fresh one with a new expiry - an
+older blob from the same transaction can legitimately have expired), or simply retry with `txId` alone
+and omit `requestState` entirely - the pending entry is untouched by a failed check, so nothing is
+lost. See [human-in-the-loop](../concepts/human-in-the-loop.md#requeststate-integrity-sep-2322).
+
 ### `202 pending` handled as a failure
 
 **Cause:** a client treating `ok: false` / HTTP 202 as "the call failed." **Fix:** `202 { pending }` is

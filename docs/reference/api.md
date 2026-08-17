@@ -141,7 +141,7 @@ deliberate hard-cap policy both produce this exact response.
 | Pipeline result | HTTP | Envelope |
 |---|---|---|
 | `ok` | 200 | `{ ok: true, data, _diagnostic }` |
-| `pending` | 202 | `{ ok: false, pending: true, txId, pushInfo }` |
+| `pending` | 202 | `{ ok: false, pending: true, txId, requestState, pushInfo }` |
 | `denied` | 403 | `{ ok: false, denied: true, reason }` |
 | `session_killed_suspicious` | 401 | `{ ok: false, killed: true, reason: "suspicious" }` |
 | `error: inactive_session` / `session_killed` | 401 | `{ ok: false, error }` |
@@ -240,10 +240,11 @@ victim - a zero-Verify-interaction DoS. See [human-in-the-loop](../concepts/huma
 
 **`requestState`** is optional and verified, when present, **before** the pending entry is
 consumed - off the entry's own stored owner and a digest recomputed from its own stored tool
-name/arguments, never from anything the caller sends. A mismatched, expired, malformed, or
-badly-signed value returns `403 { ok: false, error: "invalid_request_state" }` and leaves the
-pending entry intact for a retry with just `txId`. The `complete_hitl` MCP tool (the `/mcp`-side
-equivalent of this route) accepts the identical `requestState` argument. See
+name/arguments, never from anything the caller sends. A JSON `null` is treated as absent, the same
+as omitting the key entirely; any other non-string value is malformed. A mismatched, expired,
+malformed, or badly-signed value returns `403 { ok: false, error: "invalid_request_state" }` and
+leaves the pending entry intact for a retry with just `txId`. The `complete_hitl` MCP tool (the
+`/mcp`-side equivalent of this route) accepts the identical `requestState` argument. See
 [human-in-the-loop](../concepts/human-in-the-loop.md#requeststate-integrity-sep-2322).
 
 Missing `txId` → `400 { error: "missing_txId" }`. Unknown/expired → `{ error: "unknown_or_expired_tx" }`.

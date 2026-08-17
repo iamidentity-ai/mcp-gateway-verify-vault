@@ -17,9 +17,10 @@ showing the one thing every caller must get right: the **`202 pending` → `/hit
 | Envelope | HTTP | Meaning | What the caller does |
 |---|---|---|---|
 | `{ ok: true, data, _diagnostic }` | 200 | Success. | Use `data`. |
-| `{ ok: false, pending: true, txId, pushInfo }` | 202 | **Human approval in flight.** | Surface the push; poll `POST /hitl/complete { txId }` with the **same bearer**. |
+| `{ ok: false, pending: true, txId, requestState, pushInfo }` | 202 | **Human approval in flight.** | Surface the push; poll `POST /hitl/complete { txId }` with the **same bearer**. |
 | `{ ok: false, denied: true, reason }` | 403 | Policy denied (tier 4 / unknown tool / MFA denied). | Stop; surface `reason`. |
 | `{ ok: false, killed: true, reason }` | 401 | Session killed (suspicious). | Re-authenticate the user. |
+| `{ ok: false, error }` | 403 | Forbidden (wrong bearer resuming a `txId`) or `invalid_request_state` (the echoed `requestState` failed verification). | Retry with the correct bearer, or retry with just `txId`. |
 | `{ ok: false, error }` | 401 / 500 | Inactive session / server error. | Retry or re-auth per `error`. |
 
 A caller that ignores `pending` does **not** break security - the record is withheld regardless. It
@@ -36,7 +37,7 @@ This is the whole thing in ~40 lines. Every other adapter is a wrapper around th
 ```ts
 type Envelope =
   | { ok: true; data: unknown; _diagnostic: Record<string, unknown> }
-  | { ok: false; pending: true; txId: string; pushInfo?: { title: string; message: string } }
+  | { ok: false; pending: true; txId: string; requestState?: string; pushInfo?: { title: string; message: string } }
   | { ok: false; denied?: true; killed?: true; reason?: string; error?: string };
 
 const GATEWAY = "http://127.0.0.1:3014";
