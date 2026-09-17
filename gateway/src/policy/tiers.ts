@@ -48,6 +48,14 @@ export interface ToolPolicy {
    * arguments a caller sends, just without an advertised schema.
    */
   args?: Record<string, ToolArgType>;
+  /**
+   * Optional human-readable description advertised in `tools/list`. Hosts
+   * doing progressive tool discovery keyword-search names AND descriptions
+   * (2026-07-28 client best practices), so a config-driven tool with no
+   * description is findable only by name substring. When absent, index.ts
+   * falls back to the generic "Configured tool (tier N, ...)" boilerplate.
+   */
+  description?: string;
 }
 
 export interface GateResult {

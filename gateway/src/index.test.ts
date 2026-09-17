@@ -110,6 +110,13 @@ describe('buildToolSpecs — per-tool schema choice + complete_hitl dedupe', () 
     expect(typeof (spec.config.inputSchema as { parse?: unknown }).parse).toBe('function');
   });
 
+  it('uses a config-driven tool\'s own "description" when tools.json supplies one (progressive-discovery hosts keyword-search descriptions)', () => {
+    const specs = buildToolSpecs({
+      sf_update: { tier: 2, rarAction: 'record_write', scope: 'records:write', description: 'Update fields on a Salesforce object' },
+    });
+    expect(specs.find((s) => s.name === 'sf_update')!.config.description).toBe('Update fields on a Salesforce object');
+  });
+
   it('does NOT double-register complete_hitl when a tools.json defines a tool literally named that', () => {
     const specs = buildToolSpecs({
       complete_hitl: { tier: 1, rarAction: 'record_read', scope: 'records:read' },
@@ -334,6 +341,19 @@ describe('POST /mcp — complete_hitl tool + pending envelope (MCP-transport cov
     expect(typeof text).toBe('string');
     const envelope = JSON.parse(text as string) as { pending?: boolean; txId?: string; requestState?: string };
     expect(envelope).toMatchObject({ pending: true, txId: 'tx-mcp-pending-1', requestState: 'v1.x.y' });
+    // Non-ok outcomes carry isError so a code-mode host's wrapper throws.
+    expect((rpc.result as { isError?: boolean }).isError).toBe(true);
+  });
+
+  it('a denied PipelineResult sets isError:true; an ok result does not', async () => {
+    pipelineMocks.runPipeline.mockClear();
+    pipelineMocks.runPipeline.mockResolvedValueOnce({ status: 'denied' as const, reason: 'tier_blocked' } as PipelineResult);
+    const denied = await postMcpToolCall('get_record', { recordId: 'REC-1' });
+    expect((denied.rpc.result as { isError?: boolean }).isError).toBe(true);
+
+    pipelineMocks.runPipeline.mockResolvedValueOnce({ status: 'ok' as const, data: { id: 'REC-1' } });
+    const ok = await postMcpToolCall('get_record', { recordId: 'REC-1' });
+    expect((ok.rpc.result as { isError?: boolean }).isError).toBeUndefined();
   });
 });
 

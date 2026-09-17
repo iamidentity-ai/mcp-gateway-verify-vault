@@ -666,9 +666,11 @@ export function buildToolSpecs(policies: Record<string, ToolPolicy> = configured
         name,
         config: {
           title: name,
-          description: policy.args
-            ? `Configured tool (tier ${policy.tier}, RAR action "${policy.rarAction}"). Arguments are forwarded verbatim to this deployment's upstream MCP tool of the same name.`
-            : `Configured tool (tier ${policy.tier}, RAR action "${policy.rarAction}"). Generic passthrough — arguments are forwarded verbatim to this deployment's upstream MCP tool of the same name; the gateway has no per-field schema for it (tools.json defines no "args" for it), only its tier/RAR policy.`,
+          description:
+            policy.description ??
+            (policy.args
+              ? `Configured tool (tier ${policy.tier}, RAR action "${policy.rarAction}"). Arguments are forwarded verbatim to this deployment's upstream MCP tool of the same name.`
+              : `Configured tool (tier ${policy.tier}, RAR action "${policy.rarAction}"). Generic passthrough — arguments are forwarded verbatim to this deployment's upstream MCP tool of the same name; the gateway has no per-field schema for it (tools.json defines no "args" for it), only its tier/RAR policy.`),
           inputSchema: policy.args ? shapeFromArgs(policy.args) : z.record(z.string(), z.unknown()),
         },
       },
@@ -720,7 +722,16 @@ function buildMcpServer(bearer: string, subjectEmail?: string): McpServer {
             args['requestState'] as string | undefined,
           )
         : await dispatchTool(name, args, bearer, subjectEmail);
-    return { content: [{ type: 'text' as const, text: JSON.stringify(pipelineResultToEnvelope(result)) }] };
+    // isError on every non-ok outcome (denied / pending / session-killed):
+    // the 2026-07-28 client best-practices doc has code-mode hosts turn
+    // `isError: true` into a thrown exception, so a sandboxed loop stops on a
+    // policy deny instead of reading the envelope as a successful string.
+    // The envelope itself is unchanged — REST /tool and existing MCP
+    // consumers still read `ok`/`pending`/`denied` off the body.
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify(pipelineResultToEnvelope(result)) }],
+      ...(result.status !== 'ok' ? { isError: true } : {}),
+    };
   };
 
   for (const spec of MCP_TOOL_SPECS) {
