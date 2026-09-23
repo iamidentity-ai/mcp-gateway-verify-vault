@@ -219,6 +219,29 @@ function isStaleSecretError(status: number, body: string): boolean {
   return status === 401 || body.includes('invalid_client') || body.includes('CSIAQ0155E');
 }
 
+// ── Suspended-agent classification ───────────────────────────
+
+/**
+ * Turn Verify's refusal for a suspended agent into a distinct error code.
+ *
+ * CSIAQ5293E ("Unable to match an active agent identity.") is what Verify
+ * returns when the calling agent's Agent Registry status is not ACTIVE, an
+ * owner or admin suspended it. It arrives as a generic `invalid_request`,
+ * the same bare error a dozen other misconfigurations produce, with the
+ * CSIAQ code buried in `error_description`. pipeline.ts needs to tell this
+ * apart from every other exchange failure so it can return a deny instead
+ * of a fault, so this is the one place that reads the code out. Only the
+ * mapped code is returned; the free-text description never leaves this
+ * function into a result a client or LLM sees.
+ */
+export function exchangeErrorCode(
+  errorData: { error?: string; error_description?: string },
+  fallback: string,
+): string {
+  if (String(errorData.error_description ?? '').includes('CSIAQ5293E')) return 'agent_suspended';
+  return errorData.error || fallback;
+}
+
 // ── Exchange-failure diagnostics ─────────────────────────────
 
 /**
@@ -618,7 +641,7 @@ export async function exchangeMfaAssertionWithRAR(
     });
     return {
       status: 'error',
-      error: errorData.error || 'jwt_bearer_failed',
+      error: exchangeErrorCode(errorData, 'jwt_bearer_failed'),
       errorDescription: errorData.error_description || text,
     };
   }
@@ -851,7 +874,7 @@ export async function exchangeToken(request: TokenExchangeRequest): Promise<Toke
     });
     return {
       status: 'error',
-      error: errorData.error || 'token_exchange_failed',
+      error: exchangeErrorCode(errorData, 'token_exchange_failed'),
       errorDescription: errorData.error_description || body,
     };
   }

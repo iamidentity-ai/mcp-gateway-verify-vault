@@ -501,6 +501,24 @@ describe('runPipeline', () => {
       expect(deps.emitSessionRevoked).not.toHaveBeenCalled();
       expect(deps.markKilled).not.toHaveBeenCalled();
     });
+
+    it('a suspended-agent (CSIAQ5293E) deny never counts either: a registry suspension is a governance decision, not a prompt-injection attempt', async () => {
+      const { deps } = makeRunDeps({
+        blockedActionKill: true,
+        gateTool: () => makeGateResult({ tier: 2, rarAction: 'record_write', scope: 'records:write' }),
+        exchangeToken: async () => ({ status: 'error' as const, error: 'agent_suspended' }),
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'update_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result).toEqual({ status: 'denied', reason: 'agent_suspended' });
+      expect(deps.recordDeny).not.toHaveBeenCalled();
+      expect(deps.emitSessionRevoked).not.toHaveBeenCalled();
+      expect(deps.markKilled).not.toHaveBeenCalled();
+    });
   });
 
   it('unknown tool -> denied(unknown_tool), no exchange call', async () => {
@@ -740,6 +758,32 @@ describe('runPipeline', () => {
     );
 
     expect(result).toEqual({ status: 'error', error: 'access_denied' });
+    expect(deps.mintCred).not.toHaveBeenCalled();
+    expect(deps.callUpstreamTool).not.toHaveBeenCalled();
+    expect(deps.appendAudit).toHaveBeenCalledTimes(1);
+    expect((deps.appendAudit as any).mock.calls[0][0]).toMatchObject({ decision: 'exchange_denied' });
+  });
+
+  it('exchangeToken agent_suspended (CSIAQ5293E, Verify Agent Registry suspension) -> {status:"denied", reason:"agent_suspended"}, audited as "exchange_denied", no mint/upstream', async () => {
+    // Unlike access_denied (a real policy deny that stays status:"error" for
+    // backward compatibility), a registry suspension is deliberately a NEW
+    // status:"denied" result, the same status the tier-4 gate uses, so it
+    // gets the denied:true envelope and 403 a client already treats as a
+    // governance decision, not a fault.
+    const { deps } = makeRunDeps({
+      exchangeToken: async () => ({
+        status: 'error' as const,
+        error: 'agent_suspended',
+        errorDescription: 'CSIAQ5293E Unable to match an active agent identity.',
+      }),
+    });
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'list_records', args: {} },
+      deps as any,
+    );
+
+    expect(result).toEqual({ status: 'denied', reason: 'agent_suspended' });
     expect(deps.mintCred).not.toHaveBeenCalled();
     expect(deps.callUpstreamTool).not.toHaveBeenCalled();
     expect(deps.appendAudit).toHaveBeenCalledTimes(1);
@@ -1446,6 +1490,33 @@ describe('completePending', () => {
     expect(result).toEqual({ status: 'error', error: 'invalid_scope' });
     expect(deps.exchangeMfaAssertionWithRAR).toHaveBeenCalledTimes(1);
     expect(deps.invalidateExchangeSecret).not.toHaveBeenCalled();
+  });
+
+  it('leg-2 agent_suspended (CSIAQ5293E on the post-MFA jwt-bearer leg) -> {status:"denied", reason:"agent_suspended"}, audited as "exchange_denied", no stale-secret retry, no mint/upstream', async () => {
+    // A suspension must classify the same way on BOTH legs: an approved
+    // push can still land on a jwt-bearer call Verify refuses because the
+    // agent was suspended in between. No secret refresh can reactivate a
+    // suspended agent, so this must not enter the CSIAQ0155E retry ladder
+    // above, the same way any other non-stale error skips it.
+    const { deps } = makeCompleteDeps({
+      exchangeMfaAssertionWithRAR: async () => ({
+        status: 'error' as const,
+        error: 'agent_suspended',
+        errorDescription: 'CSIAQ5293E Unable to match an active agent identity.',
+      }),
+    });
+
+    const result = await completePending('tx-1', 'user-1', deps as any);
+
+    expect(result).toEqual({ status: 'denied', reason: 'agent_suspended' });
+    expect(deps.exchangeMfaAssertionWithRAR).toHaveBeenCalledTimes(1);
+    expect(deps.invalidateExchangeSecret).not.toHaveBeenCalled();
+    expect(deps.mintCred).not.toHaveBeenCalled();
+    expect(deps.callUpstreamTool).not.toHaveBeenCalled();
+    // Same audit row leg 1 writes for this code, so the chain does not lose
+    // a deny just because it landed after the approval instead of before.
+    expect(deps.appendAudit).toHaveBeenCalledTimes(1);
+    expect((deps.appendAudit as any).mock.calls[0][0]).toMatchObject({ decision: 'exchange_denied', tool: 'update_record' });
   });
 
   it('denied (not at threshold) -> recordDeny only, no session kill', async () => {
@@ -2227,6 +2298,20 @@ describe('GATEWAY_NARRATE', () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('ERROR');
     expect(lines[0]).toContain('exchange=denied:access_denied');
+  });
+
+  it('ON: a suspended-agent deny narrates DENIED and exchange=denied:agent_suspended', async () => {
+    const { deps } = makeRunDeps({
+      exchangeToken: async () => ({ status: 'error' as const, error: 'agent_suspended' }),
+    });
+
+    const { lines } = await withNarrate('true', () =>
+      runPipeline({ userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } }, deps as any),
+    );
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('DENIED');
+    expect(lines[0]).toContain('exchange=denied:agent_suspended');
   });
 
   it('ON: a tier-4 local deny narrates before Verify is ever called', async () => {

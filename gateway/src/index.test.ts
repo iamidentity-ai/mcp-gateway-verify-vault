@@ -528,6 +528,11 @@ describe('pipelineResultToEnvelope', () => {
     expect(envelope).toEqual({ ok: false, denied: true, reason: 'policy_deny' });
   });
 
+  it('denied: agent_suspended (Verify Agent Registry suspension, CSIAQ5293E), same shape as any other denied reason, ok:false, denied:true', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'denied', reason: 'agent_suspended' });
+    expect(envelope).toEqual({ ok: false, denied: true, reason: 'agent_suspended' });
+  });
+
   it('denied WITH killed — the deny that crossed the 3-strike threshold carries killed:true so a client can tell it apart from an ordinary policy deny', () => {
     const envelope = pipelineResultToEnvelope({
       status: 'denied',
@@ -646,6 +651,10 @@ describe('statusCodeFor', () => {
     ['ok', { status: 'ok', data: {} }, 200],
     ['pending', { status: 'pending', txId: 'tx-1', requestState: 'v1.abc.def' }, 202],
     ['denied (tier-4 local gate)', { status: 'denied', reason: 'policy_deny' }, 403],
+    // A Verify Agent Registry suspension (CSIAQ5293E) is a "denied" status
+    // like the tier-4 gate, not the "error" status access_denied keeps.
+    // Same 403 either way.
+    ['denied: agent_suspended (Verify Agent Registry suspension)', { status: 'denied', reason: 'agent_suspended' }, 403],
     ['session_killed_suspicious', { status: 'session_killed_suspicious' }, 401],
     ['error: inactive_session', { status: 'error', error: 'inactive_session' }, 401],
     ['error: session_killed', { status: 'error', error: 'session_killed' }, 401],

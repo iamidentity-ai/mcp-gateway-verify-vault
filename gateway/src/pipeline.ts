@@ -871,6 +871,29 @@ async function runExchangeAndCall(
     };
   }
 
+  if (exchangeResult.status === 'error' && exchangeResult.error === 'agent_suspended') {
+    // IBM Verify refused because this agent's Agent Registry status is not
+    // ACTIVE (CSIAQ5293E): an owner or admin suspended it. That is a
+    // governance decision, not a fault, so it returns 'denied' like the
+    // tier gate does and gets the same 403 / denied:true envelope on both
+    // transports. It never feeds the blocked-action deny counter (only the
+    // tier gate does) and never triggers the stale-secret retry: no secret
+    // refresh can reactivate a suspended agent.
+    if (!suppressAudit) {
+      d.appendAudit({
+        ts: d.now(),
+        userId: verifyUserId,
+        tool: ctx.toolName,
+        tier: gate.tier,
+        authorizationDetails,
+        decision: 'exchange_denied',
+      });
+    }
+    facts.outcome = 'denied';
+    facts.exchange = 'denied:agent_suspended';
+    return { result: { status: 'denied', reason: 'agent_suspended' }, authorizationDetails, facts };
+  }
+
   if (exchangeResult.status === 'error') {
     // AUDIT PARITY with the tier-4 local deny above: that gate always
     // audits before returning 'denied'; this Token-Exchange-level failure
@@ -1374,6 +1397,25 @@ export async function completePending(
       authorizationDetails,
       exchangeSecret,
     );
+  }
+
+  if (assertionResult.status === 'error' && assertionResult.error === 'agent_suspended') {
+    // Same CSIAQ5293E governance-decision treatment as the first leg (see
+    // runExchangeAndCall above): the agent could have been suspended in the
+    // window between the push approval and this jwt-bearer call, so this
+    // leg must classify it too, not just leg 1. Audited the same way leg 1
+    // audits it: a deny that made it past the tier gate and past the human
+    // approval must still show up in the audit chain.
+    d.appendAudit({
+      ts: d.now(),
+      userId: ctx.verifyUserId,
+      tool: ctx.toolName,
+      tier: gate.tier,
+      authorizationDetails,
+      decision: 'exchange_denied',
+    });
+    narrateFinish('denied', 'denied:agent_suspended');
+    return { status: 'denied', reason: 'agent_suspended' };
   }
 
   if (assertionResult.status !== 'ok') {

@@ -55,6 +55,7 @@ import {
   describeDelegationMismatch,
   safeClaimDigest,
   exchangeToken,
+  exchangeErrorCode,
   triggerOAuthMfaPush,
   pollOAuthMfaStatus,
   exchangeMfaAssertionWithRAR,
@@ -274,6 +275,73 @@ describe('exchangeToken — CSIAQ0155E retry (case c)', () => {
   });
 });
 
+// ── (g) CSIAQ5293E agent-suspended classification ────────────
+//
+// A suspended agent's Agent Registry entry makes Verify refuse the
+// exchange with a generic invalid_request and CSIAQ5293E in
+// error_description. exchangeErrorCode is the one place that turns that
+// code into 'agent_suspended' so pipeline.ts can treat it as a deny
+// instead of a fault, on either leg.
+
+describe('exchangeErrorCode', () => {
+  it('maps a Verify agent-suspended refusal to agent_suspended', () => {
+    expect(
+      exchangeErrorCode(
+        { error: 'invalid_request', error_description: 'CSIAQ5293E Unable to match an active agent identity.' },
+        'token_exchange_failed',
+      ),
+    ).toBe('agent_suspended');
+  });
+
+  it('finds the code in a non-JSON body the parser wrapped as error_description', () => {
+    expect(exchangeErrorCode({ error_description: '<html>CSIAQ5293E</html>' }, 'token_exchange_failed')).toBe(
+      'agent_suspended',
+    );
+  });
+
+  it('leaves a policy deny as access_denied', () => {
+    expect(
+      exchangeErrorCode(
+        { error: 'access_denied', error_description: 'CSIAQ0278E User is not authorized to access the application.' },
+        'token_exchange_failed',
+      ),
+    ).toBe('access_denied');
+  });
+
+  it('falls back when Verify sent no error field', () => {
+    expect(exchangeErrorCode({}, 'jwt_bearer_failed')).toBe('jwt_bearer_failed');
+  });
+});
+
+describe('exchangeToken, CSIAQ5293E agent-suspended, first leg (case g)', () => {
+  it('returns status "error" with error "agent_suspended" when Verify refuses a suspended agent', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          error: 'invalid_request',
+          error_description: 'CSIAQ5293E Unable to match an active agent identity.',
+        }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const result = await exchangeToken({
+      subjectToken: 'user-access-token',
+      scope: 'records:read',
+    });
+
+    expect(result).toEqual({
+      status: 'error',
+      error: 'agent_suspended',
+      errorDescription: 'CSIAQ5293E Unable to match an active agent identity.',
+    });
+    // A 400 invalid_request is not a stale-secret signal: exchangeToken's
+    // own retry ladder must not refresh the secret and call Verify again.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(invalidateExchangeSecret).not.toHaveBeenCalled();
+  });
+});
+
 // ── (d) pollOAuthMfaStatus — suspicious precedes denied ──────
 
 describe('pollOAuthMfaStatus — suspicious verdict precedes denied (case d)', () => {
@@ -391,6 +459,21 @@ describe('exchangeMfaAssertionWithRAR — re-sends authorization_details (case e
     const r = await exchangeMfaAssertionWithRAR('assertion', 'scope-x', undefined, 'secret-x');
     expect(r.status).toBe('error');
     if (r.status === 'error') expect(r.error).toBe('invalid_grant');
+  });
+
+  it('returns error "agent_suspended" on CSIAQ5293E on the second leg too (case g)', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          error: 'invalid_request',
+          error_description: 'CSIAQ5293E Unable to match an active agent identity.',
+        }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const r = await exchangeMfaAssertionWithRAR('assertion', 'scope-x', undefined, 'secret-x');
+    expect(r.status).toBe('error');
+    if (r.status === 'error') expect(r.error).toBe('agent_suspended');
   });
 });
 
