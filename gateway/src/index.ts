@@ -249,6 +249,11 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
       // this session is revoked" BEFORE the third one lands, instead of the
       // kill arriving as an unexplained surprise. Same two fields, same
       // meaning, as on the otp_invalid error case below.
+      // reasons/decisionId/bundleRevision/agentSuspension/engine are the OPA
+      // guardrails fields (GATEWAY_OPA_MODE=enforce, see pipeline.ts's
+      // runOpaCheck): reasons+decisionId+bundleRevision on reason:'opa_deny'
+      // and on an engine:'opa' unknown_tool, agentSuspension only on
+      // the opa_deny that crossed the agent deny-counter's threshold.
       return {
         ok: false,
         denied: true,
@@ -256,6 +261,11 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
         ...(result.killed ? { killed: true } : {}),
         ...(result.denyCount !== undefined ? { denyCount: result.denyCount } : {}),
         ...(result.denyThreshold !== undefined ? { denyThreshold: result.denyThreshold } : {}),
+        ...(result.engine ? { engine: result.engine } : {}),
+        ...(result.reasons !== undefined ? { reasons: result.reasons } : {}),
+        ...(result.decisionId !== undefined ? { decisionId: result.decisionId } : {}),
+        ...(result.bundleRevision !== undefined ? { bundleRevision: result.bundleRevision } : {}),
+        ...(result.agentSuspension ? { agentSuspension: result.agentSuspension } : {}),
       };
     case 'session_killed_suspicious':
       return { ok: false, killed: true, reason: 'suspicious' };

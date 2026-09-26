@@ -575,6 +575,56 @@ describe('pipelineResultToEnvelope', () => {
     });
   });
 
+  // ── OPA guardrails denies (GATEWAY_OPA_MODE=enforce): plan Task 3 ────────
+  it('denied: opa_deny, passes through reasons, decisionId, bundleRevision, denyCount, denyThreshold', () => {
+    const envelope = pipelineResultToEnvelope({
+      status: 'denied',
+      reason: 'opa_deny',
+      reasons: ['egress-host-not-granted'],
+      decisionId: 'd-123',
+      bundleRevision: 'sha-abc',
+      denyCount: 1,
+      denyThreshold: 3,
+    });
+    expect(envelope).toEqual({
+      ok: false,
+      denied: true,
+      reason: 'opa_deny',
+      reasons: ['egress-host-not-granted'],
+      decisionId: 'd-123',
+      bundleRevision: 'sha-abc',
+      denyCount: 1,
+      denyThreshold: 3,
+    });
+  });
+
+  it('denied: opa_deny on the threshold call also carries agentSuspension:{requested:true, ttlSeconds}', () => {
+    const envelope = pipelineResultToEnvelope({
+      status: 'denied',
+      reason: 'opa_deny',
+      reasons: ['egress-host-not-granted'],
+      denyCount: 3,
+      denyThreshold: 3,
+      agentSuspension: { requested: true, ttlSeconds: 300 },
+    });
+    expect(envelope).toMatchObject({ agentSuspension: { requested: true, ttlSeconds: 300 } });
+  });
+
+  it('denied: unknown_tool via OPA carries engine:"opa" to distinguish it from the tier gate\'s own unknown_tool', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'denied', reason: 'unknown_tool', engine: 'opa' });
+    expect(envelope).toEqual({ ok: false, denied: true, reason: 'unknown_tool', engine: 'opa' });
+  });
+
+  it('denied: unknown_tool from the tier gate (no engine) is unchanged', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'denied', reason: 'unknown_tool' });
+    expect(envelope).toEqual({ ok: false, denied: true, reason: 'unknown_tool' });
+  });
+
+  it('denied: policy_unavailable, OPA down or timed out in enforce mode, no extra fields fabricated', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'denied', reason: 'policy_unavailable' });
+    expect(envelope).toEqual({ ok: false, denied: true, reason: 'policy_unavailable' });
+  });
+
   it('session_killed_suspicious — maps to ok:false, killed:true, reason: "suspicious"', () => {
     const envelope = pipelineResultToEnvelope({ status: 'session_killed_suspicious' });
     expect(envelope).toEqual({ ok: false, killed: true, reason: 'suspicious' });

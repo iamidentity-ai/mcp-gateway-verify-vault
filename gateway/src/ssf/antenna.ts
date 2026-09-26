@@ -191,3 +191,66 @@ export async function emitSessionRevoked(
     return { ok: false, status: 0, body: msg };
   }
 }
+
+// ── emitAgentRisk: OPA-deny-threshold agent-risk emitter ──────────────────
+//
+// Fire-and-forget POST to Antenna's agent_risk source, same non-throwing
+// contract as emitSessionRevoked above (never rethrows; a failure is a
+// {ok:false} result, not an exception). pipeline.ts calls this once, on the
+// deny that crosses the OPA deny-counter's threshold (see ssf/deny-counter.ts
+// and pipeline.ts's runOpaCheck). It never retries and never blocks the
+// pipeline's own return on the outcome.
+//
+// Unlike SOURCE_URL above, there is no sensible default endpoint for this.
+// The CALLER (pipeline.ts, which already resolved GATEWAY_AGENT_RISK_URL as
+// part of its OPA config) supplies `url` and is the one that decides to skip
+// the call entirely, with its own warning, when the var is unset.
+//
+// Payload shape (Antenna's agent_risk source, distinct from session-revoked
+// above: an opaque agent subject, not a Verify user):
+//
+//   { sub_id: { format: 'opaque', id: '<GATEWAY_VERIFY_AGENT_ID>' },
+//     reason: 'opa_deny_threshold',
+//     ttl_seconds: <GATEWAY_AGENT_SUSPEND_TTL_SECONDS> }
+
+export interface AgentRiskInput {
+  /** GATEWAY_VERIFY_AGENT_ID, the Verify Agent Registry id, not this
+   *  gateway's own GATEWAY_OPA_AGENT_ID (the SPIFFE/bundle key). */
+  agentId: string;
+  reason: string;
+  ttlSeconds: number;
+}
+
+export async function emitAgentRisk(
+  input: AgentRiskInput,
+  url: string,
+  deps: EmitDeps = {},
+): Promise<EmitResult> {
+  const doFetch = deps.fetchImpl ?? fetch;
+
+  const payload = {
+    sub_id: { format: 'opaque' as const, id: input.agentId },
+    reason: input.reason,
+    ttl_seconds: input.ttlSeconds,
+  };
+
+  try {
+    const res = await doFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.warn(`[${SERVICE_NAME}-ssf] agent-risk non-2xx from the transmitter: ${res.status} ${text.slice(0, 200)}`);
+      return { ok: false, status: res.status, body: text };
+    }
+    console.log(`[${SERVICE_NAME}-ssf] agent-risk emitted for agent=${input.agentId} reason=${input.reason} status=${res.status}`);
+    return { ok: true, status: res.status };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn(`[${SERVICE_NAME}-ssf] agent-risk fetch failed: ${msg}`);
+    return { ok: false, status: 0, body: msg };
+  }
+}

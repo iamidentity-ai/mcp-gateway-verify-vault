@@ -58,6 +58,7 @@ import {
   type PendingCtx,
 } from './hitl/pending.js';
 import { mintRequestState, verifyRequestState, requestDigest } from './hitl/request-state.js';
+import { recordDeny as realRecordDeny } from './ssf/deny-counter.js';
 
 function makeGateResult(
   overrides: Partial<{
@@ -178,6 +179,12 @@ function makeRunDeps(overrides: Record<string, unknown> = {}) {
     putPending: (_txId: string, _ctx: PendingCtx) => undefined,
     genTxId: () => 'tx-fixed-1',
     now: () => 1_000,
+    // OPA guardrails (GATEWAY_OPA_MODE), see the GATEWAY_OPA_MODE describe
+    // block below. Default mode 'off' so no other test in this file (none
+    // of which override opaConfig) ever calls queryOpa/emitAgentRisk.
+    opaConfig: makeOpaConfig(),
+    queryOpa: async (_input: unknown, _opts: unknown) => ({ ok: true as const, allow: true, reasons: [] as string[] }),
+    emitAgentRisk: async (_input: unknown, _url: string) => ({ ok: true, status: 202 }),
   };
 
   const deps = wrapWithCallTracking({ ...base, ...overrides }, calls);
@@ -193,6 +200,40 @@ function expectOrder(calls: string[], order: string[]): void {
     expect(idx, `expected "${step}" to come after the previous step in ${JSON.stringify(order)} (got ${JSON.stringify(calls)})`).toBeGreaterThan(lastIdx);
     lastIdx = idx;
   }
+}
+
+/** Run `fn` with GATEWAY_NARRATE set (or deleted), capturing console.log.
+ *  Hoisted to module scope (was local to the GATEWAY_NARRATE describe block)
+ *  so the GATEWAY_OPA_MODE suite can assert on narrate lines too. */
+async function withNarrate<T>(value: string | undefined, fn: () => Promise<T>): Promise<{ result: T; lines: string[]; allLogs: string[] }> {
+  const prev = process.env['GATEWAY_NARRATE'];
+  if (value === undefined) delete process.env['GATEWAY_NARRATE'];
+  else process.env['GATEWAY_NARRATE'] = value;
+  const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+  try {
+    const result = await fn();
+    const allLogs = logSpy.mock.calls.map((c) => String(c[0]));
+    return { result, allLogs, lines: allLogs.filter((l) => l.startsWith('[gateway:narrate]')) };
+  } finally {
+    logSpy.mockRestore();
+    if (prev === undefined) delete process.env['GATEWAY_NARRATE'];
+    else process.env['GATEWAY_NARRATE'] = prev;
+  }
+}
+
+/** Baseline OpaConfig for the GATEWAY_OPA_MODE suite: mode 'off' so every
+ *  OTHER test in this file, which never overrides opaConfig, is unaffected. */
+function makeOpaConfig(overrides: Record<string, unknown> = {}) {
+  return {
+    mode: 'off' as const,
+    url: 'http://opa.test:8181',
+    timeoutMs: 300,
+    agentId: 'agent-1',
+    verifyAgentId: 'verify-agent-1',
+    agentRiskUrl: 'http://antenna.test/sources/agent_risk/events',
+    suspendTtlSeconds: 300,
+    ...overrides,
+  };
 }
 
 describe('runPipeline', () => {
@@ -518,6 +559,383 @@ describe('runPipeline', () => {
       expect(deps.recordDeny).not.toHaveBeenCalled();
       expect(deps.emitSessionRevoked).not.toHaveBeenCalled();
       expect(deps.markKilled).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── GATEWAY_OPA_MODE (OPA guardrails): plan Task 3 ─────────────────────
+  //
+  // opaConfig / queryOpa / emitAgentRisk are injected the same way every
+  // other seam in this file is (see makeRunDeps' base object above). Default
+  // mode 'off'. Every OTHER test in this file never overrides opaConfig, so
+  // this feature must leave them all byte-identical.
+  describe('GATEWAY_OPA_MODE (OPA guardrails)', () => {
+    it('off: queryOpa is never called for an allowed tool', async () => {
+      const { deps } = makeRunDeps({ opaConfig: makeOpaConfig({ mode: 'off' }) });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result.status).toBe('ok');
+      expect(deps.queryOpa).not.toHaveBeenCalled();
+    });
+
+    it('off: queryOpa is never called for an unknown tool either', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'off' }),
+        gateTool: () => ({ tier: 0, rarAction: '', scope: '', allowed: false, reason: 'unknown_tool' }),
+      });
+
+      const result = await runPipeline({ userToken: 'user-token', toolName: 'not_a_tool', args: {} }, deps as any);
+
+      expect(result).toEqual({ status: 'denied', reason: 'unknown_tool' });
+      expect(deps.queryOpa).not.toHaveBeenCalled();
+    });
+
+    it('a tier-4 call never reaches OPA even in enforce mode: 6b stays entirely local', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'enforce' }),
+        gateTool: () => ({ tier: 4, rarAction: 'record_delete', scope: 'records:write', allowed: false, reason: 'policy_deny' }),
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'delete_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result).toEqual({ status: 'denied', reason: 'policy_deny' });
+      expect(deps.queryOpa).not.toHaveBeenCalled();
+    });
+
+    it('a tier-4 call still kills on the third strike with BLOCKED_ACTION_KILL + enforce both on, unchanged', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'enforce' }),
+        blockedActionKill: true,
+        gateTool: () => ({ tier: 4, rarAction: 'record_delete', scope: 'records:write', allowed: false, reason: 'policy_deny' }),
+        recordDeny: (key: string) => (key === 'user-1' ? { count: 3, thresholdReached: true, windowMs: 300_000, threshold: 3 } : { count: 1, thresholdReached: false, windowMs: 300_000, threshold: 3 }),
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'delete_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result).toMatchObject({ status: 'denied', reason: 'blocked_action_threshold_reached', killed: true });
+      expect(deps.queryOpa).not.toHaveBeenCalled();
+      expect(deps.emitAgentRisk).not.toHaveBeenCalled();
+    });
+
+    it('shadow: an OPA deny never blocks the call, and the narrate line carries the answer', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'shadow' }),
+        queryOpa: async () => ({ ok: true, allow: false, reasons: ['egress-host-not-granted'], decisionId: 'd-1' }),
+      });
+
+      const { result, lines } = await withNarrate('true', () =>
+        runPipeline({ userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } }, deps as any),
+      );
+
+      expect(result.status).toBe('ok');
+      expect(deps.exchangeToken).toHaveBeenCalled();
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('opa=deny(egress-host-not-granted) id=d-1');
+    });
+
+    it('shadow: OPA unreachable never blocks the call, and the narrate line says so', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'shadow' }),
+        queryOpa: async () => ({ ok: false, error: 'timeout' }),
+      });
+
+      const { result, lines } = await withNarrate('true', () =>
+        runPipeline({ userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } }, deps as any),
+      );
+
+      expect(result.status).toBe('ok');
+      expect(lines[0]).toContain('opa=unavailable');
+    });
+
+    it('enforce: an OPA deny returns BEFORE exchangeToken is ever called, carrying reasons/decisionId/bundleRevision', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'enforce' }),
+        queryOpa: async () => ({ ok: true, allow: false, reasons: ['egress-host-not-granted'], decisionId: 'd-2', revision: 'sha-abc' }),
+      });
+
+      const result = await runPipeline(
+        { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } },
+        deps as any,
+      );
+
+      expect(result).toMatchObject({
+        status: 'denied',
+        reason: 'opa_deny',
+        reasons: ['egress-host-not-granted'],
+        decisionId: 'd-2',
+        bundleRevision: 'sha-abc',
+      });
+      expect(deps.exchangeToken).not.toHaveBeenCalled();
+      expect(deps.mintCred).not.toHaveBeenCalled();
+    });
+
+    it('enforce: an OPA timeout denies policy_unavailable, before exchangeToken', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'enforce' }),
+        queryOpa: async () => ({ ok: false, error: 'timeout' }),
+      });
+
+      const result = await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+
+      expect(result).toEqual({ status: 'denied', reason: 'policy_unavailable' });
+      expect(deps.exchangeToken).not.toHaveBeenCalled();
+    });
+
+    it('enforce: an OPA 500 also denies policy_unavailable, before exchangeToken', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'enforce' }),
+        queryOpa: async () => ({ ok: false, error: 'http_500' }),
+      });
+
+      const result = await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+
+      expect(result).toEqual({ status: 'denied', reason: 'policy_unavailable' });
+      expect(deps.exchangeToken).not.toHaveBeenCalled();
+    });
+
+    it('enforce: OPA reasons including tool-unregistered denies unknown_tool with engine "opa", and is NOT counted', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'enforce' }),
+        queryOpa: async () => ({ ok: true, allow: false, reasons: ['tool-unregistered'] }),
+      });
+
+      const result = await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+
+      expect(result).toEqual({ status: 'denied', reason: 'unknown_tool', engine: 'opa', reasons: ['tool-unregistered'] });
+      expect(deps.exchangeToken).not.toHaveBeenCalled();
+      expect(deps.recordDeny).not.toHaveBeenCalled();
+      expect(deps.emitAgentRisk).not.toHaveBeenCalled();
+    });
+
+    it('enforce: a tool this instance does not serve is unknown_tool and NOT counted, even when OPA knows the caller-chosen name', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'enforce' }),
+        gateTool: () => ({ tier: 0, rarAction: '', scope: '', allowed: false, reason: 'unknown_tool' }),
+        queryOpa: async () => ({ ok: true, allow: false, reasons: ['egress-host-not-granted'], decisionId: 'd-9' }),
+      });
+
+      const result = await runPipeline({ userToken: 'user-token', toolName: 'webfetch/web_fetch', args: { url: 'https://github.com/' } }, deps as any);
+
+      expect(result).toEqual({ status: 'denied', reason: 'unknown_tool', engine: 'opa', reasons: ['egress-host-not-granted'], decisionId: 'd-9' });
+      expect(deps.recordDeny).not.toHaveBeenCalled();
+    });
+
+    it('enforce: a step-up call asks OPA exactly once, not once per probe/elevated leg', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'enforce' }),
+        callUpstreamTool: async () => ({
+          content: [{ type: 'text', text: JSON.stringify({ record_id: 'REC-9001', classification: 'restricted' }) }],
+        }),
+        exchangeToken: async (args: any) =>
+          args?.authorizationDetails?.[0]?.operationDetails?.action === 'record_read_elevated'
+            ? { status: 'mfa_challenge', challengeToken: 'challenge-1' }
+            : { status: 'ok', accessToken: 'obo-token-1', expiresIn: 3600, scope: 'records:read' },
+      });
+
+      const result = await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-9001' } }, deps as any);
+
+      expect(result.status).toBe('pending');
+      expect(deps.exchangeToken).toHaveBeenCalledTimes(2);
+      expect(deps.queryOpa).toHaveBeenCalledTimes(1);
+    });
+
+    it('enforce: OPA allows but the gateway already said unknown_tool, the existing unknown_tool deny still applies (no engine field)', async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'enforce' }),
+        gateTool: () => ({ tier: 0, rarAction: '', scope: '', allowed: false, reason: 'unknown_tool' }),
+        queryOpa: async () => ({ ok: true, allow: true, reasons: [] }),
+      });
+
+      const result = await runPipeline({ userToken: 'user-token', toolName: 'not_a_tool', args: {} }, deps as any);
+
+      expect(result).toEqual({ status: 'denied', reason: 'unknown_tool' });
+      expect(deps.queryOpa).toHaveBeenCalledTimes(1);
+    });
+
+    it('sends egress_host from a parseable args.url, lowercased', async () => {
+      const { deps } = makeRunDeps({ opaConfig: makeOpaConfig({ mode: 'shadow' }) });
+
+      await runPipeline(
+        { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1', url: 'https://GitHub.com/x' } },
+        deps as any,
+      );
+
+      const input = (deps.queryOpa as any).mock.calls[0][0];
+      expect(input.egress_host).toBe('github.com');
+    });
+
+    it('omits egress_host when args.url is missing or unparseable', async () => {
+      const { deps } = makeRunDeps({ opaConfig: makeOpaConfig({ mode: 'shadow' }) });
+
+      await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1', url: 'not a url' } }, deps as any);
+
+      const input = (deps.queryOpa as any).mock.calls[0][0];
+      expect('egress_host' in input).toBe(false);
+    });
+
+    it("uses the tools.json entry's toolId as tool_id when the gate carries one", async () => {
+      const { deps } = makeRunDeps({
+        opaConfig: makeOpaConfig({ mode: 'shadow' }),
+        gateTool: () => ({ ...makeGateResult({ tier: 1 }), toolId: 'records/get_record' }),
+      });
+
+      await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+
+      const input = (deps.queryOpa as any).mock.calls[0][0];
+      expect(input.tool_id).toBe('records/get_record');
+    });
+
+    it('falls back to the tool name as tool_id when tools.json has no toolId', async () => {
+      const { deps } = makeRunDeps({ opaConfig: makeOpaConfig({ mode: 'shadow' }) });
+
+      await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+
+      const input = (deps.queryOpa as any).mock.calls[0][0];
+      expect(input.tool_id).toBe('get_record');
+    });
+
+    it('agent_id in the OPA input is GATEWAY_OPA_AGENT_ID (opaConfig.agentId)', async () => {
+      const { deps } = makeRunDeps({ opaConfig: makeOpaConfig({ mode: 'shadow', agentId: 'spiffe://openshell-demo/parent' }) });
+
+      await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+
+      const input = (deps.queryOpa as any).mock.calls[0][0];
+      expect(input.agent_id).toBe('spiffe://openshell-demo/parent');
+    });
+
+    describe('agent deny-counter + emitAgentRisk (enforce, opa_deny only)', () => {
+      /** A stateful recordDeny stub mirroring deny-counter.ts's real
+       *  per-key counting, so a test can drive it past the threshold. */
+      function statefulRecordDeny() {
+        const counts = new Map<string, number>();
+        return (key: string) => {
+          const count = (counts.get(key) ?? 0) + 1;
+          counts.set(key, count);
+          return { count, thresholdReached: count >= 3, windowMs: 300_000, threshold: 3 };
+        };
+      }
+
+      it('the third opa_deny for the agent calls emitAgentRisk once with the configured id and ttl; the fourth does not call it again', async () => {
+        const { deps } = makeRunDeps({
+          opaConfig: makeOpaConfig({ mode: 'enforce', agentId: 'agent-1', verifyAgentId: 'verify-agent-1', agentRiskUrl: 'http://antenna.test/agent_risk', suspendTtlSeconds: 300 }),
+          queryOpa: async () => ({ ok: true, allow: false, reasons: ['egress-host-not-granted'] }),
+          recordDeny: statefulRecordDeny(),
+        });
+
+        for (let i = 0; i < 4; i++) {
+          await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+        }
+
+        expect(deps.recordDeny).toHaveBeenCalledTimes(4);
+        expect(deps.recordDeny).toHaveBeenCalledWith('agent:agent-1');
+        expect(deps.emitAgentRisk).toHaveBeenCalledTimes(1);
+        expect(deps.emitAgentRisk).toHaveBeenCalledWith(
+          { agentId: 'verify-agent-1', reason: 'opa_deny_threshold', ttlSeconds: 300 },
+          'http://antenna.test/agent_risk',
+        );
+      });
+
+      it('the deny result on the threshold call carries agentSuspension:{requested:true, ttlSeconds}; earlier calls do not', async () => {
+        const { deps } = makeRunDeps({
+          opaConfig: makeOpaConfig({ mode: 'enforce' }),
+          queryOpa: async () => ({ ok: true, allow: false, reasons: ['egress-host-not-granted'] }),
+          recordDeny: statefulRecordDeny(),
+        });
+
+        const first = await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+        const second = await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+        const third = await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+
+        expect((first as any).agentSuspension).toBeUndefined();
+        expect((second as any).agentSuspension).toBeUndefined();
+        expect((third as any).agentSuspension).toEqual({ requested: true, ttlSeconds: 300 });
+        expect((third as any).denyCount).toBe(3);
+        expect((third as any).denyThreshold).toBe(3);
+      });
+
+      it("the agent counter is independent of the per-user counter: a user's own strikes are untouched", async () => {
+        const { deps } = makeRunDeps({
+          opaConfig: makeOpaConfig({ mode: 'enforce' }),
+          queryOpa: async () => ({ ok: true, allow: false, reasons: ['egress-host-not-granted'] }),
+          recordDeny: statefulRecordDeny(),
+        });
+
+        await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+
+        // Only the agent-keyed counter was touched, never the bare verifyUserId
+        // the tier-4 / MFA paths use.
+        expect(deps.recordDeny).not.toHaveBeenCalledWith('user-1');
+        expect(deps.recordDeny).toHaveBeenCalledWith('agent:agent-1');
+      });
+
+      it('agentSuspension.requested is false when Antenna does not accept the event', async () => {
+        const { deps } = makeRunDeps({
+          opaConfig: makeOpaConfig({ mode: 'enforce' }),
+          queryOpa: async () => ({ ok: true, allow: false, reasons: ['egress-host-not-granted'] }),
+          recordDeny: statefulRecordDeny(),
+          emitAgentRisk: async () => ({ ok: false, status: 0, body: 'connect ECONNREFUSED' }),
+        });
+
+        let result;
+        for (let i = 0; i < 3; i++) {
+          result = await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+        }
+
+        expect((result as any).agentSuspension).toEqual({ requested: false, ttlSeconds: 300 });
+      });
+
+      it('with the real deny-counter, a second burst after the window resets emits again', async () => {
+        vi.useFakeTimers();
+        try {
+          vi.setSystemTime(new Date('2026-09-26T12:00:00Z'));
+          const { deps } = makeRunDeps({
+            opaConfig: makeOpaConfig({ mode: 'enforce', agentId: 'window-reset-agent' }),
+            queryOpa: async () => ({ ok: true, allow: false, reasons: ['egress-host-not-granted'] }),
+            recordDeny: realRecordDeny,
+          });
+          const call = () => runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+
+          for (let i = 0; i < 4; i++) await call();
+          expect(deps.emitAgentRisk).toHaveBeenCalledTimes(1);
+
+          vi.setSystemTime(new Date('2026-09-26T12:05:01Z'));
+          for (let i = 0; i < 3; i++) await call();
+          expect(deps.emitAgentRisk).toHaveBeenCalledTimes(2);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it('skips the emit with a warning when GATEWAY_VERIFY_AGENT_ID or GATEWAY_AGENT_RISK_URL is unset, but still denies', async () => {
+        const { deps } = makeRunDeps({
+          opaConfig: makeOpaConfig({ mode: 'enforce', verifyAgentId: '', agentRiskUrl: '' }),
+          queryOpa: async () => ({ ok: true, allow: false, reasons: ['egress-host-not-granted'] }),
+          recordDeny: statefulRecordDeny(),
+        });
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        try {
+          let result;
+          for (let i = 0; i < 3; i++) {
+            result = await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+          }
+          expect(deps.emitAgentRisk).not.toHaveBeenCalled();
+          expect((result as any).status).toBe('denied');
+          expect((result as any).agentSuspension).toBeUndefined();
+          expect(warn.mock.calls.some((c) => String(c[0]).includes('agent-risk'))).toBe(true);
+        } finally {
+          warn.mockRestore();
+        }
+      });
     });
   });
 
@@ -2186,22 +2604,6 @@ describe('OboDiag.credRevoked on the HITL (completePending) path', () => {
 // exactly what it was before this feature existed.
 // ──────────────────────────────────────────────────────────────────────────
 describe('GATEWAY_NARRATE', () => {
-  /** Run `fn` with GATEWAY_NARRATE set (or deleted), capturing console.log. */
-  async function withNarrate<T>(value: string | undefined, fn: () => Promise<T>): Promise<{ result: T; lines: string[]; allLogs: string[] }> {
-    const prev = process.env['GATEWAY_NARRATE'];
-    if (value === undefined) delete process.env['GATEWAY_NARRATE'];
-    else process.env['GATEWAY_NARRATE'] = value;
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => { });
-    try {
-      const result = await fn();
-      const allLogs = logSpy.mock.calls.map((c) => String(c[0]));
-      return { result, allLogs, lines: allLogs.filter((l) => l.startsWith('[gateway:narrate]')) };
-    } finally {
-      logSpy.mockRestore();
-      if (prev === undefined) delete process.env['GATEWAY_NARRATE'];
-      else process.env['GATEWAY_NARRATE'] = prev;
-    }
-  }
 
   it('UNSET: emits NOTHING — behaviour and stdout are byte-identical to before the flag existed', async () => {
     const { deps } = makeRunDeps({ revokeLease: async () => true });

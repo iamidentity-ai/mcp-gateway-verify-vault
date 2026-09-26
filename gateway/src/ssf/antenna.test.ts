@@ -9,7 +9,7 @@
  * reasonAdmin/reasonUser set.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { emitSessionRevoked } from './antenna.js';
+import { emitSessionRevoked, emitAgentRisk } from './antenna.js';
 
 const SESSION_REVOKED_URI =
   'https://schemas.openid.net/secevent/caep/event-type/session-revoked';
@@ -151,6 +151,66 @@ describe('emitSessionRevoked', () => {
     vi.stubGlobal('fetch', fetchMock);
     try {
       const result = await emitSessionRevoked({ verifyUserId: 'U5', reason: 'default-fetch' });
+      expect(result.ok).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+// ── emitAgentRisk: the agent-risk counterpart, Task 3 of the OPA phase ────
+//
+// Same fire-and-forget, non-throwing contract as emitSessionRevoked above,
+// posting to a DIFFERENT source (agent_risk, not session-revoked) with its
+// own payload shape: { sub_id: {format:'opaque', id}, reason, ttl_seconds }.
+// Unlike ANTENNA_SOURCE_URL (which has a sensible hardcoded default),
+// GATEWAY_AGENT_RISK_URL has none. The caller (pipeline.ts) supplies it,
+// and is the one that decides whether to call this at all when it's unset.
+describe('emitAgentRisk', () => {
+  const url = 'https://localhost:9042/sources/agent_risk/events';
+
+  it('POSTs {sub_id:{format:"opaque", id}, reason, ttl_seconds} to the given url', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse({ ok: true }, 202));
+
+    const result = await emitAgentRisk({ agentId: 'verify-agent-1', reason: 'opa_deny_threshold', ttlSeconds: 300 }, url, { fetchImpl });
+
+    expect(result).toEqual({ ok: true, status: 202 });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [calledUrl, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(calledUrl).toBe(url);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toEqual({
+      sub_id: { format: 'opaque', id: 'verify-agent-1' },
+      reason: 'opa_deny_threshold',
+      ttl_seconds: 300,
+    });
+  });
+
+  it('returns {ok:false, status, body} on a non-2xx response', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: 'nope' }), { status: 400, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const result = await emitAgentRisk({ agentId: 'a1', reason: 'opa_deny_threshold', ttlSeconds: 300 }, url, { fetchImpl });
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(400);
+  });
+
+  it('returns {ok:false, status:0, body} when fetch throws (does not rethrow)', async () => {
+    const fetchImpl = vi.fn().mockRejectedValueOnce(new Error('network down'));
+
+    const result = await emitAgentRisk({ agentId: 'a1', reason: 'opa_deny_threshold', ttlSeconds: 300 }, url, { fetchImpl });
+
+    expect(result).toEqual({ ok: false, status: 0, body: 'network down' });
+  });
+
+  it('falls back to the global fetch when no deps.fetchImpl is injected', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ ok: true }, 202));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const result = await emitAgentRisk({ agentId: 'a1', reason: 'opa_deny_threshold', ttlSeconds: 300 }, url);
       expect(result.ok).toBe(true);
       expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {

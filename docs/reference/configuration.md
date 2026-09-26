@@ -75,6 +75,31 @@ for the kill to actually happen; the dashboard is observability only.
 | `WEBHOOK_URL` | `http://127.0.0.1:3003` | optional | Events-dashboard base URL. Kills are pushed to `<WEBHOOK_URL>/api/events`. |
 | `WEBHOOK_API_KEY` | *(unset)* | optional | Enables the dashboard push. Unset → the push is skipped (local dev / tests). |
 
+## OPA guardrails (`GATEWAY_OPA_MODE`)
+
+The gateway can ask an [Open Policy Agent](https://www.openpolicyagent.org/) process running the
+`agent-policy-lifecycle` `guardrails` bundle, once per inbound call, right after the tier gate and
+before Token Exchange. `GATEWAY_OPA_MODE=off` (the default) makes no OPA call at all, so an
+instance with none of these vars set is byte-identical to a gateway built before this feature
+existed. `shadow` logs OPA's answer on the [narrate](../concepts/observability.md) line and never
+changes the outcome, even when OPA is unreachable, so a deployment can compare OPA's opinion
+against Verify's before trusting it. `enforce` fails closed: an OPA deny returns before
+`exchangeToken` is ever called, and an unreachable or slow OPA (past `GATEWAY_OPA_TIMEOUT_MS`)
+denies with `policy_unavailable` rather than falling through to Verify. A tier-4 (`policy_deny`)
+call never reaches OPA in any mode, the tier gate's own kill counter is untouched. Three OPA denies
+for one agent (a separate counter from the per-user MFA/blocked-action one) fires one agent-risk
+event to Antenna, requesting a timed suspension in Verify's Agent Registry.
+
+| Variable | Default | Required | Purpose |
+|---|---|---|---|
+| `GATEWAY_OPA_MODE` | `off` | optional | `off`, `shadow`, or `enforce`. Unset or empty is `off`. Any other value stops the gateway at startup, so a typo never runs as `off`. |
+| `GATEWAY_OPA_URL` | `http://127.0.0.1:8181` | optional | The OPA process's base URL (`/v1/data/agent/guardrails/decision` is appended). |
+| `GATEWAY_OPA_TIMEOUT_MS` | `300` | optional | Per-call OPA request timeout. A timeout is a deny in enforce mode, never an allow. |
+| `GATEWAY_OPA_AGENT_ID` | *(empty)* | shadow/enforce | This gateway process's own agent identity (one agent per process), the `agent_id` key in `guardrails/agents/data.json`. Unset with `shadow` or `enforce` stops the gateway at startup. |
+| `GATEWAY_VERIFY_AGENT_ID` | *(empty)* | optional | The Verify Agent Registry id used as the agent-risk event's subject. Unset skips the emit, with a warning, when the agent deny-counter's threshold is reached. |
+| `GATEWAY_AGENT_RISK_URL` | *(empty)* | optional | Antenna's `agent_risk` source endpoint. Unset skips the emit, with a warning. |
+| `GATEWAY_AGENT_SUSPEND_TTL_SECONDS` | `300` | optional | Requested suspension length sent on the agent-risk event. Capped at `900`. |
+
 ## Tunables (defaults shown; usually leave unset)
 
 | Variable | Default | Purpose |
