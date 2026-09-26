@@ -822,7 +822,19 @@ export function maskEmail(email: string): string {
 export async function exchangeToken(request: TokenExchangeRequest): Promise<TokenExchangeResult> {
   const { subjectToken, scope, authorizationDetails } = request;
 
-  const actor = await getActorToken();
+  let actor: { token: string; tokenType: string };
+  try {
+    actor = await getActorToken();
+  } catch (err) {
+    // verify mode: a suspended agent's Agent Identity mint is refused with
+    // CSIAQ5293E before any exchange. Surface it as the same deny the two
+    // exchange legs produce; every other actor failure is rethrown unchanged.
+    if (exchangeErrorCode({ error_description: (err as Error).message }, '') === 'agent_suspended') {
+      console.error(`[token-exchange] REJECTED by Verify, actor mint for ${AGENT_CLIENT_ID}: agent_suspended (CSIAQ5293E)`);
+      return { status: 'error', error: 'agent_suspended' };
+    }
+    throw err;
+  }
 
   let exchangeSecret = await getExchangeClientSecret();
 

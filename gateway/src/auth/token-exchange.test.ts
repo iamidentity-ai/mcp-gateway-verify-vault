@@ -342,6 +342,86 @@ describe('exchangeToken, CSIAQ5293E agent-suspended, first leg (case g)', () => 
   });
 });
 
+// ── (h) CSIAQ5293E on the actor mint itself, verify mode only ─
+//
+// In AUTH_METHOD=verify, getActorToken() runs its OWN client_credentials
+// grant against the agent's OIDC app before either exchange leg is
+// attempted. A suspended agent is refused right there, and that refusal is
+// thrown, not returned, so exchangeToken must catch it, classify it with
+// the same exchangeErrorCode used by the two exchange legs, and return the
+// same deny. Every other actor failure (a stale secret that exhausts its
+// retry, a config error) must still propagate unchanged.
+//
+// AUTH_METHOD is read once at module load (line ~157), so each test here
+// stubs the env, resets the module registry, and imports a fresh instance.
+
+describe('exchangeToken, CSIAQ5293E on the actor mint, verify mode (case h)', () => {
+  // The global beforeEach never resets the agent-secret mocks, so clear them
+  // here or the call-count assertions below depend on test order.
+  beforeEach(() => {
+    secretsMocks.getAgentClientSecret.mockReset();
+    secretsMocks.invalidateAgentSecret.mockClear();
+  });
+  afterEach(() => {
+    vi.resetModules();
+  });
+
+  it('returns status "error" with error "agent_suspended" when the actor mint is refused', async () => {
+    vi.stubEnv('AUTH_METHOD', 'verify');
+    vi.stubEnv('GATEWAY_AGENT_CLIENT_ID', 'agent-client');
+    vi.resetModules();
+    const { exchangeToken: freshExchangeToken } = await import('./token-exchange.js');
+
+    secretsMocks.getAgentClientSecret.mockResolvedValue('agent-secret-v1');
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          error: 'invalid_request',
+          error_description: 'CSIAQ5293E Unable to match an active agent identity.',
+        }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const result = await freshExchangeToken({
+      subjectToken: 'user-access-token',
+      scope: 'records:read',
+    });
+
+    expect(result).toEqual({ status: 'error', error: 'agent_suspended' });
+    // The mint is refused before either exchange leg runs: one fetch, no
+    // exchange attempt, no stale-secret retry.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(secretsMocks.invalidateAgentSecret).not.toHaveBeenCalled();
+  });
+
+  it('still throws when the actor mint stale-secret retry exhausts on a non-agent_suspended 400', async () => {
+    vi.stubEnv('AUTH_METHOD', 'verify');
+    vi.stubEnv('GATEWAY_AGENT_CLIENT_ID', 'agent-client');
+    vi.resetModules();
+    const { exchangeToken: freshExchangeToken } = await import('./token-exchange.js');
+
+    secretsMocks.getAgentClientSecret.mockResolvedValue('agent-secret-v1');
+    const staleSecretBody = JSON.stringify({
+      error: 'invalid_client',
+      error_description: 'CSIAQ0155E stale client secret',
+    });
+    fetchMock
+      .mockResolvedValueOnce(new Response(staleSecretBody, { status: 400, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(staleSecretBody, { status: 400, headers: { 'Content-Type': 'application/json' } }));
+
+    await expect(
+      freshExchangeToken({ subjectToken: 'user-access-token', scope: 'records:read' }),
+    ).rejects.toThrow(/CSIAQ0155E/);
+    // The pre-existing stale-secret retry inside getActorToken runs
+    // unchanged: two mint attempts, one secret invalidation, and since
+    // neither response carries CSIAQ5293E, the exhausted-retry error still
+    // propagates as a rejection, not a deny.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(secretsMocks.invalidateAgentSecret).toHaveBeenCalledTimes(1);
+  });
+});
+
 // ── (d) pollOAuthMfaStatus — suspicious precedes denied ──────
 
 describe('pollOAuthMfaStatus — suspicious verdict precedes denied (case d)', () => {
