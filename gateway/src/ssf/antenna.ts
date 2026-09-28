@@ -53,9 +53,11 @@
 //   - The `source_id` path segment of ANTENNA_SOURCE_URL must match a
 //     source configured on the transmitter's ingester (conventionally
 //     `agentic`); any other value is a 404 at the ingester, not a drop.
-//   - NODE_TLS_REJECT_UNAUTHORIZED=0 may be needed in the gateway's service
-//     env to allow connections to a transmitter serving self-signed HTTPS
-//     on localhost.
+//   - The transmitter serves self-signed HTTPS on localhost. The agent-risk
+//     send below trusts it through GATEWAY_AGENT_RISK_CA, the transmitter's
+//     certificate file, reread on every send (see the AGENT_RISK_CA note
+//     further down). The session-revoked emit in this section goes out over
+//     the global fetch and does not use that certificate file.
 //
 // fetch is dependency-injectable via an optional `deps.fetchImpl` param;
 // default behavior is the bare global `fetch`.
