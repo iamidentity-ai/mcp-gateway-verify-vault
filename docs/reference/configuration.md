@@ -98,6 +98,7 @@ event to Antenna, requesting a timed suspension in Verify's Agent Registry.
 | `GATEWAY_OPA_AGENT_ID` | *(empty)* | shadow/enforce | This gateway process's own agent identity (one agent per process), the `agent_id` key in `guardrails/agents/data.json`. Unset with `shadow` or `enforce` stops the gateway at startup. |
 | `GATEWAY_VERIFY_AGENT_ID` | *(empty)* | optional | The Verify Agent Registry id used as the agent-risk event's subject. Unset skips the emit, with a warning, when the agent deny-counter's threshold is reached. |
 | `GATEWAY_AGENT_RISK_URL` | *(empty)* | optional | Antenna's `agent_risk` source endpoint. Unset skips the emit, with a warning. |
+| `GATEWAY_AGENT_RISK_CA` | *(empty)* | optional | Path to the transmitter's certificate, read on every send. Use it instead of `NODE_EXTRA_CA_CERTS` when the transmitter regenerates its certificate. Applies to an `https:` URL only: with an `http:` URL set, every send fails. |
 | `GATEWAY_AGENT_SUSPEND_TTL_SECONDS` | `300` | optional | Requested suspension length sent on the agent-risk event. Capped at `900`. |
 
 ## Tunables (defaults shown; usually leave unset)

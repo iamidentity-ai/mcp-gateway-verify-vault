@@ -936,6 +936,43 @@ describe('runPipeline', () => {
           warn.mockRestore();
         }
       });
+
+      it('a send that fails clears the agent counter, so the next three refusals try again', async () => {
+        const counts = new Map<string, number>();
+        const { deps } = makeRunDeps({
+          opaConfig: makeOpaConfig({ mode: 'enforce', agentId: 'agent-1', verifyAgentId: 'verify-agent-1', agentRiskUrl: 'http://antenna.test/agent_risk', suspendTtlSeconds: 300 }),
+          queryOpa: async () => ({ ok: true, allow: false, reasons: ['egress-host-not-granted'] }),
+          recordDeny: (key: string) => {
+            const count = (counts.get(key) ?? 0) + 1;
+            counts.set(key, count);
+            return { count, thresholdReached: count >= 3, windowMs: 300_000, threshold: 3 };
+          },
+          clearDeny: (key: string) => { counts.delete(key); },
+          emitAgentRisk: vi.fn()
+            .mockResolvedValueOnce({ ok: false, status: 0, body: 'fetch failed' })
+            .mockResolvedValue({ ok: true, status: 201 }),
+        });
+
+        const results = [];
+        for (let i = 0; i < 6; i++) {
+          results.push(await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any));
+        }
+
+        expect(deps.emitAgentRisk).toHaveBeenCalledTimes(2);
+        expect(deps.clearDeny).toHaveBeenCalledWith('agent:agent-1');
+        expect((results[2] as any).agentSuspension).toEqual({ requested: false, ttlSeconds: 300 });
+        expect((results[5] as any).agentSuspension).toEqual({ requested: true, ttlSeconds: 300 });
+      });
+
+      it('a send that lands does not clear the counter: the fourth refusal in the window does not send again', async () => {
+        const { deps } = makeRunDeps({
+          opaConfig: makeOpaConfig({ mode: 'enforce' }),
+          queryOpa: async () => ({ ok: true, allow: false, reasons: ['egress-host-not-granted'] }),
+          recordDeny: statefulRecordDeny(),
+        });
+        for (let i = 0; i < 4; i++) await runPipeline({ userToken: 'user-token', toolName: 'get_record', args: {} }, deps as any);
+        expect(deps.clearDeny).not.toHaveBeenCalledWith(expect.stringMatching(/^agent:/));
+      });
     });
   });
 

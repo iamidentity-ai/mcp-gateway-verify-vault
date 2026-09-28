@@ -60,6 +60,9 @@
 // fetch is dependency-injectable via an optional `deps.fetchImpl` param;
 // default behavior is the bare global `fetch`.
 
+import { readFileSync } from 'node:fs';
+import { request as httpsRequest } from 'node:https';
+
 /** Service name — the `source` on central-dashboard events + log prefixes. */
 const SERVICE_NAME = process.env.GATEWAY_SERVICE_NAME || 'mcp-gateway';
 
@@ -90,6 +93,11 @@ export interface EmitResult {
 export interface EmitDeps {
   /** Injectable for tests; defaults to the global fetch. */
   fetchImpl?: typeof fetch;
+}
+
+export interface AgentRiskDeps extends EmitDeps {
+  /** Antenna's certificate, read on every send; defaults to GATEWAY_AGENT_RISK_CA. */
+  caFile?: string;
 }
 
 // ── Central events dashboard (optional) ──────────────────────────────────
@@ -221,36 +229,73 @@ export interface AgentRiskInput {
   ttlSeconds: number;
 }
 
+// GATEWAY_AGENT_RISK_CA: Antenna's self-signed server certificate, read on
+// EVERY send. Not NODE_EXTRA_CA_CERTS: Node loads that once at process start,
+// and Antenna writes a new certificate each time it starts, so a copy loaded
+// at gateway start is missing when the gateway starts first and wrong after
+// any Antenna restart (both seen on the RHEL host, 2026-09-28).
+const AGENT_RISK_CA = process.env.GATEWAY_AGENT_RISK_CA ?? '';
+
+function postJsonWithCaFile(url: string, body: string, caFile: string): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const req = httpsRequest(
+      url,
+      {
+        method: 'POST',
+        ca: readFileSync(caFile), // a missing file throws here and rejects the promise
+        timeout: 5_000,
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      },
+      (res) => {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', (c: string) => (text += c));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, text }));
+      },
+    );
+    req.on('timeout', () => req.destroy(new Error('timeout after 5000ms')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
 export async function emitAgentRisk(
   input: AgentRiskInput,
   url: string,
-  deps: EmitDeps = {},
+  deps: AgentRiskDeps = {},
 ): Promise<EmitResult> {
-  const doFetch = deps.fetchImpl ?? fetch;
-
   const payload = {
     sub_id: { format: 'opaque' as const, id: input.agentId },
     reason: input.reason,
     ttl_seconds: input.ttlSeconds,
   };
+  const body = JSON.stringify(payload);
+  const caFile = deps.caFile ?? AGENT_RISK_CA;
 
   try {
-    const res = await doFetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      console.warn(`[${SERVICE_NAME}-ssf] agent-risk non-2xx from the transmitter: ${res.status} ${text.slice(0, 200)}`);
-      return { ok: false, status: res.status, body: text };
+    let status: number;
+    let text = '';
+    if (caFile && !deps.fetchImpl) {
+      ({ status, text } = await postJsonWithCaFile(url, body, caFile));
+    } else {
+      const res = await (deps.fetchImpl ?? fetch)(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: AbortSignal.timeout(5_000),
+      });
+      status = res.status;
+      if (!res.ok) text = await res.text().catch(() => '');
     }
-    console.log(`[${SERVICE_NAME}-ssf] agent-risk emitted for agent=${input.agentId} reason=${input.reason} status=${res.status}`);
-    return { ok: true, status: res.status };
+    if (status < 200 || status > 299) {
+      console.warn(`[${SERVICE_NAME}-ssf] agent-risk non-2xx from the transmitter: ${status} ${text.slice(0, 200)}`);
+      return { ok: false, status, body: text };
+    }
+    console.log(`[${SERVICE_NAME}-ssf] agent-risk emitted for agent=${input.agentId} reason=${input.reason} status=${status}`);
+    return { ok: true, status };
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
-    console.warn(`[${SERVICE_NAME}-ssf] agent-risk fetch failed: ${msg}`);
+    console.warn(`[${SERVICE_NAME}-ssf] agent-risk send failed: ${msg}`);
     return { ok: false, status: 0, body: msg };
   }
 }

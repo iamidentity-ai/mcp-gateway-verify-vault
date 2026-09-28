@@ -567,6 +567,11 @@ async function runOpaCheck(
       // `requested` is whether Antenna accepted the event, so a card never
       // claims a suspension that was never delivered.
       agentSuspension = { requested: emitted.ok, ttlSeconds: d.opaConfig.suspendTtlSeconds };
+      // A send that did not land must not use up the window: the emit fires
+      // only when the count equals the threshold, so without this a failed
+      // send meant no retry until the window expired. Clearing lets the next
+      // three refusals try again.
+      if (!emitted.ok) d.clearDeny(`agent:${d.opaConfig.agentId}`);
     } else {
       console.warn(
         `[${SERVICE_NAME}] OPA agent-risk threshold reached for agent=${d.opaConfig.agentId} but ` +

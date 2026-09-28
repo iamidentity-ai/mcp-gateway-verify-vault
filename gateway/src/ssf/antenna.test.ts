@@ -10,6 +10,12 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { emitSessionRevoked, emitAgentRisk } from './antenna.js';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:https';
+import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const SESSION_REVOKED_URI =
   'https://schemas.openid.net/secevent/caep/event-type/session-revoked';
@@ -216,5 +222,49 @@ describe('emitAgentRisk', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe('emitAgentRisk with GATEWAY_AGENT_RISK_CA (Antenna writes a new certificate on every start)', () => {
+  const INPUT = { agentId: 'verify-agent-1', reason: 'opa_deny_threshold', ttlSeconds: 300 };
+
+  function selfSigned(dir: string, name: string) {
+    const key = join(dir, `${name}.key`);
+    const cert = join(dir, `${name}.pem`);
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost',
+      '-addext', 'subjectAltName=IP:127.0.0.1', '-keyout', key, '-out', cert], { stdio: 'ignore' });
+    return { key: readFileSync(key), cert: readFileSync(cert) };
+  }
+
+  async function serve(tls: { key: Buffer; cert: Buffer }) {
+    const srv = createServer(tls, (req, res) => {
+      req.resume();
+      req.on('end', () => { res.statusCode = 201; res.end('{}'); });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+    return { srv, url: `https://127.0.0.1:${(srv.address() as AddressInfo).port}/sources/agent_risk/events` };
+  }
+
+  it('rereads the CA file on every send, so a restarted Antenna is trusted without restarting the gateway', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'antenna-ca-'));
+    const caFile = join(dir, 'server.pem');
+
+    const first = selfSigned(dir, 'a');
+    writeFileSync(caFile, first.cert);
+    const a = await serve(first);
+    expect((await emitAgentRisk(INPUT, a.url, { caFile })).ok).toBe(true);
+    a.srv.close();
+
+    const second = selfSigned(dir, 'b'); // Antenna restarted: new key, new certificate
+    const b = await serve(second);
+    expect((await emitAgentRisk(INPUT, b.url, { caFile })).ok).toBe(false); // file still holds the old one
+    writeFileSync(caFile, second.cert); // render-config.sh wrote the new one
+    expect((await emitAgentRisk(INPUT, b.url, { caFile })).ok).toBe(true);
+    b.srv.close();
+  });
+
+  it('a missing CA file (Antenna not started yet) is a failed send, not a crash', async () => {
+    const r = await emitAgentRisk(INPUT, 'https://127.0.0.1:9/x', { caFile: '/nonexistent/server.pem' });
+    expect(r).toMatchObject({ ok: false, status: 0 });
   });
 });
