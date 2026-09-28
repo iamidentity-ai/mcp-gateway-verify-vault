@@ -250,3 +250,23 @@ describe('no-DB config (credsPath-less actions): business-only authorization_det
     expect(resolveRar({ rarAction: 'record_read' }).credsPath).toBe('verify-rar/creds/records');
   });
 });
+
+describe('buildRAR in kv cred mode', () => {
+  it('emits business + ONE read leg on the creds path, no lease-revoke leg', () => {
+    const rar = buildRAR({ rarAction: 'record_read' }, undefined, 'kv');
+    expect(rar).toHaveLength(2);
+    expect(rar[1]).toEqual({
+      type: 'vault:path_access',
+      path_constraint: 'verify-rar/creds/records',
+      action: 'read',
+      path: 'verify-rar/creds/records',
+      capabilities: ['read'],
+    });
+  });
+
+  it('verify-rar mode is unchanged: update on the creds path plus sys/leases/revoke', () => {
+    const rar = buildRAR({ rarAction: 'record_read' }, undefined, 'verify-rar');
+    expect(rar.map((e: any) => e.capabilities)).toEqual([undefined, ['update'], ['update']]);
+    expect((rar[2] as any).path).toBe('sys/leases/revoke');
+  });
+});
