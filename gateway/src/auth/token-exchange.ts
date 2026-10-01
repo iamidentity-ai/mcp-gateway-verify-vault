@@ -745,6 +745,11 @@ export async function submitTransientOtp(
     return { status: 'otp_invalid', attemptsRemaining };
   }
   if (res.status === 400) {
+    // Some tenants answer a wrong code with 400 CSIBN0021E ("the verification
+    // attempt failed") instead of 401. That is a wrong code, not an expired
+    // one, and must count toward the deny threshold like a 401 does.
+    const text = await res.text();
+    if (text.includes('CSIBN0021E')) return { status: 'otp_invalid', attemptsRemaining: undefined };
     return { status: 'otp_expired' };
   }
   if (!res.ok) {
