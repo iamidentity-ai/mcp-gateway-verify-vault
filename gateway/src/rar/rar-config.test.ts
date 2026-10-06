@@ -265,3 +265,14 @@ describe('examples/upstreams/everything fixture (no-DB)', () => {
     expect((thrown as Error).message).toMatch(/actions\.everything_read\.credsPath/);
   });
 });
+
+describe('parseRarConfig: rarTags', () => {
+  it('is true when set true, false when omitted', () => {
+    expect(parseRarConfig({ ...ticketsConfig(), rarTags: true }).rarTags).toBe(true);
+    expect(parseRarConfig(ticketsConfig()).rarTags).toBe(false);
+  });
+  it('rejects a non-boolean', () => {
+    expect(() => parseRarConfig({ ...ticketsConfig(), rarTags: 'yes' })).toThrow(RarConfigError);
+    expect(() => parseRarConfig({ ...ticketsConfig(), rarTags: 'yes' })).toThrow(/rarTags must be a boolean/);
+  });
+});

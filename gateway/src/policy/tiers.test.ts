@@ -8,7 +8,7 @@
  *   - unknown tools are denied with reason unknown_tool
  */
 import { describe, it, expect } from 'vitest';
-import { gateTool, assertToolActionsValid, assertToolArgsValid } from './tiers.js';
+import { gateTool, assertToolActionsValid, assertToolArgsValid, assertToolTagsValid } from './tiers.js';
 
 describe('gateTool', () => {
   it('gates tier 4 delete_record as denied', () => {
@@ -126,5 +126,20 @@ describe('assertToolArgsValid', () => {
         },
       }),
     ).toThrow(/databricks_write.*table.*unrecognized type "sting"/);
+  });
+});
+
+describe('assertToolTagsValid', () => {
+  const good = { sensitivity: 'internal', action: 'read', blast_radius: 'low', owner: 'o', tenant: 't' };
+  const table = (tags?: unknown) => ({ t1: { tier: 1, rarAction: 'a', scope: 's', ...(tags === undefined ? {} : { tags }) } }) as any;
+  it('passes with five string keys or no tags', () => {
+    expect(() => assertToolTagsValid(table(good), 'tools.json')).not.toThrow();
+    expect(() => assertToolTagsValid(table(), 'tools.json')).not.toThrow();
+  });
+  it('throws on a missing key, non-string value, or extra key, naming the tool', () => {
+    const { tenant: _t, ...missing } = good;
+    expect(() => assertToolTagsValid(table(missing), 'tools.json')).toThrow(/"t1".*tenant/);
+    expect(() => assertToolTagsValid(table({ ...good, owner: 5 }), 'tools.json')).toThrow(/"t1".*owner/);
+    expect(() => assertToolTagsValid(table({ ...good, extra: 'x' }), 'tools.json')).toThrow(/"t1".*extra/);
   });
 });

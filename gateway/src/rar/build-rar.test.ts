@@ -270,3 +270,32 @@ describe('buildRAR in kv cred mode', () => {
     expect((rar[2] as any).path).toBe('sys/leases/revoke');
   });
 });
+
+describe('tool tags in the business element (rarTags)', () => {
+  const customRaw = {
+    rarType: 'urn:example:agent:tickets',
+    idField: 'ticket_id',
+    argIdKey: 'ticketId',
+    actions: { ticket_read: { credsPath: 'verify-rar/creds/tickets', default: true } },
+    stepUp: { discoveryTools: ['get_ticket'], elevateWhen: { field: 'priority', in: ['high'] } },
+  };
+  const TAGS = { sensitivity: 'internal', action: 'read', blast_radius: 'low', owner: 'openshell-demo', tenant: 'openshell' };
+
+  it('adds tags beside operationDetails only when rarTags is on and tags are given', () => {
+    const on = parseRarConfig({ ...customRaw, rarTags: true }, { requireCredsPath: false });
+    const off = parseRarConfig({ ...customRaw }, { requireCredsPath: false });
+    const withTags = buildRAR({ rarAction: 'ticket_read', tags: TAGS }, on, 'kv')[0] as any;
+    expect(withTags.tags).toEqual(TAGS);
+    expect(Object.keys(withTags).sort()).toEqual(['operationDetails', 'tags', 'type']);
+    expect(buildRAR({ rarAction: 'ticket_read' }, on, 'kv')[0]).not.toHaveProperty('tags');
+    expect(buildRAR({ rarAction: 'ticket_read', tags: TAGS }, off, 'kv')[0]).not.toHaveProperty('tags');
+    expect(JSON.stringify(buildRAR({ rarAction: 'ticket_read', tags: TAGS }, off, 'kv'))).toEqual(
+      JSON.stringify(buildRAR({ rarAction: 'ticket_read' }, off, 'kv')),
+    );
+  });
+
+  it('resolveRar passes tags through', () => {
+    const on = parseRarConfig({ ...customRaw, rarTags: true }, { requireCredsPath: false });
+    expect((resolveRar({ rarAction: 'ticket_read', tags: TAGS }, on).authorizationDetails[0] as any).tags).toEqual(TAGS);
+  });
+});

@@ -51,6 +51,7 @@
 
 import { rarConfig, type RarConfig } from './rar-config.js';
 import { VAULT_CRED_MODE } from '../vault/mint.js';
+import type { ToolTags } from '../policy/tiers.js';
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -78,6 +79,7 @@ export type AuthorizationDetail =
   | {
     type: string;
     operationDetails: { [key: string]: string | undefined; action: string; subaction: string };
+    tags?: ToolTags;
   }
   | {
     type: 'vault:path_access';
@@ -154,6 +156,7 @@ export function buildRAR(
     rarAction: string;
     recordId?: string;
     elevated?: boolean;
+    tags?: ToolTags;
   },
   config: RarConfig = rarConfig,
   credMode: 'verify-rar' | 'kv' = VAULT_CRED_MODE,
@@ -169,6 +172,17 @@ export function buildRAR(
       ...(args.recordId ? { [config.idField]: args.recordId } : {}),
     },
   };
+
+  if (config.rarTags && args.tags && 'operationDetails' in business) {
+    // Explicit keys: nothing else from the tools table leaks into the RAR.
+    business.tags = {
+      sensitivity: args.tags.sensitivity,
+      action: args.tags.action,
+      blast_radius: args.tags.blast_radius,
+      owner: args.tags.owner,
+      tenant: args.tags.tenant,
+    };
+  }
 
   // NO-DB upstream: no creds path → emit ONLY the business element.
   if (!credsPath) return [business];
@@ -222,6 +236,7 @@ export function resolveRar(
     rarAction: string;
     recordId?: string;
     elevated?: boolean;
+    tags?: ToolTags;
   },
   config: RarConfig = rarConfig,
 ): { authorizationDetails: AuthorizationDetail[]; credsPath: string | undefined; collapsedAction: string } {
