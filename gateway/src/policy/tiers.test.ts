@@ -138,8 +138,16 @@ describe('assertToolTagsValid', () => {
   });
   it('throws on a missing key, non-string value, or extra key, naming the tool', () => {
     const { tenant: _t, ...missing } = good;
-    expect(() => assertToolTagsValid(table(missing), 'tools.json')).toThrow(/"t1".*tenant/);
+    expect(() => assertToolTagsValid(table(missing), 'tools.json')).toThrow(/"t1".*missing tenant/);
+    expect(() => assertToolTagsValid(table(missing), 'tools.json')).not.toThrow(/owner/);
     expect(() => assertToolTagsValid(table({ ...good, owner: 5 }), 'tools.json')).toThrow(/"t1".*owner/);
     expect(() => assertToolTagsValid(table({ ...good, extra: 'x' }), 'tools.json')).toThrow(/"t1".*extra/);
+  });
+  it('throws on a non-object tags value or an empty-string tag, naming the tool', () => {
+    expect(() => assertToolTagsValid(table('internal'), 'tools.json')).toThrow(/"t1".*not an object/);
+    expect(() => assertToolTagsValid(table({ ...good, owner: '' }), 'tools.json')).toThrow(/"t1" tag "owner" must be a non-empty string/);
+  });
+  it('names the given source file', () => {
+    expect(() => assertToolTagsValid(table('x'), '/etc/real/tools.json')).toThrow(/^\/etc\/real\/tools\.json:/);
   });
 });

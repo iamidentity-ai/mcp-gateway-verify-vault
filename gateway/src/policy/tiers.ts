@@ -23,6 +23,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { rarConfig } from '../rar/rar-config.js';
 
 export type Tier = 1 | 2 | 3 | 4;
@@ -160,10 +161,12 @@ export function assertToolTagsValid(table: Record<string, ToolPolicy>, source: s
     if (typeof tags !== 'object' || tags === null || Array.isArray(tags)) {
       throw new Error(`${source}: tool "${name}" has a tags value that is not an object`);
     }
-    const keys = Object.keys(tags).sort();
-    const want = [...TOOL_TAG_KEYS].sort();
-    if (keys.join(',') !== want.join(',')) {
-      throw new Error(`${source}: tool "${name}" tags must have exactly the keys ${want.join(', ')} (got ${keys.join(', ') || 'none'})`);
+    const have = Object.keys(tags);
+    const missing = TOOL_TAG_KEYS.filter((k) => !have.includes(k));
+    const extra = have.filter((k) => !(TOOL_TAG_KEYS as readonly string[]).includes(k));
+    if (missing.length || extra.length) {
+      const parts = [missing.length ? `missing ${missing.join(', ')}` : '', extra.length ? `unexpected ${extra.join(', ')}` : ''];
+      throw new Error(`${source}: tool "${name}" tags must have exactly the five tag keys (${parts.filter(Boolean).join('; ')})`);
     }
     for (const k of TOOL_TAG_KEYS) {
       const v = (tags as Record<string, unknown>)[k];
@@ -178,7 +181,7 @@ export function assertToolTagsValid(table: Record<string, ToolPolicy>, source: s
 // unrecognized args field type.
 assertToolActionsValid(tools, rarConfig.actions);
 assertToolArgsValid(tools);
-assertToolTagsValid(tools, 'config/tools.json');
+assertToolTagsValid(tools, toolsPath instanceof URL ? fileURLToPath(toolsPath) : toolsPath);
 if (rarConfig.rarTags && !Object.values(tools).some((t) => t.tags)) {
   console.warn(`rarTags is on but no tool in ${String(toolsPath)} carries tags; the RAR will not change`);
 }
