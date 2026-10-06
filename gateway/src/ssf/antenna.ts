@@ -60,6 +60,9 @@
 // fetch is dependency-injectable via an optional `deps.fetchImpl` param;
 // default behavior is the bare global `fetch`.
 
+import { readFileSync } from 'node:fs';
+import { request as httpsRequest } from 'node:https';
+
 /** Service name — the `source` on central-dashboard events + log prefixes. */
 const SERVICE_NAME = process.env.GATEWAY_SERVICE_NAME || 'mcp-gateway';
 
@@ -90,6 +93,11 @@ export interface EmitResult {
 export interface EmitDeps {
   /** Injectable for tests; defaults to the global fetch. */
   fetchImpl?: typeof fetch;
+}
+
+export interface AgentRiskDeps extends EmitDeps {
+  /** Antenna's certificate, read on every send; defaults to GATEWAY_AGENT_RISK_CA. */
+  caFile?: string;
 }
 
 // ── Central events dashboard (optional) ──────────────────────────────────
@@ -188,6 +196,106 @@ export async function emitSessionRevoked(
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     console.warn(`[${SERVICE_NAME}-ssf] fetch failed: ${msg}`);
+    return { ok: false, status: 0, body: msg };
+  }
+}
+
+// ── emitAgentRisk: OPA-deny-threshold agent-risk emitter ──────────────────
+//
+// Fire-and-forget POST to Antenna's agent_risk source, same non-throwing
+// contract as emitSessionRevoked above (never rethrows; a failure is a
+// {ok:false} result, not an exception). pipeline.ts calls this once, on the
+// deny that crosses the OPA deny-counter's threshold (see ssf/deny-counter.ts
+// and pipeline.ts's runOpaCheck). It never retries and never blocks the
+// pipeline's own return on the outcome.
+//
+// Unlike SOURCE_URL above, there is no sensible default endpoint for this.
+// The CALLER (pipeline.ts, which already resolved GATEWAY_AGENT_RISK_URL as
+// part of its OPA config) supplies `url` and is the one that decides to skip
+// the call entirely, with its own warning, when the var is unset.
+//
+// Payload shape (Antenna's agent_risk source, distinct from session-revoked
+// above: an opaque agent subject, not a Verify user):
+//
+//   { sub_id: { format: 'opaque', id: '<GATEWAY_VERIFY_AGENT_ID>' },
+//     reason: 'opa_deny_threshold',
+//     ttl_seconds: <GATEWAY_AGENT_SUSPEND_TTL_SECONDS> }
+
+export interface AgentRiskInput {
+  /** GATEWAY_VERIFY_AGENT_ID, the Verify Agent Registry id, not this
+   *  gateway's own GATEWAY_OPA_AGENT_ID (the SPIFFE/bundle key). */
+  agentId: string;
+  reason: string;
+  ttlSeconds: number;
+}
+
+// GATEWAY_AGENT_RISK_CA: Antenna's self-signed server certificate, read on
+// EVERY send. Not NODE_EXTRA_CA_CERTS: Node loads that once at process start,
+// and Antenna writes a new certificate each time it starts, so a copy loaded
+// at gateway start is missing when the gateway starts first and wrong after
+// any Antenna restart (both seen on the RHEL host, 2026-09-28).
+const AGENT_RISK_CA = process.env.GATEWAY_AGENT_RISK_CA ?? '';
+
+function postJsonWithCaFile(url: string, body: string, caFile: string): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const req = httpsRequest(
+      url,
+      {
+        method: 'POST',
+        ca: readFileSync(caFile), // a missing file throws here and rejects the promise
+        timeout: 5_000,
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      },
+      (res) => {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', (c: string) => (text += c));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, text }));
+      },
+    );
+    req.on('timeout', () => req.destroy(new Error('timeout after 5000ms')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+export async function emitAgentRisk(
+  input: AgentRiskInput,
+  url: string,
+  deps: AgentRiskDeps = {},
+): Promise<EmitResult> {
+  const payload = {
+    sub_id: { format: 'opaque' as const, id: input.agentId },
+    reason: input.reason,
+    ttl_seconds: input.ttlSeconds,
+  };
+  const body = JSON.stringify(payload);
+  const caFile = deps.caFile ?? AGENT_RISK_CA;
+
+  try {
+    let status: number;
+    let text = '';
+    if (caFile && !deps.fetchImpl) {
+      ({ status, text } = await postJsonWithCaFile(url, body, caFile));
+    } else {
+      const res = await (deps.fetchImpl ?? fetch)(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        signal: AbortSignal.timeout(5_000),
+      });
+      status = res.status;
+      if (!res.ok) text = await res.text().catch(() => '');
+    }
+    if (status < 200 || status > 299) {
+      console.warn(`[${SERVICE_NAME}-ssf] agent-risk non-2xx from the transmitter: ${status} ${text.slice(0, 200)}`);
+      return { ok: false, status, body: text };
+    }
+    console.log(`[${SERVICE_NAME}-ssf] agent-risk emitted for agent=${input.agentId} reason=${input.reason} status=${status}`);
+    return { ok: true, status };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn(`[${SERVICE_NAME}-ssf] agent-risk send failed: ${msg}`);
     return { ok: false, status: 0, body: msg };
   }
 }

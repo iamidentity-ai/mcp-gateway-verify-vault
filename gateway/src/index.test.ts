@@ -528,6 +528,11 @@ describe('pipelineResultToEnvelope', () => {
     expect(envelope).toEqual({ ok: false, denied: true, reason: 'policy_deny' });
   });
 
+  it('denied: agent_suspended (Verify Agent Registry suspension, CSIAQ5293E), same shape as any other denied reason, ok:false, denied:true', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'denied', reason: 'agent_suspended' });
+    expect(envelope).toEqual({ ok: false, denied: true, reason: 'agent_suspended' });
+  });
+
   it('denied WITH killed — the deny that crossed the 3-strike threshold carries killed:true so a client can tell it apart from an ordinary policy deny', () => {
     const envelope = pipelineResultToEnvelope({
       status: 'denied',
@@ -568,6 +573,56 @@ describe('pipelineResultToEnvelope', () => {
       denyCount: 3,
       denyThreshold: 3,
     });
+  });
+
+  // ── OPA guardrails denies (GATEWAY_OPA_MODE=enforce): plan Task 3 ────────
+  it('denied: opa_deny, passes through reasons, decisionId, bundleRevision, denyCount, denyThreshold', () => {
+    const envelope = pipelineResultToEnvelope({
+      status: 'denied',
+      reason: 'opa_deny',
+      reasons: ['egress-host-not-granted'],
+      decisionId: 'd-123',
+      bundleRevision: 'sha-abc',
+      denyCount: 1,
+      denyThreshold: 3,
+    });
+    expect(envelope).toEqual({
+      ok: false,
+      denied: true,
+      reason: 'opa_deny',
+      reasons: ['egress-host-not-granted'],
+      decisionId: 'd-123',
+      bundleRevision: 'sha-abc',
+      denyCount: 1,
+      denyThreshold: 3,
+    });
+  });
+
+  it('denied: opa_deny on the threshold call also carries agentSuspension:{requested:true, ttlSeconds}', () => {
+    const envelope = pipelineResultToEnvelope({
+      status: 'denied',
+      reason: 'opa_deny',
+      reasons: ['egress-host-not-granted'],
+      denyCount: 3,
+      denyThreshold: 3,
+      agentSuspension: { requested: true, ttlSeconds: 300 },
+    });
+    expect(envelope).toMatchObject({ agentSuspension: { requested: true, ttlSeconds: 300 } });
+  });
+
+  it('denied: unknown_tool via OPA carries engine:"opa" to distinguish it from the tier gate\'s own unknown_tool', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'denied', reason: 'unknown_tool', engine: 'opa' });
+    expect(envelope).toEqual({ ok: false, denied: true, reason: 'unknown_tool', engine: 'opa' });
+  });
+
+  it('denied: unknown_tool from the tier gate (no engine) is unchanged', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'denied', reason: 'unknown_tool' });
+    expect(envelope).toEqual({ ok: false, denied: true, reason: 'unknown_tool' });
+  });
+
+  it('denied: policy_unavailable, OPA down or timed out in enforce mode, no extra fields fabricated', () => {
+    const envelope = pipelineResultToEnvelope({ status: 'denied', reason: 'policy_unavailable' });
+    expect(envelope).toEqual({ ok: false, denied: true, reason: 'policy_unavailable' });
   });
 
   it('session_killed_suspicious — maps to ok:false, killed:true, reason: "suspicious"', () => {
@@ -646,6 +701,10 @@ describe('statusCodeFor', () => {
     ['ok', { status: 'ok', data: {} }, 200],
     ['pending', { status: 'pending', txId: 'tx-1', requestState: 'v1.abc.def' }, 202],
     ['denied (tier-4 local gate)', { status: 'denied', reason: 'policy_deny' }, 403],
+    // A Verify Agent Registry suspension (CSIAQ5293E) is a "denied" status
+    // like the tier-4 gate, not the "error" status access_denied keeps.
+    // Same 403 either way.
+    ['denied: agent_suspended (Verify Agent Registry suspension)', { status: 'denied', reason: 'agent_suspended' }, 403],
     ['session_killed_suspicious', { status: 'session_killed_suspicious' }, 401],
     ['error: inactive_session', { status: 'error', error: 'inactive_session' }, 401],
     ['error: session_killed', { status: 'error', error: 'session_killed' }, 401],

@@ -219,6 +219,29 @@ function isStaleSecretError(status: number, body: string): boolean {
   return status === 401 || body.includes('invalid_client') || body.includes('CSIAQ0155E');
 }
 
+// ── Suspended-agent classification ───────────────────────────
+
+/**
+ * Turn Verify's refusal for a suspended agent into a distinct error code.
+ *
+ * CSIAQ5293E ("Unable to match an active agent identity.") is what Verify
+ * returns when the calling agent's Agent Registry status is not ACTIVE, an
+ * owner or admin suspended it. It arrives as a generic `invalid_request`,
+ * the same bare error a dozen other misconfigurations produce, with the
+ * CSIAQ code buried in `error_description`. pipeline.ts needs to tell this
+ * apart from every other exchange failure so it can return a deny instead
+ * of a fault, so this is the one place that reads the code out. Only the
+ * mapped code is returned; the free-text description never leaves this
+ * function into a result a client or LLM sees.
+ */
+export function exchangeErrorCode(
+  errorData: { error?: string; error_description?: string },
+  fallback: string,
+): string {
+  if (String(errorData.error_description ?? '').includes('CSIAQ5293E')) return 'agent_suspended';
+  return errorData.error || fallback;
+}
+
 // ── Exchange-failure diagnostics ─────────────────────────────
 
 /**
@@ -618,7 +641,7 @@ export async function exchangeMfaAssertionWithRAR(
     });
     return {
       status: 'error',
-      error: errorData.error || 'jwt_bearer_failed',
+      error: exchangeErrorCode(errorData, 'jwt_bearer_failed'),
       errorDescription: errorData.error_description || text,
     };
   }
@@ -745,6 +768,11 @@ export async function submitTransientOtp(
     return { status: 'otp_invalid', attemptsRemaining };
   }
   if (res.status === 400) {
+    // Some tenants answer a wrong code with 400 CSIBN0021E ("the verification
+    // attempt failed") instead of 401. That is a wrong code, not an expired
+    // one, and must count toward the deny threshold like a 401 does.
+    const text = await res.text();
+    if (text.includes('CSIBN0021E')) return { status: 'otp_invalid', attemptsRemaining: undefined };
     return { status: 'otp_expired' };
   }
   if (!res.ok) {
@@ -799,7 +827,19 @@ export function maskEmail(email: string): string {
 export async function exchangeToken(request: TokenExchangeRequest): Promise<TokenExchangeResult> {
   const { subjectToken, scope, authorizationDetails } = request;
 
-  const actor = await getActorToken();
+  let actor: { token: string; tokenType: string };
+  try {
+    actor = await getActorToken();
+  } catch (err) {
+    // verify mode: a suspended agent's Agent Identity mint is refused with
+    // CSIAQ5293E before any exchange. Surface it as the same deny the two
+    // exchange legs produce; every other actor failure is rethrown unchanged.
+    if (exchangeErrorCode({ error_description: (err as Error).message }, '') === 'agent_suspended') {
+      console.error(`[token-exchange] REJECTED by Verify, actor mint for ${AGENT_CLIENT_ID}: agent_suspended (CSIAQ5293E)`);
+      return { status: 'error', error: 'agent_suspended' };
+    }
+    throw err;
+  }
 
   let exchangeSecret = await getExchangeClientSecret();
 
@@ -851,7 +891,7 @@ export async function exchangeToken(request: TokenExchangeRequest): Promise<Toke
     });
     return {
       status: 'error',
-      error: errorData.error || 'token_exchange_failed',
+      error: exchangeErrorCode(errorData, 'token_exchange_failed'),
       errorDescription: errorData.error_description || body,
     };
   }

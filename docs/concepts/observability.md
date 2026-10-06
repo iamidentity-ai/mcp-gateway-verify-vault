@@ -99,9 +99,9 @@ tool call** to its own stdout, so `tail -F` on the gateway log is a readable nar
 pipeline while it runs:
 
 ```
-[gateway:narrate] OK tool=databricks_write user=operator@example.com tier=2 rar=databricks_write exchange=ok lease=verify-rar/creds/databricks-write/7Xk2Qm4pLz revoked=true jti=7b2f9c14d8 412ms
-[gateway:narrate] PENDING tool=databricks_write user=operator@example.com tier=2 rar=databricks_write exchange=mfa_challenge tx=tx-9c1a 631ms
-[gateway:narrate] OK tool=databricks_write user=operator@example.com tier=2 rar=databricks_write exchange=ok:jwt_bearer stepup=resumed lease=verify-rar/creds/databricks-write/Qz8Nr3Tv revoked=true jti=aa11bb22cc tx=tx-9c1a 2894ms
+[gateway:narrate] OK tool=postgres_write user=operator@example.com tier=2 rar=postgres_write exchange=ok lease=verify-rar/creds/pg-write/7Xk2Qm4pLz revoked=true jti=7b2f9c14d8 412ms
+[gateway:narrate] PENDING tool=postgres_write user=operator@example.com tier=2 rar=postgres_write exchange=mfa_challenge tx=tx-9c1a 631ms
+[gateway:narrate] OK tool=postgres_write user=operator@example.com tier=2 rar=postgres_write exchange=ok:jwt_bearer stepup=resumed lease=verify-rar/creds/pg-write/Qz8Nr3Tv revoked=true jti=aa11bb22cc tx=tx-9c1a 2894ms
 [gateway:narrate] DENIED tool=gitlab_delete_repo user=operator@example.com tier=4 exchange=denied:policy_deny 3ms
 ```
 
@@ -144,7 +144,7 @@ So every rejection now logs **one line naming the reason**, unconditionally:
 [token-exchange] REJECTED by Verify — {"leg":"token-exchange","httpStatus":400,
   "error":"invalid_request",
   "error_description":"CSIAQ5201E The actor or client is not authorized to act on behalf of the subject.",
-  "scope":"databricks:read","rarTypes":["urn:openshell:agent:databricks","vault:path_access"],
+  "scope":"postgres:read","rarTypes":["urn:openshell:agent:postgres","vault:path_access"],
   "subject":{"sub":"user","may_act":{"sub":"spiffe://demo/parent"},"iat":…},
   "actor":{"sub":"323f90b0-…"},
   "mayActMismatch":true,

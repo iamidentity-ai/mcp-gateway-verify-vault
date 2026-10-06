@@ -55,6 +55,7 @@ import {
   describeDelegationMismatch,
   safeClaimDigest,
   exchangeToken,
+  exchangeErrorCode,
   triggerOAuthMfaPush,
   pollOAuthMfaStatus,
   exchangeMfaAssertionWithRAR,
@@ -274,6 +275,153 @@ describe('exchangeToken — CSIAQ0155E retry (case c)', () => {
   });
 });
 
+// ── (g) CSIAQ5293E agent-suspended classification ────────────
+//
+// A suspended agent's Agent Registry entry makes Verify refuse the
+// exchange with a generic invalid_request and CSIAQ5293E in
+// error_description. exchangeErrorCode is the one place that turns that
+// code into 'agent_suspended' so pipeline.ts can treat it as a deny
+// instead of a fault, on either leg.
+
+describe('exchangeErrorCode', () => {
+  it('maps a Verify agent-suspended refusal to agent_suspended', () => {
+    expect(
+      exchangeErrorCode(
+        { error: 'invalid_request', error_description: 'CSIAQ5293E Unable to match an active agent identity.' },
+        'token_exchange_failed',
+      ),
+    ).toBe('agent_suspended');
+  });
+
+  it('finds the code in a non-JSON body the parser wrapped as error_description', () => {
+    expect(exchangeErrorCode({ error_description: '<html>CSIAQ5293E</html>' }, 'token_exchange_failed')).toBe(
+      'agent_suspended',
+    );
+  });
+
+  it('leaves a policy deny as access_denied', () => {
+    expect(
+      exchangeErrorCode(
+        { error: 'access_denied', error_description: 'CSIAQ0278E User is not authorized to access the application.' },
+        'token_exchange_failed',
+      ),
+    ).toBe('access_denied');
+  });
+
+  it('falls back when Verify sent no error field', () => {
+    expect(exchangeErrorCode({}, 'jwt_bearer_failed')).toBe('jwt_bearer_failed');
+  });
+});
+
+describe('exchangeToken, CSIAQ5293E agent-suspended, first leg (case g)', () => {
+  it('returns status "error" with error "agent_suspended" when Verify refuses a suspended agent', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          error: 'invalid_request',
+          error_description: 'CSIAQ5293E Unable to match an active agent identity.',
+        }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const result = await exchangeToken({
+      subjectToken: 'user-access-token',
+      scope: 'records:read',
+    });
+
+    expect(result).toEqual({
+      status: 'error',
+      error: 'agent_suspended',
+      errorDescription: 'CSIAQ5293E Unable to match an active agent identity.',
+    });
+    // A 400 invalid_request is not a stale-secret signal: exchangeToken's
+    // own retry ladder must not refresh the secret and call Verify again.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(invalidateExchangeSecret).not.toHaveBeenCalled();
+  });
+});
+
+// ── (h) CSIAQ5293E on the actor mint itself, verify mode only ─
+//
+// In AUTH_METHOD=verify, getActorToken() runs its OWN client_credentials
+// grant against the agent's OIDC app before either exchange leg is
+// attempted. A suspended agent is refused right there, and that refusal is
+// thrown, not returned, so exchangeToken must catch it, classify it with
+// the same exchangeErrorCode used by the two exchange legs, and return the
+// same deny. Every other actor failure (a stale secret that exhausts its
+// retry, a config error) must still propagate unchanged.
+//
+// AUTH_METHOD is read once at module load (line ~157), so each test here
+// stubs the env, resets the module registry, and imports a fresh instance.
+
+describe('exchangeToken, CSIAQ5293E on the actor mint, verify mode (case h)', () => {
+  // The global beforeEach never resets the agent-secret mocks, so clear them
+  // here or the call-count assertions below depend on test order.
+  beforeEach(() => {
+    secretsMocks.getAgentClientSecret.mockReset();
+    secretsMocks.invalidateAgentSecret.mockClear();
+  });
+  afterEach(() => {
+    vi.resetModules();
+  });
+
+  it('returns status "error" with error "agent_suspended" when the actor mint is refused', async () => {
+    vi.stubEnv('AUTH_METHOD', 'verify');
+    vi.stubEnv('GATEWAY_AGENT_CLIENT_ID', 'agent-client');
+    vi.resetModules();
+    const { exchangeToken: freshExchangeToken } = await import('./token-exchange.js');
+
+    secretsMocks.getAgentClientSecret.mockResolvedValue('agent-secret-v1');
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          error: 'invalid_request',
+          error_description: 'CSIAQ5293E Unable to match an active agent identity.',
+        }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const result = await freshExchangeToken({
+      subjectToken: 'user-access-token',
+      scope: 'records:read',
+    });
+
+    expect(result).toEqual({ status: 'error', error: 'agent_suspended' });
+    // The mint is refused before either exchange leg runs: one fetch, no
+    // exchange attempt, no stale-secret retry.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(secretsMocks.invalidateAgentSecret).not.toHaveBeenCalled();
+  });
+
+  it('still throws when the actor mint stale-secret retry exhausts on a non-agent_suspended 400', async () => {
+    vi.stubEnv('AUTH_METHOD', 'verify');
+    vi.stubEnv('GATEWAY_AGENT_CLIENT_ID', 'agent-client');
+    vi.resetModules();
+    const { exchangeToken: freshExchangeToken } = await import('./token-exchange.js');
+
+    secretsMocks.getAgentClientSecret.mockResolvedValue('agent-secret-v1');
+    const staleSecretBody = JSON.stringify({
+      error: 'invalid_client',
+      error_description: 'CSIAQ0155E stale client secret',
+    });
+    fetchMock
+      .mockResolvedValueOnce(new Response(staleSecretBody, { status: 400, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(staleSecretBody, { status: 400, headers: { 'Content-Type': 'application/json' } }));
+
+    await expect(
+      freshExchangeToken({ subjectToken: 'user-access-token', scope: 'records:read' }),
+    ).rejects.toThrow(/CSIAQ0155E/);
+    // The pre-existing stale-secret retry inside getActorToken runs
+    // unchanged: two mint attempts, one secret invalidation, and since
+    // neither response carries CSIAQ5293E, the exhausted-retry error still
+    // propagates as a rejection, not a deny.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(secretsMocks.invalidateAgentSecret).toHaveBeenCalledTimes(1);
+  });
+});
+
 // ── (d) pollOAuthMfaStatus — suspicious precedes denied ──────
 
 describe('pollOAuthMfaStatus — suspicious verdict precedes denied (case d)', () => {
@@ -391,6 +539,21 @@ describe('exchangeMfaAssertionWithRAR — re-sends authorization_details (case e
     const r = await exchangeMfaAssertionWithRAR('assertion', 'scope-x', undefined, 'secret-x');
     expect(r.status).toBe('error');
     if (r.status === 'error') expect(r.error).toBe('invalid_grant');
+  });
+
+  it('returns error "agent_suspended" on CSIAQ5293E on the second leg too (case g)', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          error: 'invalid_request',
+          error_description: 'CSIAQ5293E Unable to match an active agent identity.',
+        }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const r = await exchangeMfaAssertionWithRAR('assertion', 'scope-x', undefined, 'secret-x');
+    expect(r.status).toBe('error');
+    if (r.status === 'error') expect(r.error).toBe('agent_suspended');
   });
 });
 
@@ -630,6 +793,12 @@ describe('submitTransientOtp', () => {
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ error: 'expired' }), { status: 400, headers: { 'Content-Type': 'application/json' } }));
     const r = await submitTransientOtp('https://x/tx/verif-1', '000000', 'challenge-token');
     expect(r).toEqual({ status: 'otp_expired' });
+  });
+
+  it('400 CSIBN0021E ("verification attempt failed") -> otp_invalid: tenants that answer a wrong code with 400 must still count it', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ messageId: 'CSIBN0021E', messageDescription: 'The system cannot process the request because the verification attempt failed.' }), { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    const r = await submitTransientOtp('https://x/tx/verif-1', '000000', 'challenge-token');
+    expect(r).toEqual({ status: 'otp_invalid', attemptsRemaining: undefined });
   });
 
   it('other non-2xx -> generic error, not swallowed as otp_invalid/otp_expired', async () => {

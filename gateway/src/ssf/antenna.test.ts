@@ -9,7 +9,13 @@
  * reasonAdmin/reasonUser set.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { emitSessionRevoked } from './antenna.js';
+import { emitSessionRevoked, emitAgentRisk } from './antenna.js';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:https';
+import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const SESSION_REVOKED_URI =
   'https://schemas.openid.net/secevent/caep/event-type/session-revoked';
@@ -156,5 +162,109 @@ describe('emitSessionRevoked', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+// ── emitAgentRisk: the agent-risk counterpart, Task 3 of the OPA phase ────
+//
+// Same fire-and-forget, non-throwing contract as emitSessionRevoked above,
+// posting to a DIFFERENT source (agent_risk, not session-revoked) with its
+// own payload shape: { sub_id: {format:'opaque', id}, reason, ttl_seconds }.
+// Unlike ANTENNA_SOURCE_URL (which has a sensible hardcoded default),
+// GATEWAY_AGENT_RISK_URL has none. The caller (pipeline.ts) supplies it,
+// and is the one that decides whether to call this at all when it's unset.
+describe('emitAgentRisk', () => {
+  const url = 'https://localhost:9042/sources/agent_risk/events';
+
+  it('POSTs {sub_id:{format:"opaque", id}, reason, ttl_seconds} to the given url', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse({ ok: true }, 202));
+
+    const result = await emitAgentRisk({ agentId: 'verify-agent-1', reason: 'opa_deny_threshold', ttlSeconds: 300 }, url, { fetchImpl });
+
+    expect(result).toEqual({ ok: true, status: 202 });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [calledUrl, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(calledUrl).toBe(url);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toEqual({
+      sub_id: { format: 'opaque', id: 'verify-agent-1' },
+      reason: 'opa_deny_threshold',
+      ttl_seconds: 300,
+    });
+  });
+
+  it('returns {ok:false, status, body} on a non-2xx response', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: 'nope' }), { status: 400, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const result = await emitAgentRisk({ agentId: 'a1', reason: 'opa_deny_threshold', ttlSeconds: 300 }, url, { fetchImpl });
+
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(400);
+  });
+
+  it('returns {ok:false, status:0, body} when fetch throws (does not rethrow)', async () => {
+    const fetchImpl = vi.fn().mockRejectedValueOnce(new Error('network down'));
+
+    const result = await emitAgentRisk({ agentId: 'a1', reason: 'opa_deny_threshold', ttlSeconds: 300 }, url, { fetchImpl });
+
+    expect(result).toEqual({ ok: false, status: 0, body: 'network down' });
+  });
+
+  it('falls back to the global fetch when no deps.fetchImpl is injected', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ ok: true }, 202));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const result = await emitAgentRisk({ agentId: 'a1', reason: 'opa_deny_threshold', ttlSeconds: 300 }, url);
+      expect(result.ok).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('emitAgentRisk with GATEWAY_AGENT_RISK_CA (Antenna writes a new certificate on every start)', () => {
+  const INPUT = { agentId: 'verify-agent-1', reason: 'opa_deny_threshold', ttlSeconds: 300 };
+
+  function selfSigned(dir: string, name: string) {
+    const key = join(dir, `${name}.key`);
+    const cert = join(dir, `${name}.pem`);
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=localhost',
+      '-addext', 'subjectAltName=IP:127.0.0.1', '-keyout', key, '-out', cert], { stdio: 'ignore' });
+    return { key: readFileSync(key), cert: readFileSync(cert) };
+  }
+
+  async function serve(tls: { key: Buffer; cert: Buffer }) {
+    const srv = createServer(tls, (req, res) => {
+      req.resume();
+      req.on('end', () => { res.statusCode = 201; res.end('{}'); });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+    return { srv, url: `https://127.0.0.1:${(srv.address() as AddressInfo).port}/sources/agent_risk/events` };
+  }
+
+  it('rereads the CA file on every send, so a restarted Antenna is trusted without restarting the gateway', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'antenna-ca-'));
+    const caFile = join(dir, 'server.pem');
+
+    const first = selfSigned(dir, 'a');
+    writeFileSync(caFile, first.cert);
+    const a = await serve(first);
+    expect((await emitAgentRisk(INPUT, a.url, { caFile })).ok).toBe(true);
+    a.srv.close();
+
+    const second = selfSigned(dir, 'b'); // Antenna restarted: new key, new certificate
+    const b = await serve(second);
+    expect((await emitAgentRisk(INPUT, b.url, { caFile })).ok).toBe(false); // file still holds the old one
+    writeFileSync(caFile, second.cert); // render-config.sh wrote the new one
+    expect((await emitAgentRisk(INPUT, b.url, { caFile })).ok).toBe(true);
+    b.srv.close();
+  });
+
+  it('a missing CA file (Antenna not started yet) is a failed send, not a crash', async () => {
+    const r = await emitAgentRisk(INPUT, 'https://127.0.0.1:9/x', { caFile: '/nonexistent/server.pem' });
+    expect(r).toMatchObject({ ok: false, status: 0 });
   });
 });

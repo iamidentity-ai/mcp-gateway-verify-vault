@@ -50,13 +50,14 @@ import {
   maskEmail,
 } from './auth/token-exchange.js';
 import { gateTool } from './policy/tiers.js';
+import { loadOpaConfig, queryOpa, egressHostFromUrl, type OpaConfig } from './policy/opa.js';
 import { resolveRar, type AuthorizationDetail } from './rar/build-rar.js';
 import { rarConfig, isElevatedCredsPath } from './rar/rar-config.js';
 import { mintCred, revokeLease, type MintedCred } from './vault/mint.js';
 import { callUpstreamTool } from './proxy/upstream.js';
 import { recordDeny, clearDeny } from './ssf/deny-counter.js';
 import { markKilled, isSessionKilled, readSubjectIssuedAt } from './ssf/killed-sessions.js';
-import { emitSessionRevoked } from './ssf/antenna.js';
+import { emitSessionRevoked, emitAgentRisk } from './ssf/antenna.js';
 import { putPending, takePending, peekPending, ttlMs, type PendingCtx } from './hitl/pending.js';
 import { mintRequestState, verifyRequestState, requestDigest } from './hitl/request-state.js';
 import { appendAudit } from './audit/chain.js';
@@ -164,7 +165,29 @@ export type PipelineResult =
    * an `otp_invalid` error: so a caller can render "attempt 2 of 3" without
    * keeping its own counter. They describe THIS gateway's kill threshold.
    */
-  | { status: 'denied'; reason: string; killed?: boolean; denyCount?: number; denyThreshold?: number }
+  | {
+      status: 'denied';
+      reason: string;
+      killed?: boolean;
+      denyCount?: number;
+      denyThreshold?: number;
+      /** 'opa' on an OPA-decided unknown_tool deny (GATEWAY_OPA_MODE=enforce,
+       *  reasons included tool-unregistered, or the tier gate has no entry
+       *  and OPA denied): distinguishes it from the SAME reason string
+       *  produced locally by the tier gate with OPA off or allowing. */
+      engine?: 'opa';
+      /** OPA's own reasons array, present on reason:'opa_deny' and on an
+       *  engine:'opa' unknown_tool. */
+      reasons?: string[];
+      /** OPA's decision_id, present only when its console decision log is on. */
+      decisionId?: string;
+      /** The guardrails bundle revision OPA answered from. */
+      bundleRevision?: string;
+      /** Set on the ONE opa_deny that crossed the agent deny-counter's
+       *  threshold: see ssf/deny-counter.ts and runOpaCheck below.
+       *  `requested` is false when Antenna did not accept the event. */
+      agentSuspension?: { requested: boolean; ttlSeconds: number };
+    }
   | { status: 'session_killed_suspicious' }
   /** attemptsRemaining is set only for error:'otp_invalid' when Verify's
    *  response reported a retries/attemptsRemaining count. denyCount /
@@ -229,6 +252,10 @@ export interface NarrateFacts {
   rar?: string;
   /** Token Exchange verdict: ok | mfa_challenge | denied:<code> | error:<code>. */
   exchange?: string;
+  /** OPA's answer for this call: 'allow' | 'deny(<reasons>)' | 'unavailable',
+   *  with ' id=<decisionId>' appended when OPA reported one. Present
+   *  whenever GATEWAY_OPA_MODE != off (shadow AND enforce). */
+  opa?: string;
   /** Gateway-derived step-up marker: 'discovery' | 'elevated' | 'resumed'. */
   stepUp?: string;
   /** Vault lease id — a correlation id, NOT the credential it leased. */
@@ -261,6 +288,7 @@ function narrate(f: NarrateFacts): void {
   if (f.tier !== undefined) parts.push(`tier=${f.tier}`);
   if (f.rar) parts.push(`rar=${f.rar}`);
   if (f.exchange) parts.push(`exchange=${f.exchange}`);
+  if (f.opa) parts.push(`opa=${f.opa}`);
   if (f.stepUp) parts.push(`stepup=${f.stepUp}`);
   if (f.lease) parts.push(`lease=${f.lease}`);
   if (f.revoked !== undefined) parts.push(`revoked=${f.revoked}`);
@@ -315,6 +343,14 @@ export interface RunPipelineDeps {
   genTxId?: () => string;
   /** Injectable clock (tests want deterministic latency). */
   now?: () => number;
+  /** GATEWAY_OPA_MODE and the rest of the GATEWAY_OPA_ / GATEWAY_AGENT_ env
+   *  block, see policy/opa.ts's loadOpaConfig. Injectable as one object so
+   *  a test can set mode:'enforce' etc. without touching process.env. */
+  opaConfig?: OpaConfig;
+  queryOpa?: typeof queryOpa;
+  /** Fires once when the OPA agent deny-counter crosses its threshold, see
+   *  runOpaCheck below. */
+  emitAgentRisk?: typeof emitAgentRisk;
   /**
    * Whether the upstream MCP is database-backed. `true` (default) runs the
    * Vault ephemeral-cred leg (mint → X-DB-* headers → revoke) before every
@@ -396,6 +432,9 @@ const defaultRunPipelineDeps: Required<RunPipelineDeps> = {
   dbBacked: process.env['UPSTREAM_DB_BACKED'] !== 'false',
   hitlMethod: process.env['HITL_METHOD'] === 'transient_email' ? 'transient_email' : 'push',
   blockedActionKill: process.env['BLOCKED_ACTION_KILL'] === 'true',
+  opaConfig: loadOpaConfig(),
+  queryOpa,
+  emitAgentRisk,
 };
 
 /**
@@ -449,6 +488,112 @@ function shouldStepUp(data: unknown): boolean {
   if (rule.in !== undefined) return rule.in.includes(value);
   if (rule.notIn !== undefined) return !rule.notIn.includes(value);
   return true; // no matcher configured → fail closed
+}
+
+/**
+ * Step 2.4 (runPipeline): one OPA query per inbound call. Never runs for a
+ * tier-4 (policy_deny) call, that stays entirely local, see runPipeline's
+ * comment above its tier gate. `narrateValue` is always returned when
+ * GATEWAY_OPA_MODE != off (shadow AND enforce); `deny` is set only in
+ * enforce mode, only when this call must stop here, before exchangeToken is
+ * ever reached. Shadow always returns `{narrateValue}` alone, whatever OPA
+ * answered.
+ */
+async function runOpaCheck(
+  d: Required<RunPipelineDeps>,
+  ctx: PipelineCtx,
+  gate: ReturnType<typeof gateTool>,
+): Promise<{ narrateValue: string; deny?: { result: Extract<PipelineResult, { status: 'denied' }>; auditDecision: string } }> {
+  const egressHost = egressHostFromUrl(ctx.args['url']);
+  const opaResult = await d.queryOpa(
+    {
+      agent_id: d.opaConfig.agentId,
+      tool_id: gate.toolId ?? ctx.toolName,
+      ...(egressHost ? { egress_host: egressHost } : {}),
+    },
+    { url: d.opaConfig.url, timeoutMs: d.opaConfig.timeoutMs },
+  );
+
+  const narrateValue = !opaResult.ok
+    ? 'unavailable'
+    : `${opaResult.allow ? 'allow' : `deny(${opaResult.reasons.join(',')})`}${opaResult.decisionId ? ` id=${opaResult.decisionId}` : ''}`;
+
+  // shadow (or enforce+allow): the answer is logged (narrateValue) and never
+  // changes the outcome.
+  if (d.opaConfig.mode !== 'enforce' || (opaResult.ok && opaResult.allow)) {
+    return { narrateValue };
+  }
+
+  if (!opaResult.ok) {
+    // Timeout, non-2xx, or a missing/malformed result: fail CLOSED. Never
+    // counted (this is OPA being unreachable, not the agent misbehaving).
+    return { narrateValue, deny: { result: { status: 'denied', reason: 'policy_unavailable' }, auditDecision: 'opa_unavailable_deny' } };
+  }
+
+  const opaFields = {
+    reasons: opaResult.reasons,
+    ...(opaResult.decisionId ? { decisionId: opaResult.decisionId } : {}),
+    ...(opaResult.revision ? { bundleRevision: opaResult.revision } : {}),
+  };
+
+  if (!gate.allowed || opaResult.reasons.includes('tool-unregistered')) {
+    // Same reason string gateTool's own unknown_tool deny uses. `engine`
+    // is what tells a caller OPA (not the local tier gate) decided this one.
+    // Never counted toward the agent deny-counter, same reasoning as
+    // BLOCKED_ACTION_KILL's own unknown_tool carve-out above. `!gate.allowed`
+    // covers a caller naming a registered D4 id this instance does not serve:
+    // tool_id then falls back to that caller-chosen name, and whatever OPA
+    // says about it must not count toward suspending the agent.
+    return {
+      narrateValue,
+      deny: { result: { status: 'denied', reason: 'unknown_tool', engine: 'opa', ...opaFields }, auditDecision: 'unknown_tool_deny' },
+    };
+  }
+
+  // A real OPA policy deny (egress-host-not-granted, action-not-granted,
+  // tenant-mismatch, ...). Feeds the PER-AGENT deny counter, a separate key
+  // from the per-user counter the tier-4/MFA paths use, so the two never mix.
+  const denyResult = d.recordDeny(`agent:${d.opaConfig.agentId}`);
+  let agentSuspension: { requested: boolean; ttlSeconds: number } | undefined;
+  // Exactly once per window: recordDeny's thresholdReached is `count >=
+  // threshold`, true on every call after the 3rd too. count===threshold is
+  // the transition, not `>=`.
+  if (denyResult.count === denyResult.threshold) {
+    if (d.opaConfig.verifyAgentId && d.opaConfig.agentRiskUrl) {
+      const emitted = await d.emitAgentRisk(
+        { agentId: d.opaConfig.verifyAgentId, reason: 'opa_deny_threshold', ttlSeconds: d.opaConfig.suspendTtlSeconds },
+        d.opaConfig.agentRiskUrl,
+      );
+      // `requested` is whether Antenna accepted the event, so a card never
+      // claims a suspension that was never delivered.
+      agentSuspension = { requested: emitted.ok, ttlSeconds: d.opaConfig.suspendTtlSeconds };
+      // A send that did not land must not use up the window: the emit fires
+      // only when the count equals the threshold, so without this a failed
+      // send meant no retry until the window expired. Clearing lets the next
+      // three refusals try again.
+      if (!emitted.ok) d.clearDeny(`agent:${d.opaConfig.agentId}`);
+    } else {
+      console.warn(
+        `[${SERVICE_NAME}] OPA agent-risk threshold reached for agent=${d.opaConfig.agentId} but ` +
+          `GATEWAY_VERIFY_AGENT_ID/GATEWAY_AGENT_RISK_URL is unset, skipping the emit`,
+      );
+    }
+  }
+
+  return {
+    narrateValue,
+    deny: {
+      result: {
+        status: 'denied',
+        reason: 'opa_deny',
+        ...opaFields,
+        denyCount: denyResult.count,
+        denyThreshold: denyResult.threshold,
+        ...(agentSuspension ? { agentSuspension } : {}),
+      },
+      auditDecision: 'opa_deny',
+    },
+  };
 }
 
 // ── runPipeline ───────────────────────────────────────────────
@@ -521,18 +666,21 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
 
   // Step 2: tier gate — the single choke point before Verify is ever hit.
   const gate = d.gateTool(ctx.toolName);
-  if (!gate.allowed) {
+
+  // Tier-4 (policy_deny) is decided ENTIRELY here, exactly as it was before
+  // OPA existed in this pipeline: it NEVER reaches OPA, with or without
+  // BLOCKED_ACTION_KILL. Nothing below this block runs for a policy_deny.
+  if (!gate.allowed && gate.reason === 'policy_deny') {
     d.appendAudit({
       ts: d.now(),
       userId: verifyUserId,
       tool: ctx.toolName,
       tier: gate.tier,
-      decision: gate.reason === 'policy_deny' ? 'tier4_deny' : 'unknown_tool_deny',
+      decision: 'tier4_deny',
     });
 
     // Blocked-action escalation kill (opt-in — see RunPipelineDeps.blockedActionKill).
-    // Only a real tier-4 policy deny counts; `unknown_tool` never does.
-    if (d.blockedActionKill && gate.reason === 'policy_deny') {
+    if (d.blockedActionKill) {
       const denyResult = d.recordDeny(verifyUserId);
       if (denyResult.thresholdReached) {
         await d.emitSessionRevoked({
@@ -574,9 +722,51 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
 
     narrate({
       outcome: 'denied', tool: ctx.toolName, ...(userEmail || verifyUserId ? { user: userEmail || verifyUserId } : {}),
-      tier: gate.tier, exchange: `denied:${gate.reason ?? 'policy_deny'}`, latencyMs: d.now() - startedAt,
+      tier: gate.tier, exchange: 'denied:policy_deny', latencyMs: d.now() - startedAt,
     });
-    return { status: 'denied', reason: gate.reason ?? 'policy_deny' };
+    return { status: 'denied', reason: 'policy_deny' };
+  }
+
+  // Step 2.4: ask OPA (GATEWAY_OPA_MODE != off), once per inbound call, for
+  // every call NOT already decided above: an allowed tool, or one the tier
+  // gate refused only as unknown_tool. Runs BEFORE both the unknown_tool
+  // deny below and the step-up block, so an enforce-mode OPA deny never
+  // reaches exchangeToken. See runOpaCheck's own doc comment.
+  const opa = d.opaConfig.mode === 'off' ? undefined : await runOpaCheck(d, ctx, gate);
+  if (opa?.deny) {
+    d.appendAudit({
+      ts: d.now(),
+      userId: verifyUserId,
+      tool: ctx.toolName,
+      tier: gate.tier,
+      decision: opa.deny.auditDecision,
+    });
+    narrate({
+      outcome: 'denied', tool: ctx.toolName, ...(userEmail || verifyUserId ? { user: userEmail || verifyUserId } : {}),
+      tier: gate.tier, exchange: `denied:${opa.deny.result.reason}`, opa: opa.narrateValue,
+      latencyMs: d.now() - startedAt,
+    });
+    return opa.deny.result;
+  }
+
+  if (!gate.allowed) {
+    // reason === 'unknown_tool' (policy_deny returned above already). OPA,
+    // whether off, shadow, or enforce+allow, never overrides this: the
+    // instance's own static tool table is always a second check (a tool OPA
+    // allows but this instance does not serve is still refused unknown_tool).
+    d.appendAudit({
+      ts: d.now(),
+      userId: verifyUserId,
+      tool: ctx.toolName,
+      tier: gate.tier,
+      decision: 'unknown_tool_deny',
+    });
+    narrate({
+      outcome: 'denied', tool: ctx.toolName, ...(userEmail || verifyUserId ? { user: userEmail || verifyUserId } : {}),
+      tier: gate.tier, exchange: 'denied:unknown_tool', ...(opa ? { opa: opa.narrateValue } : {}),
+      latencyMs: d.now() - startedAt,
+    });
+    return { status: 'denied', reason: 'unknown_tool' };
   }
 
   // Step 2.5: GATEWAY-DERIVED STEP-UP (config/rar.json → stepUp).
@@ -606,7 +796,7 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
     if (probe.result.status !== 'ok') {
       // The probe failed — that IS this inbound call's outcome. Narrate once,
       // marked as the discovery leg so the line is not mistaken for a delivery.
-      narrate({ ...probe.facts, tool: ctx.toolName, stepUp: 'discovery', latencyMs: d.now() - startedAt });
+      narrate({ ...probe.facts, tool: ctx.toolName, stepUp: 'discovery', ...(opa ? { opa: opa.narrateValue } : {}), latencyMs: d.now() - startedAt });
       return probe.result;
     }
     // NB: probe.result.data is the MCP CallToolResult envelope in production —
@@ -623,14 +813,14 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
           leaseId: probe.leaseId, oboJti: probe.result.diag?.oboJti,
           latencyMs: d.now() - startedAt,
         });
-        narrate({ ...probe.facts, latencyMs: d.now() - startedAt });
+        narrate({ ...probe.facts, ...(opa ? { opa: opa.narrateValue } : {}), latencyMs: d.now() - startedAt });
         return probe.result;
       }
       // detail/history on a public record — the probe only told us it is not
       // restricted; run the ACTUAL requested tool with the standard RAR. That
       // call (suppressAudit:false) audits its own 'ok' result.
       const delivered = await runExchangeAndCall({ ctx, gate, verifyUserId, userEmail, startedAt, elevated: false, suppressAudit: false }, d);
-      narrate({ ...delivered.facts, latencyMs: d.now() - startedAt });
+      narrate({ ...delivered.facts, ...(opa ? { opa: opa.narrateValue } : {}), latencyMs: d.now() - startedAt });
       return delivered.result;
     }
 
@@ -643,7 +833,7 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
       leaseId: probe.leaseId, oboJti: probe.result.diag?.oboJti,
     });
     const elevated = await runExchangeAndCall({ ctx, gate, verifyUserId, userEmail, startedAt, elevated: true, suppressAudit: false }, d);
-    narrate({ ...elevated.facts, stepUp: 'elevated', latencyMs: d.now() - startedAt });
+    narrate({ ...elevated.facts, stepUp: 'elevated', ...(opa ? { opa: opa.narrateValue } : {}), latencyMs: d.now() - startedAt });
     return elevated.result;
   }
 
@@ -656,7 +846,7 @@ export async function runPipeline(ctx: PipelineCtx, deps: RunPipelineDeps = {}):
     { ctx, gate, verifyUserId, userEmail, startedAt, elevated: false, suppressAudit: false },
     d,
   );
-  narrate({ ...normal.facts, latencyMs: d.now() - startedAt });
+  narrate({ ...normal.facts, ...(opa ? { opa: opa.narrateValue } : {}), latencyMs: d.now() - startedAt });
   return normal.result;
 }
 
@@ -869,6 +1059,29 @@ async function runExchangeAndCall(
       authorizationDetails,
       facts,
     };
+  }
+
+  if (exchangeResult.status === 'error' && exchangeResult.error === 'agent_suspended') {
+    // IBM Verify refused because this agent's Agent Registry status is not
+    // ACTIVE (CSIAQ5293E): an owner or admin suspended it. That is a
+    // governance decision, not a fault, so it returns 'denied' like the
+    // tier gate does and gets the same 403 / denied:true envelope on both
+    // transports. It never feeds the blocked-action deny counter (only the
+    // tier gate does) and never triggers the stale-secret retry: no secret
+    // refresh can reactivate a suspended agent.
+    if (!suppressAudit) {
+      d.appendAudit({
+        ts: d.now(),
+        userId: verifyUserId,
+        tool: ctx.toolName,
+        tier: gate.tier,
+        authorizationDetails,
+        decision: 'exchange_denied',
+      });
+    }
+    facts.outcome = 'denied';
+    facts.exchange = 'denied:agent_suspended';
+    return { result: { status: 'denied', reason: 'agent_suspended' }, authorizationDetails, facts };
   }
 
   if (exchangeResult.status === 'error') {
@@ -1374,6 +1587,25 @@ export async function completePending(
       authorizationDetails,
       exchangeSecret,
     );
+  }
+
+  if (assertionResult.status === 'error' && assertionResult.error === 'agent_suspended') {
+    // Same CSIAQ5293E governance-decision treatment as the first leg (see
+    // runExchangeAndCall above): the agent could have been suspended in the
+    // window between the push approval and this jwt-bearer call, so this
+    // leg must classify it too, not just leg 1. Audited the same way leg 1
+    // audits it: a deny that made it past the tier gate and past the human
+    // approval must still show up in the audit chain.
+    d.appendAudit({
+      ts: d.now(),
+      userId: ctx.verifyUserId,
+      tool: ctx.toolName,
+      tier: gate.tier,
+      authorizationDetails,
+      decision: 'exchange_denied',
+    });
+    narrateFinish('denied', 'denied:agent_suspended');
+    return { status: 'denied', reason: 'agent_suspended' };
   }
 
   if (assertionResult.status !== 'ok') {
