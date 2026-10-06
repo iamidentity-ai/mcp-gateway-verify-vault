@@ -100,6 +100,12 @@ export interface RarConfig {
   defaultAction: string;
   /** Derived at parse: base action → the action that `elevatedFrom`s it. */
   elevationByBase: Record<string, string>;
+  /**
+   * When true and the tool's tools.json entry carries `tags`, the business RAR
+   * element also carries those five tags, so Verify policy can key on tags
+   * instead of tool names. Default false: the RAR is unchanged.
+   */
+  rarTags: boolean;
 }
 
 function requireNonEmptyString(value: unknown, field: string): string {
@@ -213,7 +219,13 @@ export function parseRarConfig(raw: unknown, opts: { requireCredsPath?: boolean 
     };
   }
 
-  return { rarType, idField, argIdKey, actions, stepUp, defaultAction, elevationByBase };
+  const rarTagsRaw = cfg['rarTags'];
+  if (rarTagsRaw !== undefined && typeof rarTagsRaw !== 'boolean') {
+    throw new RarConfigError('config/rar.json: rarTags must be a boolean');
+  }
+  const rarTags = rarTagsRaw === true;
+
+  return { rarType, idField, argIdKey, actions, stepUp, defaultAction, elevationByBase, rarTags };
 }
 
 /**

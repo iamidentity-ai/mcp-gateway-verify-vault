@@ -934,6 +934,7 @@ async function runExchangeAndCall(
       // names (argIdKey; `recordId` under the default config).
       recordId: ctx.args[rarConfig.argIdKey] as string | undefined,
       elevated,
+      tags: gate.tags,
     });
 
   const exchangeResult = await d.exchangeToken({
