@@ -74,6 +74,9 @@ address. `mfa_no_email` means both sources came up empty, not just `email` speci
 - **`submitTransientOtp()`** - verifies the code the user typed. Distinguishes a wrong code
   (`otp_invalid`, with `attemptsRemaining` when Verify reports one) from an expired/already-consumed
   one (`otp_expired`, telling the caller to request a fresh code rather than retype the same one).
+  Some Verify tenants answer a wrong code with HTTP 400 `CSIBN0021E` ("the verification attempt
+  failed") instead of 401, so a 400 carrying `CSIBN0021E` maps to `otp_invalid` (counted toward
+  the deny threshold); any other 400 remains `otp_expired` (not counted).
 - **`exchangeMfaAssertionWithRAR()`** - the same second leg the push path uses, re-sending
   `authorization_details` for the same reason.
 

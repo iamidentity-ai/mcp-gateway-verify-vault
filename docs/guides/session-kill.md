@@ -96,6 +96,9 @@ From `completePending` (`gateway/src/pipeline.ts`), on the MFA verdict of a gate
   than a wrong one. A wrong code with attempts left re-parks the transaction so the same `txId`
   stays retryable — the counter is per user, so the three strikes can be spread across one parked
   step-up or three.
+  Some Verify tenants answer a wrong code with HTTP 400 `CSIBN0021E` ("the verification attempt
+  failed") rather than 401; `submitTransientOtp` maps that 400 to `otp_invalid`, so it still
+  counts. Any other 400 stays `otp_expired` and does not.
 - **1 "suspicious"/fraud verdict** → kill immediately (terminal - the user reported the agent, don't
   keep pushing).
 - **An approval** → clears the deny counter (a fresh slate; MFA-gated tiers only).

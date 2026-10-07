@@ -795,6 +795,12 @@ describe('submitTransientOtp', () => {
     expect(r).toEqual({ status: 'otp_expired' });
   });
 
+  it('400 CSIBN0021E ("verification attempt failed") -> otp_invalid: tenants that answer a wrong code with 400 must still count it', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ messageId: 'CSIBN0021E', messageDescription: 'The system cannot process the request because the verification attempt failed.' }), { status: 400, headers: { 'Content-Type': 'application/json' } }));
+    const r = await submitTransientOtp('https://x/tx/verif-1', '000000', 'challenge-token');
+    expect(r).toEqual({ status: 'otp_invalid', attemptsRemaining: undefined });
+  });
+
   it('other non-2xx -> generic error, not swallowed as otp_invalid/otp_expired', async () => {
     fetchMock.mockResolvedValueOnce(new Response('server error', { status: 500 }));
     const r = await submitTransientOtp('https://x/tx/verif-1', '000000', 'challenge-token');
