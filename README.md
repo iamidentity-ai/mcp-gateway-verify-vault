@@ -374,6 +374,12 @@ long pole, as every operator reports, is the per-downstream *trust* configuratio
 
 ---
 
+## Tool tags in the RAR
+
+Set `"rarTags": true` in `config/rar.json` and the business element of the RAR also carries a `tags` object (sensitivity, action, blast_radius, owner, tenant) next to `operationDetails`. It is off by default, and with it off the RAR is byte-identical to before. A tool's tags come from the optional `tags` object on its `config/tools.json` entry, which agent-policy-lifecycle's `gen-openshell.mjs` generates from the tool's `tags.yaml`; a tool without tags sends none. This lets Verify access policies key on tags instead of enumerating tool names.
+
+---
+
 ## Operational considerations
 
 **Secrets backend.** The gateway authenticates to Verify's `/oauth2/token` with two OAuth

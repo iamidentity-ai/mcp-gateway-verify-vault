@@ -19,7 +19,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { SignJWT } from 'jose';
-import { mintCred, revokeLease } from './mint.js';
+import { mintCred, revokeLease, readKvCred, parseCredMode } from './mint.js';
 import type { AuthorizationDetail } from '../rar/build-rar.js';
 
 const AUTHZ_DETAILS: AuthorizationDetail[] = [
@@ -272,4 +272,41 @@ describe('revokeLease', () => {
     expect(warnSpy).not.toHaveBeenCalled();
     warnSpy.mockRestore();
   });
+});
+
+describe('readKvCred (VAULT_CRED_MODE=kv)', () => {
+  const args = { obo: 'obo-1', authorizationDetails: [], credsPath: 'secret/data/openshell/databricks/read' };
+
+  it('GETs /v1/<credsPath> with the OBO as X-Vault-Token and returns the stored pair with no lease', async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ data: { data: { username: 'token', password: 'dapi-secret' } } }), { status: 200 }),
+    );
+    const cred = await readKvCred(args, { fetchImpl: fetchImpl as unknown as typeof fetch, vaultAddr: 'http://vault' });
+    expect(fetchImpl).toHaveBeenCalledWith('http://vault/v1/secret/data/openshell/databricks/read', {
+      method: 'GET',
+      headers: { 'X-Vault-Token': 'obo-1' },
+    });
+    expect(cred).toEqual({ username: 'token', password: 'dapi-secret', leaseId: '' });
+  });
+
+  it('throws with the status on a non-ok response', async () => {
+    const fetchImpl = vi.fn(async () => new Response('{"errors":["permission denied"]}', { status: 403 }));
+    await expect(readKvCred(args, { fetchImpl: fetchImpl as unknown as typeof fetch })).rejects.toThrow(/kv read failed \(403\)/);
+  });
+
+  it('names a missing field without echoing the body', async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ data: { data: { username: 'dapi-leaky' } } }), { status: 200 }),
+    );
+    const err = await readKvCred(args, { fetchImpl: fetchImpl as unknown as typeof fetch }).catch((e: Error) => e);
+    expect(String(err)).toMatch(/password:false/);
+    expect(String(err)).not.toMatch(/dapi-leaky/);
+  });
+});
+
+describe('parseCredMode', () => {
+  it('defaults to verify-rar', () => expect(parseCredMode(undefined)).toBe('verify-rar'));
+  it('accepts kv', () => expect(parseCredMode('kv')).toBe('kv'));
+  it('rejects anything else so a typo cannot fall back silently', () =>
+    expect(() => parseCredMode('kvv')).toThrow(/VAULT_CRED_MODE/));
 });

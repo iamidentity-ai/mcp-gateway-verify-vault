@@ -52,6 +52,7 @@ How the gateway proves **its own** (actor) identity in the exchange.
 | Variable | Default | Required | Purpose |
 |---|---|---|---|
 | `VAULT_ADDR` | `http://127.0.0.1:8200` | always | Vault address (the OBO is POSTed here as `X-Vault-Token`). Also read as `VAULT_BASE_URI`. |
+| `VAULT_CRED_MODE` | `verify-rar` | optional | `verify-rar` mints an ephemeral credential through the verify-rar plugin and revokes its lease after the call; `kv` reads a stored `{username, password}` from a KV v2 path with the same OBO, through Vault's OAuth resource server, with no lease. Anything else stops the gateway at startup. `kv` needs each action's `credsPath` to be a KV v2 data path (`<mount>/data/<path>`) holding `username` and `password`. |
 | `VAULT_KEY` | *(unset)* | optional | **Dev override** - used directly as the Vault client token, skipping the whole SPIFFE login. **Never set in a real deployment.** |
 | `GATEWAY_APPROLE_ROLE_ID` | `__set_me__` | spiffe | AppRole role_id bootstrapping the workload identity (not secret, but deployment-specific). |
 | `GATEWAY_APPROLE_SECRET_ID` | `__set_me__` | spiffe | AppRole secret_id (**secret** - local `.env` only). |

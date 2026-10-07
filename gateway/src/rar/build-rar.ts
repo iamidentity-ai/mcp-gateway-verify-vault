@@ -50,6 +50,8 @@
  */
 
 import { rarConfig, type RarConfig } from './rar-config.js';
+import { VAULT_CRED_MODE } from '../vault/mint.js';
+import type { ToolTags } from '../policy/tiers.js';
 
 // ── Types ─────────────────────────────────────────────────────
 
@@ -77,6 +79,7 @@ export type AuthorizationDetail =
   | {
     type: string;
     operationDetails: { [key: string]: string | undefined; action: string; subaction: string };
+    tags?: ToolTags;
   }
   | {
     type: 'vault:path_access';
@@ -153,8 +156,10 @@ export function buildRAR(
     rarAction: string;
     recordId?: string;
     elevated?: boolean;
+    tags?: ToolTags;
   },
   config: RarConfig = rarConfig,
+  credMode: 'verify-rar' | 'kv' = VAULT_CRED_MODE,
 ): AuthorizationDetail[] {
   const collapsedAction = collapseAction(args, config);
   const credsPath = vaultCredsPath(collapsedAction, config);
@@ -168,29 +173,44 @@ export function buildRAR(
     },
   };
 
+  if (config.rarTags && args.tags && 'operationDetails' in business) {
+    // Explicit keys: nothing else from the tools table leaks into the RAR.
+    business.tags = {
+      sensitivity: args.tags.sensitivity,
+      action: args.tags.action,
+      blast_radius: args.tags.blast_radius,
+      owner: args.tags.owner,
+      tenant: args.tags.tenant,
+    };
+  }
+
   // NO-DB upstream: no creds path → emit ONLY the business element.
   if (!credsPath) return [business];
 
+  // kv: one read on the stored credential's path; KV issues no lease to revoke.
+  if (credMode === 'kv') return [business, pathAccessLeg(credsPath, 'read')];
+
   return [
     business,
-    pathAccessLeg(credsPath),
-    pathAccessLeg('sys/leases/revoke'),
+    pathAccessLeg(credsPath, 'update'),
+    pathAccessLeg('sys/leases/revoke', 'update'),
   ];
 }
 
 /**
  * One vault:path_access element in the dual shape (see the
  * AuthorizationDetail type doc): alpha-era `path_constraint`/`action`
- * alongside GA `path`/`capabilities`, always granting `update` — both the
- * creds mint and the lease revoke are Vault update operations.
+ * alongside GA `path`/`capabilities`. verify-rar mode grants `update` (the
+ * creds mint and the lease revoke are both update operations); kv mode
+ * grants `read` on the stored credential.
  */
-function pathAccessLeg(path: string): AuthorizationDetail {
+function pathAccessLeg(path: string, capability: 'read' | 'update'): AuthorizationDetail {
   return {
     type: 'vault:path_access',
     path_constraint: path,
-    action: 'update',
+    action: capability,
     path,
-    capabilities: ['update'],
+    capabilities: [capability],
   };
 }
 
@@ -216,6 +236,7 @@ export function resolveRar(
     rarAction: string;
     recordId?: string;
     elevated?: boolean;
+    tags?: ToolTags;
   },
   config: RarConfig = rarConfig,
 ): { authorizationDetails: AuthorizationDetail[]; credsPath: string | undefined; collapsedAction: string } {

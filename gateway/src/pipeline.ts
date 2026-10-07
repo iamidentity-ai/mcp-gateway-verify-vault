@@ -18,7 +18,7 @@
  *      authorization_details and the Vault creds path — see
  *      rar/build-rar.ts). May come back 'ok' (continue), 'mfa_challenge'
  *      (park as pending + trigger a push) or 'error'.
- *   4. mintCred — Vault verify-rar mints an ephemeral Postgres credential.
+ *   4. mintCred: verify-rar mints an ephemeral credential, or (VAULT_CRED_MODE=kv) a stored one is read from KV with the OBO.
  *   5. callUpstreamTool — the OBO + ephemeral creds actually run the tool
  *      against the upstream MCP server.
  *   6. revokeLease (best-effort) + appendAudit + clearDeny (MFA-gated
@@ -53,7 +53,7 @@ import { gateTool } from './policy/tiers.js';
 import { loadOpaConfig, queryOpa, egressHostFromUrl, type OpaConfig } from './policy/opa.js';
 import { resolveRar, type AuthorizationDetail } from './rar/build-rar.js';
 import { rarConfig, isElevatedCredsPath } from './rar/rar-config.js';
-import { mintCred, revokeLease, type MintedCred } from './vault/mint.js';
+import { mintCred, revokeLease, readKvCred, VAULT_CRED_MODE, type MintedCred } from './vault/mint.js';
 import { callUpstreamTool } from './proxy/upstream.js';
 import { recordDeny, clearDeny } from './ssf/deny-counter.js';
 import { markKilled, isSessionKilled, readSubjectIssuedAt } from './ssf/killed-sessions.js';
@@ -418,7 +418,7 @@ const defaultRunPipelineDeps: Required<RunPipelineDeps> = {
   triggerOAuthMfaPush,
   buildPushContext,
   triggerTransientEmailOtp,
-  mintCred,
+  mintCred: VAULT_CRED_MODE === 'kv' ? readKvCred : mintCred,
   callUpstreamTool,
   revokeLease,
   appendAudit,
@@ -934,6 +934,7 @@ async function runExchangeAndCall(
       // names (argIdKey; `recordId` under the default config).
       recordId: ctx.args[rarConfig.argIdKey] as string | undefined,
       elevated,
+      tags: gate.tags,
     });
 
   const exchangeResult = await d.exchangeToken({
@@ -1141,10 +1142,13 @@ async function runExchangeAndCall(
         dbPass: cred.password,
       });
     } finally {
-      const revoked = await d.revokeLease(cred.leaseId, obo);
-      if (typeof revoked === 'boolean') {
-        credRevoked = revoked;
-        facts.revoked = revoked;
+      // KV mode reads a stored credential: no lease, nothing to revoke.
+      if (cred.leaseId) {
+        const revoked = await d.revokeLease(cred.leaseId, obo);
+        if (typeof revoked === 'boolean') {
+          credRevoked = revoked;
+          facts.revoked = revoked;
+        }
       }
     }
   } else {
@@ -1234,7 +1238,7 @@ const defaultCompletePendingDeps: Required<CompletePendingDeps> = {
   getExchangeClientSecret,
   invalidateExchangeSecret,
   exchangeMfaAssertionWithRAR,
-  mintCred,
+  mintCred: VAULT_CRED_MODE === 'kv' ? readKvCred : mintCred,
   callUpstreamTool,
   revokeLease,
   appendAudit,
@@ -1638,10 +1642,13 @@ export async function completePending(
         dbPass: cred.password,
       });
     } finally {
-      const revoked = await d.revokeLease(cred.leaseId, obo);
-      if (typeof revoked === 'boolean') {
-        credRevoked = revoked;
-        facts.revoked = revoked;
+      // KV mode reads a stored credential: no lease, nothing to revoke.
+      if (cred.leaseId) {
+        const revoked = await d.revokeLease(cred.leaseId, obo);
+        if (typeof revoked === 'boolean') {
+          credRevoked = revoked;
+          facts.revoked = revoked;
+        }
       }
     }
   } else {

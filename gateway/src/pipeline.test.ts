@@ -2516,6 +2516,23 @@ describe('OboDiag.credRevoked', () => {
     expect((result as { diag?: Record<string, unknown> }).diag).toHaveProperty('cred');
     expect((result as { diag?: Record<string, unknown> }).diag).not.toHaveProperty('credRevoked');
   });
+
+  it('KV cred mode (leaseId ""): the revoke never runs, so credRevoked is never fabricated', async () => {
+    const revokeSpy = vi.fn(async () => true);
+    const { deps } = makeRunDeps({
+      mintCred: async () => ({ username: 'token', password: 'p', leaseId: '' }),
+      revokeLease: revokeSpy,
+    });
+
+    const result = await runPipeline(
+      { userToken: 'user-token', toolName: 'get_record', args: { recordId: 'REC-1' } },
+      deps as any,
+    );
+
+    expect(result).toMatchObject({ status: 'ok' });
+    expect(revokeSpy).not.toHaveBeenCalled();
+    expect((result as { diag?: Record<string, unknown> }).diag).not.toHaveProperty('credRevoked');
+  });
 });
 
 describe('OboDiag.credRevoked on the HITL (completePending) path', () => {
@@ -2597,6 +2614,20 @@ describe('OboDiag.credRevoked on the HITL (completePending) path', () => {
     const diag = (result as { diag?: Record<string, unknown> }).diag;
     expect(diag).not.toHaveProperty('cred');
     expect(diag).not.toHaveProperty('credRevoked');
+  });
+
+  it('KV cred mode (leaseId ""): the revoke never runs, so credRevoked is never fabricated', async () => {
+    const revokeSpy = vi.fn(async () => true);
+    const { deps } = makeHitlDeps({
+      mintCred: async () => ({ username: 'token', password: 'p', leaseId: '' }),
+      revokeLease: revokeSpy,
+    });
+
+    const result = await completePending('tx-1', 'user-1', deps as any);
+
+    expect(result).toMatchObject({ status: 'ok' });
+    expect(revokeSpy).not.toHaveBeenCalled();
+    expect((result as { diag?: Record<string, unknown> }).diag).not.toHaveProperty('credRevoked');
   });
 
   // ── narration on the HITL path ─────────────────────────────────────────

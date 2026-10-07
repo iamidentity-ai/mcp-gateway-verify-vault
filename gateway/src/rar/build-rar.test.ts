@@ -250,3 +250,52 @@ describe('no-DB config (credsPath-less actions): business-only authorization_det
     expect(resolveRar({ rarAction: 'record_read' }).credsPath).toBe('verify-rar/creds/records');
   });
 });
+
+describe('buildRAR in kv cred mode', () => {
+  it('emits business + ONE read leg on the creds path, no lease-revoke leg', () => {
+    const rar = buildRAR({ rarAction: 'record_read' }, undefined, 'kv');
+    expect(rar).toHaveLength(2);
+    expect(rar[1]).toEqual({
+      type: 'vault:path_access',
+      path_constraint: 'verify-rar/creds/records',
+      action: 'read',
+      path: 'verify-rar/creds/records',
+      capabilities: ['read'],
+    });
+  });
+
+  it('verify-rar mode is unchanged: update on the creds path plus sys/leases/revoke', () => {
+    const rar = buildRAR({ rarAction: 'record_read' }, undefined, 'verify-rar');
+    expect(rar.map((e: any) => e.capabilities)).toEqual([undefined, ['update'], ['update']]);
+    expect((rar[2] as any).path).toBe('sys/leases/revoke');
+  });
+});
+
+describe('tool tags in the business element (rarTags)', () => {
+  const customRaw = {
+    rarType: 'urn:example:agent:tickets',
+    idField: 'ticket_id',
+    argIdKey: 'ticketId',
+    actions: { ticket_read: { credsPath: 'verify-rar/creds/tickets', default: true } },
+    stepUp: { discoveryTools: ['get_ticket'], elevateWhen: { field: 'priority', in: ['high'] } },
+  };
+  const TAGS = { sensitivity: 'internal', action: 'read', blast_radius: 'low', owner: 'openshell-demo', tenant: 'openshell' };
+
+  it('adds tags beside operationDetails only when rarTags is on and tags are given', () => {
+    const on = parseRarConfig({ ...customRaw, rarTags: true }, { requireCredsPath: false });
+    const off = parseRarConfig({ ...customRaw }, { requireCredsPath: false });
+    const withTags = buildRAR({ rarAction: 'ticket_read', tags: TAGS }, on, 'kv')[0] as any;
+    expect(withTags.tags).toEqual(TAGS);
+    expect(Object.keys(withTags).sort()).toEqual(['operationDetails', 'tags', 'type']);
+    expect(buildRAR({ rarAction: 'ticket_read' }, on, 'kv')[0]).not.toHaveProperty('tags');
+    expect(buildRAR({ rarAction: 'ticket_read', tags: TAGS }, off, 'kv')[0]).not.toHaveProperty('tags');
+    expect(JSON.stringify(buildRAR({ rarAction: 'ticket_read', tags: TAGS }, off, 'kv'))).toEqual(
+      JSON.stringify(buildRAR({ rarAction: 'ticket_read' }, off, 'kv')),
+    );
+  });
+
+  it('resolveRar passes tags through', () => {
+    const on = parseRarConfig({ ...customRaw, rarTags: true }, { requireCredsPath: false });
+    expect((resolveRar({ rarAction: 'ticket_read', tags: TAGS }, on).authorizationDetails[0] as any).tags).toEqual(TAGS);
+  });
+});

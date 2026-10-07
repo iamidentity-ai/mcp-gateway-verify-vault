@@ -27,6 +27,20 @@ import type { AuthorizationDetail } from '../rar/build-rar.js';
 const VAULT_ADDR =
   process.env.VAULT_ADDR ?? process.env.VAULT_BASE_URI ?? 'http://127.0.0.1:8200';
 
+/**
+ * VAULT_CRED_MODE picks how a DB-backed call gets its upstream credential:
+ * `verify-rar` (default) mints one through the verify-rar plugin and revokes
+ * its lease after the call; `kv` reads a stored {username, password} from a
+ * KV v2 path with the same OBO, through Vault's OAuth resource server, with
+ * no lease. Anything else stops the gateway at startup.
+ */
+export function parseCredMode(v: string | undefined): 'verify-rar' | 'kv' {
+  if (v === undefined || v === '' || v === 'verify-rar') return 'verify-rar';
+  if (v === 'kv') return 'kv';
+  throw new Error(`VAULT_CRED_MODE must be verify-rar or kv, got ${JSON.stringify(v)}`);
+}
+export const VAULT_CRED_MODE = parseCredMode(process.env.VAULT_CRED_MODE);
+
 // ── mintCred ──────────────────────────────────────────────────
 
 export interface MintCredArgs {
@@ -118,6 +132,28 @@ export async function mintCred(args: MintCredArgs, deps: VaultFetchDeps = {}): P
   }
 
   return { username, password, leaseId };
+}
+
+/**
+ * GET a stored credential from a KV v2 data path with the OBO as
+ * X-Vault-Token (the same call the Verify Agent Identity + Vault sample makes
+ * with its delegated token). Returns leaseId '' because KV issues no lease,
+ * so the pipeline skips the revoke. Never puts the response body in an error.
+ */
+export async function readKvCred(args: MintCredArgs, deps: VaultFetchDeps = {}): Promise<MintedCred> {
+  const f = deps.fetchImpl ?? fetch;
+  const addr = deps.vaultAddr ?? VAULT_ADDR;
+  const res = await f(`${addr}/v1/${args.credsPath}`, { method: 'GET', headers: { 'X-Vault-Token': args.obo } });
+  if (!res.ok) {
+    throw new Error(`kv read failed (${res.status}) at ${args.credsPath}`);
+  }
+  const body = (await res.json()) as { data?: { data?: { username?: string; password?: string } } };
+  const username = body?.data?.data?.username;
+  const password = body?.data?.data?.password;
+  if (!username || !password) {
+    throw new Error(`kv read response missing required fields (username:${!!username} password:${!!password})`);
+  }
+  return { username, password, leaseId: '' };
 }
 
 // ── revokeLease ───────────────────────────────────────────────
