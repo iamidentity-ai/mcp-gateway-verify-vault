@@ -32,7 +32,7 @@
  * a live Verify/Vault call and the test can inspect exactly what PipelineCtx
  * the /mcp transport built.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import type { PipelineCtx, PipelineResult } from './pipeline.js';
 
 // vi.mock is hoisted above imports; vi.hoisted lets us share the mock fn
@@ -64,6 +64,8 @@ vi.mock('./auth/introspect.js', () => ({
 }));
 
 process.env['PORT'] = process.env['PORT'] ?? '39714';
+// Pin the public URL so PRM assertions don't depend on a local .env.
+process.env['GATEWAY_PUBLIC_URL'] = `http://127.0.0.1:${process.env['PORT']}`;
 
 const { resolveTestVerdictOverride, pipelineResultToEnvelope, statusCodeFor, mcpToolNames, buildToolSpecs } =
   await import('./index.js');
@@ -735,5 +737,141 @@ describe('statusCodeFor', () => {
     ['error: otp_init_failed', { status: 'error', error: 'otp_init_failed' }, 409],
   ] as const)('%s -> %d', (_label, result, expected) => {
     expect(statusCodeFor(result as Parameters<typeof statusCodeFor>[0])).toBe(expected);
+  });
+});
+
+describe('RFC 9728 protected resource metadata', () => {
+  const base = `http://127.0.0.1:${process.env['PORT']}`;
+  const prmUrl = `${base}/.well-known/oauth-protected-resource`;
+  const saved = { ...process.env };
+  beforeEach(() => {
+    process.env['VERIFY_TENANT_URL'] = 'https://t.example.com';
+  });
+  afterEach(() => {
+    for (const k of ['GATEWAY_AUTHORIZATION_SERVER', 'VERIFY_ISSUER', 'GATEWAY_PRM_SCOPES', 'TOKEN_BINDING_MODE', 'VERIFY_TENANT_URL']) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  it('serves the metadata at the root and the path-suffixed URL, unauthenticated', async () => {
+    process.env['VERIFY_TENANT_URL'] = 'https://t.example.com/';
+    delete process.env['GATEWAY_AUTHORIZATION_SERVER'];
+    delete process.env['VERIFY_ISSUER'];
+    delete process.env['GATEWAY_PRM_SCOPES'];
+    delete process.env['TOKEN_BINDING_MODE'];
+    for (const url of [prmUrl, `${prmUrl}/mcp`]) {
+      const res = await fetch(url);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        resource: `${base}/mcp`,
+        authorization_servers: ['https://t.example.com/oauth2'],
+        bearer_methods_supported: ['header'],
+        scopes_supported: ['openid'],
+        resource_name: 'mcp-gateway',
+      });
+    }
+  });
+
+  it('honors GATEWAY_AUTHORIZATION_SERVER and GATEWAY_PRM_SCOPES', async () => {
+    process.env['GATEWAY_AUTHORIZATION_SERVER'] = 'https://as.example.com/custom';
+    process.env['GATEWAY_PRM_SCOPES'] = 'openid  records:read';
+    const body = (await (await fetch(prmUrl)).json()) as Record<string, unknown>;
+    expect(body['authorization_servers']).toEqual(['https://as.example.com/custom']);
+    expect(body['scopes_supported']).toEqual(['openid', 'records:read']);
+  });
+
+  it('advertises DPoP-bound tokens only in full binding mode', async () => {
+    process.env['TOKEN_BINDING_MODE'] = 'outbound';
+    expect(await (await fetch(prmUrl)).json()).not.toHaveProperty('dpop_bound_access_tokens_required');
+    process.env['TOKEN_BINDING_MODE'] = 'full';
+    expect(await (await fetch(prmUrl)).json()).toHaveProperty('dpop_bound_access_tokens_required', true);
+  });
+
+  it('401 on /mcp without a bearer carries the resource_metadata challenge and the old body', async () => {
+    const res = await fetch(`${base}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe(`Bearer resource_metadata="${prmUrl}"`);
+    expect(await res.json()).toEqual({ error: 'missing_bearer' });
+  });
+
+  it('inactive token on /me/audit adds error="invalid_token"', async () => {
+    introspectMocks.introspectUser.mockResolvedValueOnce({ active: false } as never);
+    const res = await fetch(`${base}/me/audit`, { headers: { authorization: 'Bearer x' } });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe(`Bearer error="invalid_token", resource_metadata="${prmUrl}"`);
+  });
+
+  const mcpPost = () =>
+    fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: 'Bearer t' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+  const invalidChallenge = `Bearer error="invalid_token", resource_metadata="${prmUrl}"`;
+
+  it('/mcp returns 401 invalid_token for an inactive or expired bearer', async () => {
+    introspectMocks.introspectUser.mockResolvedValueOnce({ active: false } as never);
+    const res = await mcpPost();
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe(invalidChallenge);
+    expect(await res.json()).toEqual({ error: 'inactive_session' });
+  });
+
+  it('/mcp returns 401 for a killed session', async () => {
+    const { markKilled, __resetForTests } = await import('./ssf/killed-sessions.js');
+    markKilled('user-1');
+    try {
+      const res = await mcpPost();
+      expect(res.status).toBe(401);
+      expect(res.headers.get('www-authenticate')).toBe(invalidChallenge);
+    } finally {
+      __resetForTests();
+    }
+  });
+
+  it('/mcp still serves an active bearer', async () => {
+    expect((await mcpPost()).status).toBe(200);
+  });
+
+  it('/mcp is a 503, not a 401, when Verify is unreachable', async () => {
+    introspectMocks.introspectUser.mockResolvedValueOnce({ active: false, unreachable: true } as never);
+    const res = await mcpPost();
+    expect(res.status).toBe(503);
+    expect(res.headers.get('www-authenticate')).toBeNull();
+  });
+
+  it('REST /tool 401 from the pipeline carries the invalid_token challenge', async () => {
+    pipelineMocks.runPipeline.mockResolvedValueOnce({ status: 'session_killed_suspicious' } as never);
+    const res = await fetch(`${base}/tool`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer t' },
+      body: JSON.stringify({ name: 'get_record', arguments: { recordId: 'REC-1' } }),
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe(invalidChallenge);
+  });
+
+  it('PRM is 503 when no authorization server is configured', async () => {
+    delete process.env['GATEWAY_AUTHORIZATION_SERVER'];
+    delete process.env['VERIFY_ISSUER'];
+    delete process.env['VERIFY_TENANT_URL'];
+    const res = await fetch(prmUrl);
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: 'authorization_server_not_configured' });
+  });
+
+  it('a real MCP SDK client parses our 401 and discovers the PRM', async () => {
+    const { extractResourceMetadataUrl, discoverOAuthProtectedResourceMetadata } = await import(
+      '@modelcontextprotocol/sdk/client/auth.js'
+    );
+    const res = await fetch(`${base}/mcp`, { method: 'POST', body: '{}', headers: { 'content-type': 'application/json' } });
+    const url = extractResourceMetadataUrl(res);
+    expect(url?.href).toBe(prmUrl);
+    const prm = await discoverOAuthProtectedResourceMetadata(`${base}/mcp`, { resourceMetadataUrl: url });
+    expect(prm.resource).toBe(`${base}/mcp`);
+    // No hint: the SDK falls back to the path-suffixed well-known URL.
+    const prm2 = await discoverOAuthProtectedResourceMetadata(`${base}/mcp`);
+    expect(prm2.authorization_servers?.length).toBe(1);
   });
 });
