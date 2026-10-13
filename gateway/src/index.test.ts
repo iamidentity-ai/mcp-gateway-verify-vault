@@ -32,7 +32,7 @@
  * a live Verify/Vault call and the test can inspect exactly what PipelineCtx
  * the /mcp transport built.
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import type { PipelineCtx, PipelineResult } from './pipeline.js';
 
 // vi.mock is hoisted above imports; vi.hoisted lets us share the mock fn
@@ -744,6 +744,9 @@ describe('RFC 9728 protected resource metadata', () => {
   const base = `http://127.0.0.1:${process.env['PORT']}`;
   const prmUrl = `${base}/.well-known/oauth-protected-resource`;
   const saved = { ...process.env };
+  beforeEach(() => {
+    process.env['VERIFY_TENANT_URL'] = 'https://t.example.com';
+  });
   afterEach(() => {
     for (const k of ['GATEWAY_AUTHORIZATION_SERVER', 'VERIFY_ISSUER', 'GATEWAY_PRM_SCOPES', 'TOKEN_BINDING_MODE', 'VERIFY_TENANT_URL']) {
       if (saved[k] === undefined) delete process.env[k];
@@ -797,6 +800,65 @@ describe('RFC 9728 protected resource metadata', () => {
     const res = await fetch(`${base}/me/audit`, { headers: { authorization: 'Bearer x' } });
     expect(res.status).toBe(401);
     expect(res.headers.get('www-authenticate')).toBe(`Bearer error="invalid_token", resource_metadata="${prmUrl}"`);
+  });
+
+  const mcpPost = () =>
+    fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: 'Bearer t' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+  const invalidChallenge = `Bearer error="invalid_token", resource_metadata="${prmUrl}"`;
+
+  it('/mcp returns 401 invalid_token for an inactive or expired bearer', async () => {
+    introspectMocks.introspectUser.mockResolvedValueOnce({ active: false } as never);
+    const res = await mcpPost();
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe(invalidChallenge);
+    expect(await res.json()).toEqual({ error: 'inactive_session' });
+  });
+
+  it('/mcp returns 401 for a killed session', async () => {
+    const { markKilled, __resetForTests } = await import('./ssf/killed-sessions.js');
+    markKilled('user-1');
+    try {
+      const res = await mcpPost();
+      expect(res.status).toBe(401);
+      expect(res.headers.get('www-authenticate')).toBe(invalidChallenge);
+    } finally {
+      __resetForTests();
+    }
+  });
+
+  it('/mcp still serves an active bearer', async () => {
+    expect((await mcpPost()).status).toBe(200);
+  });
+
+  it('/mcp is a 503, not a 401, when Verify is unreachable', async () => {
+    introspectMocks.introspectUser.mockResolvedValueOnce({ active: false, unreachable: true } as never);
+    const res = await mcpPost();
+    expect(res.status).toBe(503);
+    expect(res.headers.get('www-authenticate')).toBeNull();
+  });
+
+  it('REST /tool 401 from the pipeline carries the invalid_token challenge', async () => {
+    pipelineMocks.runPipeline.mockResolvedValueOnce({ status: 'session_killed_suspicious' } as never);
+    const res = await fetch(`${base}/tool`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer t' },
+      body: JSON.stringify({ name: 'get_record', arguments: { recordId: 'REC-1' } }),
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe(invalidChallenge);
+  });
+
+  it('PRM is 503 when no authorization server is configured', async () => {
+    delete process.env['GATEWAY_AUTHORIZATION_SERVER'];
+    delete process.env['VERIFY_ISSUER'];
+    delete process.env['VERIFY_TENANT_URL'];
+    const res = await fetch(prmUrl);
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: 'authorization_server_not_configured' });
   });
 
   it('a real MCP SDK client parses our 401 and discovers the PRM', async () => {

@@ -45,6 +45,9 @@ export interface IntrospectResult {
    *  mcp-refund-okta-verify-vault's token-exchange.ts selectTransientOtpChannel
    *  for the proven pattern this mirrors. */
   preferredUsername?: string;
+  /** Set with active:false when the failure was a network error reaching
+   *  Verify, not a rejected token. Callers must not treat it as a 401. */
+  unreachable?: boolean;
 }
 
 export interface IntrospectDeps {
@@ -128,7 +131,7 @@ export async function introspectUser(token: string, deps: IntrospectDeps = {}): 
     return result;
   } catch {
     // Network / TLS error reaching Verify — fail closed, same as a 401. Never cached.
-    return { active: false };
+    return { active: false, unreachable: true };
   }
 }
 

@@ -94,11 +94,21 @@ function unauthorized(res: Response, body: object, invalidToken = false): Respon
   return res.status(401).json(body);
 }
 
-function protectedResourceMetadata(): object {
+/** Response helper for the REST routes: a 401 from statusCodeFor gets the challenge too. */
+function sendResult(res: Response, result: PipelineResult): Response {
+  const status = statusCodeFor(result);
+  if (status === 401) res.set('WWW-Authenticate', `Bearer error="invalid_token", resource_metadata="${PRM_URL}"`);
+  return res.status(status).json(pipelineResultToEnvelope(result));
+}
+
+function protectedResourceMetadata(): object | undefined {
+  const tenant = process.env['VERIFY_TENANT_URL'];
   const issuer =
     process.env['GATEWAY_AUTHORIZATION_SERVER'] ||
     process.env['VERIFY_ISSUER'] ||
-    `${(process.env['VERIFY_TENANT_URL'] || 'https://tenant.verify.ibm.com').replace(/\/+$/, '')}/oauth2`;
+    (tenant ? `${tenant.replace(/\/+$/, '')}/oauth2` : undefined);
+  // Never advertise a placeholder authorization server.
+  if (!issuer) return undefined;
   return {
     resource: `${PUBLIC_URL}/mcp`,
     authorization_servers: [issuer],
@@ -111,7 +121,9 @@ function protectedResourceMetadata(): object {
 
 // RFC 9728 §3.1: the path-suffixed form is what clients try first for /mcp.
 app.get(['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp'], (_req: Request, res: Response) => {
-  res.json(protectedResourceMetadata());
+  const prm = protectedResourceMetadata();
+  if (!prm) return void res.status(503).json({ error: 'authorization_server_not_configured' });
+  res.json(prm);
 });
 
 /** Gate a route on a valid caller proof in full mode. In none/outbound mode
@@ -369,7 +381,7 @@ app.post('/tool', async (req: Request, res: Response) => {
 
   try {
     const result = await dispatchTool(name, args, bearer, subjectEmail);
-    res.status(statusCodeFor(result)).json(pipelineResultToEnvelope(result));
+    sendResult(res, result);
   } catch (err) {
     const e = err as Error;
     // Log the real error server-side ONLY; the client gets a stable generic
@@ -470,7 +482,7 @@ app.post('/hitl/complete', async (req: Request, res: Response) => {
     // one that parked it (statusCodeFor still drives the HTTP status off the
     // raw result). completePending's `ok` result carries `diag`, so the
     // approved elevated read surfaces its OBO + elevated-scoped cred here too.
-    res.status(statusCodeFor(result)).json(pipelineResultToEnvelope(result));
+    sendResult(res, result);
   } catch (err) {
     const e = err as Error;
     console.error(`[${SERVICE}] /hitl/complete failed:`, e.message);
@@ -786,6 +798,17 @@ function buildMcpServer(bearer: string, subjectEmail?: string): McpServer {
 app.post('/mcp', async (req: Request, res: Response) => {
   const bearer = requireBearer(req, res);
   if (!bearer) return;
+
+  // An invalid, expired or killed token must get HTTP 401 so the client
+  // re-authenticates (MCP auth spec). introspectUser's positive cache means
+  // this is at most one userinfo call per token per INTROSPECT_CACHE_TTL_MS,
+  // and the tool-call pipeline reuses the same cached entry.
+  const introspection = await introspectUser(bearer);
+  if (introspection.unreachable) return void res.status(503).json({ error: 'verify_unreachable' });
+  if (!introspection.active) return void unauthorized(res, { error: 'inactive_session' }, true);
+  if (introspection.verifyUserId && isSessionKilled(introspection.verifyUserId, readSubjectIssuedAt(bearer))) {
+    return void unauthorized(res, { error: 'session_killed' }, true);
+  }
   if (!(await requireDpopBound(req, res, bearer))) return;
 
   // SEP-2243 Mcp-Method/Mcp-Name validation, Phase 0 validate-if-present:

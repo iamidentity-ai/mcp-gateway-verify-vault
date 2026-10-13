@@ -59,7 +59,7 @@ describe('introspectUser', () => {
     expect(result).toEqual({ active: false });
   });
 
-  it('a fetch rejection (network/TLS error) fails closed to active:false', async () => {
+  it('a fetch rejection (network/TLS error) fails closed to active:false (flagged unreachable)', async () => {
     const fetchMock = vi.fn(async () => {
       throw new Error('network down');
     });
@@ -69,7 +69,7 @@ describe('introspectUser', () => {
       tenantUrl: 'https://verify.test',
     });
 
-    expect(result).toEqual({ active: false });
+    expect(result).toEqual({ active: false, unreachable: true });
   });
 
   it('defaults to VERIFY_TENANT_URL / the tenant.verify.ibm.com host when no tenantUrl override is passed', async () => {
