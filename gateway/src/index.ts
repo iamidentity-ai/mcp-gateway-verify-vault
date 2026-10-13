@@ -72,7 +72,7 @@ app.get('/healthz', (_req: Request, res: Response) => {
 function requireBearer(req: Request, res: Response): string | undefined {
   const bearer = (req.header('authorization') || '').replace(/^Bearer /i, '');
   if (!bearer) {
-    res.status(401).json({ error: 'missing_bearer' });
+    unauthorized(res, { error: 'missing_bearer' });
     return undefined;
   }
   return bearer;
@@ -84,6 +84,36 @@ function requireBearer(req: Request, res: Response): string | undefined {
 // for same-host development.
 const PUBLIC_URL = (process.env['GATEWAY_PUBLIC_URL'] || `http://127.0.0.1:${PORT}`).replace(/\/+$/, '');
 
+// ── RFC 9728 Protected Resource Metadata ─────────────────────────────────
+const PRM_URL = `${PUBLIC_URL}/.well-known/oauth-protected-resource`;
+
+/** 401 with the RFC 9728 §5.1 challenge so MCP clients can find the PRM.
+ *  Bodies stay as before; invalidToken adds error="invalid_token" (RFC 6750). */
+function unauthorized(res: Response, body: object, invalidToken = false): Response {
+  res.set('WWW-Authenticate', `Bearer${invalidToken ? ' error="invalid_token",' : ''} resource_metadata="${PRM_URL}"`);
+  return res.status(401).json(body);
+}
+
+function protectedResourceMetadata(): object {
+  const issuer =
+    process.env['GATEWAY_AUTHORIZATION_SERVER'] ||
+    process.env['VERIFY_ISSUER'] ||
+    `${(process.env['VERIFY_TENANT_URL'] || 'https://tenant.verify.ibm.com').replace(/\/+$/, '')}/oauth2`;
+  return {
+    resource: `${PUBLIC_URL}/mcp`,
+    authorization_servers: [issuer],
+    bearer_methods_supported: ['header'],
+    scopes_supported: (process.env['GATEWAY_PRM_SCOPES'] || 'openid').split(/\s+/).filter(Boolean),
+    resource_name: SERVICE,
+    ...(resolveBindingMode() === 'full' ? { dpop_bound_access_tokens_required: true } : {}),
+  };
+}
+
+// RFC 9728 §3.1: the path-suffixed form is what clients try first for /mcp.
+app.get(['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp'], (_req: Request, res: Response) => {
+  res.json(protectedResourceMetadata());
+});
+
 /** Gate a route on a valid caller proof in full mode. In none/outbound mode
  *  this is a no-op so the drop-in path stays untouched. Returns false after
  *  writing the 401, mirroring requireBearer's contract. */
@@ -91,12 +121,12 @@ async function requireDpopBound(req: Request, res: Response, bearer: string): Pr
   if (resolveBindingMode() !== 'full') return true;
   const proof = req.header('dpop');
   if (!proof) {
-    res.status(401).json({ error: 'missing_dpop_proof' });
+    unauthorized(res, { error: 'missing_dpop_proof' });
     return false;
   }
   const result = await verifyDpopProof({ proof, method: req.method, url: `${PUBLIC_URL}${req.path}`, accessToken: bearer });
   if (!result.ok) {
-    res.status(401).json({ error: result.error });
+    unauthorized(res, { error: result.error }, true);
     return false;
   }
   return true;
@@ -456,7 +486,7 @@ app.get('/me/audit', async (req: Request, res: Response) => {
 
   const introspection = await introspectUser(bearer);
   if (!introspection.active || !introspection.verifyUserId) {
-    return res.status(401).json({ error: 'inactive_session' });
+    return unauthorized(res, { error: 'inactive_session' }, true);
   }
 
   const limitRaw = req.query['limit'];
@@ -474,7 +504,7 @@ app.get('/me/session-status', async (req: Request, res: Response) => {
   try {
     const introspection = await introspectUser(bearer);
     if (!introspection.active) {
-      return res.status(401).json({ active: false, reason: 'session_revoked' });
+      return unauthorized(res, { active: false, reason: 'session_revoked' }, true);
     }
     // Same iat-aware gate the pipeline uses. Polling this endpoint with a
     // token minted AFTER the kill reports `active` again — without it a
@@ -484,7 +514,7 @@ app.get('/me/session-status', async (req: Request, res: Response) => {
       introspection.verifyUserId &&
       isSessionKilled(introspection.verifyUserId, readSubjectIssuedAt(bearer))
     ) {
-      return res.status(401).json({ active: false, reason: 'session_killed' });
+      return unauthorized(res, { active: false, reason: 'session_killed' }, true);
     }
     return res.json({ active: true, email: introspection.email, sub: introspection.verifyUserId });
   } catch (e) {

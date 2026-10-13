@@ -329,6 +329,14 @@ alpha-era fields can be dropped - the emission helper is the single place to col
 
 ---
 
+## Client discovery (RFC 9728)
+
+The gateway serves OAuth Protected Resource Metadata at `/.well-known/oauth-protected-resource` and at the path-suffixed `/.well-known/oauth-protected-resource/mcp`, with no authentication. It returns the resource (`GATEWAY_PUBLIC_URL` + `/mcp`), the authorization server (`GATEWAY_AUTHORIZATION_SERVER`, else `VERIFY_ISSUER`, else `VERIFY_TENANT_URL` + `/oauth2`), `scopes_supported` (`GATEWAY_PRM_SCOPES`, default `openid`), and `dpop_bound_access_tokens_required: true` when `TOKEN_BINDING_MODE=full`. Every 401 also carries a `WWW-Authenticate: Bearer resource_metadata="..."` header, which is how MCP clients such as VS Code, Claude Code and the MCP SDK find the metadata. The JSON error bodies are unchanged.
+
+Your tunnel or ingress must route `/.well-known/*` to the gateway, not only `/mcp`, or clients will never reach the metadata.
+
+How a client gets a client id is the authorization server's job, not the gateway's. That means a pre-registered client id, dynamic client registration, or a client ID metadata document. Whether IBM Verify supports client ID metadata documents is unconfirmed, so plan on a pre-registered client until you have checked your tenant.
+
 ## Secure your own MCP
 
 The core is generic; the domain is configuration. Everything that makes the example deployment
