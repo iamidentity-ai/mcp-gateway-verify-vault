@@ -347,6 +347,26 @@ describe('POST /mcp — complete_hitl tool + pending envelope (MCP-transport cov
     expect((rpc.result as { isError?: boolean }).isError).toBe(true);
   });
 
+  it('strips the raw _diagnostic.obo from the MCP tool result but keeps oboJti; an envelope without obo is unchanged', async () => {
+    pipelineMocks.runPipeline.mockResolvedValueOnce({
+      status: 'ok' as const,
+      data: { id: 'REC-1' },
+      diag: { obo: 'a.b.c', oboJti: 'jti-1' },
+    } as PipelineResult);
+    const { rpc } = await postMcpToolCall('get_record', { recordId: 'REC-1' });
+    const text = rpc.result?.content[0]?.text as string;
+    expect(text).toContain('oboJti');
+    expect(text).not.toContain('a.b.c');
+
+    pipelineMocks.runPipeline.mockResolvedValueOnce({
+      status: 'ok' as const,
+      data: { id: 'REC-1' },
+      diag: { oboJti: 'jti-2' },
+    } as PipelineResult);
+    const plain = await postMcpToolCall('get_record', { recordId: 'REC-1' });
+    expect(JSON.parse(plain.rpc.result?.content[0]?.text as string)._diagnostic).toEqual({ oboJti: 'jti-2' });
+  });
+
   it('a denied PipelineResult sets isError:true; an ok result does not', async () => {
     pipelineMocks.runPipeline.mockClear();
     pipelineMocks.runPipeline.mockResolvedValueOnce({ status: 'denied' as const, reason: 'tier_blocked' } as PipelineResult);

@@ -264,8 +264,9 @@ export function pipelineResultToEnvelope(result: PipelineResult): Record<string,
     case 'ok':
       // `diag` is the pipeline's OboDiag (oboJti/oboTtl/oboScope/cred/
       // elevated) — the `_diagnostic` contract a UI's agent log and
-      // audit-trace ribbon read. All non-secret: the raw OBO bearer token
-      // is never exposed to clients (it is a replayable credential).
+      // audit-trace ribbon read. All non-secret except `obo`, the raw OBO bearer
+      // (a replayable credential): it is exposed to the REST /tool consumer
+      // only when GATEWAY_DEBUG_OBO=true, and stripped from the MCP transport.
       return { ok: true, data: unwrapToolData(result.data), _diagnostic: result.diag ?? {} };
     case 'pending':
       // requestState (SEP-2322/MRTR pre-adoption — hitl/request-state.ts) is
@@ -780,8 +781,15 @@ function buildMcpServer(bearer: string, subjectEmail?: string): McpServer {
     // policy deny instead of reading the envelope as a successful string.
     // The envelope itself is unchanged — REST /tool and existing MCP
     // consumers still read `ok`/`pending`/`denied` off the body.
+    // The raw OBO (GATEWAY_DEBUG_OBO) is for the REST /tool consumer's JWT viewer only; an MCP tool result is model-visible, so it never carries a bearer token.
+    const envelope = pipelineResultToEnvelope(result);
+    const diag = envelope['_diagnostic'];
+    if (diag && typeof diag === 'object' && 'obo' in diag) {
+      const { obo: _obo, ...safeDiag } = diag as Record<string, unknown>;
+      envelope['_diagnostic'] = safeDiag;
+    }
     return {
-      content: [{ type: 'text' as const, text: JSON.stringify(pipelineResultToEnvelope(result)) }],
+      content: [{ type: 'text' as const, text: JSON.stringify(envelope) }],
       ...(result.status !== 'ok' ? { isError: true } : {}),
     };
   };
