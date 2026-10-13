@@ -335,7 +335,7 @@ The gateway serves OAuth Protected Resource Metadata at `/.well-known/oauth-prot
 
 Your tunnel or ingress must route `/.well-known/*` to the gateway, not only `/mcp`, or clients will never reach the metadata.
 
-How a client gets a client id is the authorization server's job, not the gateway's. That means a pre-registered client id, dynamic client registration, or a client ID metadata document. Whether IBM Verify supports client ID metadata documents is unconfirmed, so plan on a pre-registered client until you have checked your tenant.
+How a client gets a client id is the authorization server's job, not the gateway's. That means a pre-registered client id, dynamic client registration, or a client ID metadata document (CIMD), where the client id is an HTTPS URL the authorization server fetches. IBM Verify does not support CIMD today: a URL client id is rejected with `CSIAQ0154E The requested OAuth 2.0 Client does not exist`, and its discovery document does not advertise `client_id_metadata_document_supported`. CIMD support is planned for Q1 2027. Until then, use a pre-registered client, or dynamic client registration through the `registration_endpoint` Verify advertises.
 
 ## Secure your own MCP
 
