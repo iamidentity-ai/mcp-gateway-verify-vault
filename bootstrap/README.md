@@ -97,7 +97,7 @@ them. Get them from the Admin console, or (better) read them live via the Vault
 | `VERIFY_ISSUER` | no | derived from `VERIFY_TENANT_URL` + `/oauth2` | entity-alias issuer (tracks the OBO's `iss`) |
 | `VAULT_OAUTH_RS_MOUNT_ACCESSOR` | no | auto-looked-up from `sys/auth` | the OAuth-RS auth mount accessor |
 | `GATEWAY_AGENT_ID_CLAIM` | no | `mcp-gateway-agent` | SUBJECT external_id (from step 1) |
-| `GATEWAY_ACTOR_SUB` / `GATEWAY_ACTOR_SPIFFE_SUB` | no | `spiffe://example.org/mcp-gateway` | ACTOR external_id (from step 1) |
+| `GATEWAY_ACTOR_SUB` / `GATEWAY_ACTOR_SPIFFE_SUB` | no | `spiffe://example.org/mcp-gateway` | ACTOR external_id (from step 1). With `AUTH_METHOD=verify` it is `GATEWAY_AGENT_REGISTRY_ID` (required) |
 | `VAULT_RUNTIME_POLICY` | no | `records-gateway` | ACL policy name |
 | `--with-ibm-verify` flag | no | off | also create the `ibm-verify` plugin roles (needs `GATEWAY_EXCHANGE_APP_ID`/`_CLIENT_ID` + `GATEWAY_AGENT_APP_ID`/`_CLIENT_ID`) |
 

@@ -150,7 +150,7 @@ Read **only** by the `bootstrap/` scripts, never by the running gateway. Full ru
 | `GATEWAY_COMPANY_NAME` | `Example` | optional | SAML company name. |
 | `GATEWAY_AGENT_ID_CLAIM` | `mcp-gateway-agent` | optional | Static `agent_id` claim stamped on every OBO = Vault SUBJECT `external_id` (one entity covers all users). Keep verify+vault in sync. |
 | `GATEWAY_ACTOR_SPIFFE_SUB` | `spiffe://example.org/mcp-gateway` | optional | The `may_act` constraint + Vault ACTOR `external_id` (spiffe mode). |
-| `GATEWAY_ACTOR_SUB` | *(empty)* | optional | ACTOR `external_id` in **verify** mode - set to the Agent Identity clientId instead of the SPIFFE sub. |
+| `GATEWAY_ACTOR_SUB` | *(empty)* | optional | Explicit ACTOR `external_id` override. In **verify** mode it defaults to `GATEWAY_AGENT_REGISTRY_ID` (the Agent Registry id, never the clientId). |
 
 ### `bootstrap:vault`
 

@@ -15,7 +15,7 @@
  *        SUBJECT — external_id = the agent_id claim the TE app stamps on every
  *                  OBO (user_claim=agent_id: ONE entity covers ALL users).
  *        ACTOR  — external_id = the OBO's act.sub (the SPIFFE SVID sub in
- *                  spiffe mode, or the Agent Identity clientId in verify mode).
+ *                  spiffe mode, or the Agent Registry id in verify mode).
  *      Both attached to the runtime policy + registered in agent-registry.
  *   4. (optional, --with-ibm-verify) ibm-verify plugin roles that rotate the
  *      TE/agent client secrets for SECRETS_BACKEND=vault.
@@ -57,11 +57,14 @@ const ACTOR_ENTITY = process.env['VAULT_ACTOR_ENTITY'] || `${SLUG}-gateway-actor
 
 // external_ids the OBO resolves against.
 const AGENT_ID_CLAIM = process.env['GATEWAY_AGENT_ID_CLAIM'] || 'mcp-gateway-agent';
+// Verify mode: the Agent Identity token's sub is the Agent Registry id, so a SPIFFE sub
+// left in the env must not win over it.
+const VERIFY_MODE = (process.env['AUTH_METHOD'] || 'spiffe') === 'verify';
 const ACTOR_SUB =
   process.env['GATEWAY_ACTOR_SUB'] ||
-  process.env['GATEWAY_ACTOR_SPIFFE_SUB'] ||
-  process.env['GATEWAY_AGENT_REGISTRY_ID'] ||
-  'spiffe://example.org/mcp-gateway';
+  (VERIFY_MODE ? process.env['GATEWAY_AGENT_REGISTRY_ID'] : process.env['GATEWAY_ACTOR_SPIFFE_SUB']) ||
+  (VERIFY_MODE ? '' : 'spiffe://example.org/mcp-gateway');
+if (!ACTOR_SUB) throw new Error('AUTH_METHOD=verify needs GATEWAY_AGENT_REGISTRY_ID (or GATEWAY_ACTOR_SUB) for the Vault ACTOR alias');
 
 // The alias issuer tracks the JWT's `iss` (the OBO), NOT the natural issuer of
 // the claim value — so even the SPIFFE actor alias uses the Verify /oauth2 iss.

@@ -207,7 +207,7 @@ async function preflightEntitlements(token: string): Promise<void> {
 // ── CELX snippets (app-body plumbing) ─────────────────────────────────────
 
 /** may_act: which single actor may act on the signed-in user's behalf — the
- *  SPIFFE actor sub (spiffe mode) OR the Agent Identity clientId (verify mode).
+ *  SPIFFE actor sub (spiffe mode) OR the Agent Registry id (verify mode).
  *  Constrains RFC 8693 delegation.
  *
  *  MUST be a single-string `sub`, NOT an array. Verify matches the actor
@@ -219,7 +219,7 @@ async function preflightEntitlements(token: string): Promise<void> {
  *  agent; multi-hop A2A works by each downstream doing its own exchange, never
  *  by cramming several actors into one may_act. */
 function agentRegistryId(): string {
-  if (!AGENT_REGISTRY_ID) throw new Error('AUTH_METHOD=verify needs GATEWAY_AGENT_REGISTRY_ID (the Agent Registry id of the gateway agent; Agent Identity tokens carry it as sub)');
+  if (!AGENT_REGISTRY_ID) throw new Error('AUTH_METHOD=verify needs GATEWAY_AGENT_REGISTRY_ID (the Agent Registry id of the gateway agent; Agent Identity tokens carry it as sub). The Agent Identity app now exists: register it in the Agent Registry, set GATEWAY_AGENT_REGISTRY_ID to the registry id, and re-run (the script is idempotent).');
   return AGENT_REGISTRY_ID;
 }
 

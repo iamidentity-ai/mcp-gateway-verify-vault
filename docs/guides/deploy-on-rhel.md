@@ -116,7 +116,7 @@ Keep `name` equal to `VAULT_RAR_DB_NAME` (default `records`).
 
 Second, activate the OAuth-Resource-Server profile. This is the licensed Vault feature that lets the gateway present the user's exchanged token directly as the Vault token. If it is not active, bootstrap:vault will run but silently SKIP the identity entities, and real tool calls will 403. The activation shape is `sys/activation-flags/.../activate` plus a `sys/config/oauth-resource-server/<id>` profile pointed at your Verify tenant JWKS. This recipe is licensed and is not shipped in this repo, so treat it as a required prerequisite and confirm the mount accessor and issuer match the tenant that issues the token. See Open Questions.
 
-Actor identity. Stay with `AUTH_METHOD=verify`. In that mode the gateway authenticates its actor leg with the Agent OIDC app's client_credentials, and it needs no AppRole and no native SPIFFE engine. Set `GATEWAY_ACTOR_SUB` to the Agent app clientId so the Vault ACTOR entity matches.
+Actor identity. Stay with `AUTH_METHOD=verify`. In that mode the gateway authenticates its actor leg with the Agent OIDC app's client_credentials, and it needs no AppRole and no native SPIFFE engine. Register the Agent app in the Agent Registry and set `GATEWAY_AGENT_REGISTRY_ID` to its registry id: an Agent Identity token's `sub` is the registry id, so `may_act.sub` and the Vault ACTOR entity must both equal it.
 
 ## Step 6. Fill in .env
 
@@ -136,7 +136,7 @@ SECRETS_BACKEND=env                       # move to vault before you ship (see b
 AUTH_METHOD=verify
 GATEWAY_AGENT_CLIENT_ID=...               # the Agent OIDC app
 GATEWAY_AGENT_CLIENT_SECRET=...
-GATEWAY_ACTOR_SUB=<the Agent app clientId>
+GATEWAY_AGENT_REGISTRY_ID=<the agent's Agent Registry id>
 VAULT_ADDR=https://your-vault:8200
 UPSTREAM_MCP_URL=http://127.0.0.1:3015/mcp
 ```
@@ -153,15 +153,21 @@ VERIFY_TENANT_URL=https://your-tenant.verify.ibm.com \
 VERIFY_ADMIN_CLIENT_ID=<admin-id> \
 VERIFY_ADMIN_SECRET=<admin-secret> \
 VERIFY_IDENTITY_SOURCE_ID=<source-id> \
+AUTH_METHOD=verify \
+GATEWAY_AGENT_REGISTRY_ID=<the agent's Agent Registry id> \
 npm run bootstrap:verify
 # Paste the printed GATEWAY_EXCHANGE_CLIENT_ID (and secret) back into .env.
+# On a fresh tenant the first run creates the Agent Identity app and then stops
+# asking for GATEWAY_AGENT_REGISTRY_ID: register that app in the Agent Registry,
+# set the registry id and re-run.
 
 # Vault: verify-rar roles, runtime ACL policy, OAuth-RS subject and actor entities.
 VAULT_ADDR=https://your-vault:8200 \
 VAULT_TOKEN=<token-that-can-write-roles-policies-entities> \
 VERIFY_TENANT_URL=https://your-tenant.verify.ibm.com \
 GATEWAY_AGENT_ID_CLAIM=mcp-gateway-agent \
-GATEWAY_ACTOR_SUB=<the Agent app clientId> \
+AUTH_METHOD=verify \
+GATEWAY_AGENT_REGISTRY_ID=<the agent's Agent Registry id> \
 npm run bootstrap:vault
 ```
 
