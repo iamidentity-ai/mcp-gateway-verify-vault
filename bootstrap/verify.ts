@@ -91,6 +91,9 @@ const ACTOR_TOKEN_TYPE = process.env['GATEWAY_ACTOR_TOKEN_TYPE'] || 'SPIFFE';
 const USE_SPIFFE = (process.env['AUTH_METHOD'] || 'spiffe') === 'spiffe';
 const AGENT_ID_CLAIM = process.env['GATEWAY_AGENT_ID_CLAIM'] || 'mcp-gateway-agent';
 const ACTOR_SPIFFE_SUB = process.env['GATEWAY_ACTOR_SPIFFE_SUB'] || 'spiffe://example.org/mcp-gateway';
+// Verify mode: since 2026-10-19 an Agent Identity token's sub (the OBO's act.sub) is the
+// Agent Registry id, not the OAuth client id, so may_act.sub must be that id.
+const AGENT_REGISTRY_ID = process.env['GATEWAY_AGENT_REGISTRY_ID'] || '';
 const COMPANY_NAME = process.env['GATEWAY_COMPANY_NAME'] || 'Example';
 // Tenant-specific — leaking a real one would be an internal detail, so these
 // are opt-in. Without an identity source the UI login loops at Verify.
@@ -215,6 +218,11 @@ async function preflightEntitlements(token: string): Promise<void> {
  *  which each carry a single-string `may_act.sub`. One app authorizes one
  *  agent; multi-hop A2A works by each downstream doing its own exchange, never
  *  by cramming several actors into one may_act. */
+function agentRegistryId(): string {
+  if (!AGENT_REGISTRY_ID) throw new Error('AUTH_METHOD=verify needs GATEWAY_AGENT_REGISTRY_ID (the Agent Registry id of the gateway agent; Agent Identity tokens carry it as sub)');
+  return AGENT_REGISTRY_ID;
+}
+
 function mayActCelx(sub: string): string {
   return 'statements:\n- return: >-\n   {\n     "sub": "' + sub + '"\n   }';
 }
@@ -303,7 +311,7 @@ function buildUiBody(agentClientId: string): Record<string, unknown> {
         grantProperties: { generateDeviceFlowQRCode: 'false' },
         token: {
           accessTokenType: 'jwt',
-          attributeMappings: [{ targetName: 'may_act', function: { custom: mayActCelx(USE_SPIFFE ? ACTOR_SPIFFE_SUB : agentClientId) } }],
+          attributeMappings: [{ targetName: 'may_act', function: { custom: mayActCelx(USE_SPIFFE ? ACTOR_SPIFFE_SUB : agentRegistryId()) } }],
         },
         consentAction: 'always_prompt',
         requirePkceVerification: 'true',

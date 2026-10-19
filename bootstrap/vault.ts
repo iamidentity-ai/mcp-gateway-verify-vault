@@ -60,7 +60,7 @@ const AGENT_ID_CLAIM = process.env['GATEWAY_AGENT_ID_CLAIM'] || 'mcp-gateway-age
 const ACTOR_SUB =
   process.env['GATEWAY_ACTOR_SUB'] ||
   process.env['GATEWAY_ACTOR_SPIFFE_SUB'] ||
-  process.env['GATEWAY_AGENT_CLIENT_ID'] ||
+  process.env['GATEWAY_AGENT_REGISTRY_ID'] ||
   'spiffe://example.org/mcp-gateway';
 
 // The alias issuer tracks the JWT's `iss` (the OBO), NOT the natural issuer of

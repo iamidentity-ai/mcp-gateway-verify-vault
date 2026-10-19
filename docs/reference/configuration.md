@@ -45,7 +45,8 @@ How the gateway proves **its own** (actor) identity in the exchange.
 |---|---|---|---|
 | `AUTH_METHOD` | `spiffe` | optional | `spiffe` (Vault-native JWT-SVID) or `verify` (agent client-credentials grant). |
 | `GATEWAY_ACTOR_TOKEN_TYPE` | `SPIFFE` | optional | `actor_token_type` sent for the SVID - must match the custom token type on the tenant. |
-| `GATEWAY_AGENT_CLIENT_ID` | `0000…0000` | verify | Agent Identity OIDC app clientId (verify-mode actor). Secret via `SECRETS_BACKEND`. |
+| `GATEWAY_AGENT_CLIENT_ID` | `0000…0000` | verify | Agent Identity OIDC app clientId (verify-mode; used to mint the actor token only, its `sub` is the Agent Registry id). Secret via `SECRETS_BACKEND`. |
+| `GATEWAY_AGENT_REGISTRY_ID` | - | verify (bootstrap) | Agent Registry id of the gateway agent. `may_act.sub` and the Vault actor alias must equal it. |
 
 ## HashiCorp Vault
 

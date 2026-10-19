@@ -96,7 +96,7 @@ const AGENT_CLIENT_ID = process.env.GATEWAY_AGENT_CLIENT_ID || '';
 /**
  * Which identity the gateway presents as the RFC 8693 ACTOR.
  *   spiffe — a Vault-native JWT-SVID, `sub` = the workload's SPIFFE ID
- *   verify — a client_credentials token, `sub` = GATEWAY_AGENT_CLIENT_ID
+ *   verify — a client_credentials token, `sub` = the agent's Agent Registry id (client_id stays GATEWAY_AGENT_CLIENT_ID, used only to mint)
  */
 export type AuthMethod = 'spiffe' | 'verify';
 
